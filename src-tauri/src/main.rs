@@ -13,6 +13,7 @@ use tauri::{
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::time::Duration;
 
 /// 向守卫本地 API 发一个无 body 的 POST（仅回环，无鉴权边界内）。
 fn post_local(port: u16, path: &str) {
@@ -25,6 +26,14 @@ fn post_local(port: u16, path: &str) {
         let _ = stream.write_all(req.as_bytes());
         let mut buf = Vec::new();
         let _ = stream.read_to_end(&mut buf);
+    }
+}
+
+fn guard_alive(port: u16) -> bool {
+    let addr = format!("127.0.0.1:{}", port);
+    match addr.parse() {
+    Ok(a) => TcpStream::connect_timeout(&a, Duration::from_millis(400)).is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -44,6 +53,13 @@ fn main() {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(3100);
+
+            // 守卫没起就先拉起（GUI 先于服务打开的常见场景），失败静默交由用户排查
+            if !guard_alive(port) {
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "start", "dsh-supervisor.service"])
+                    .status();
+            }
 
             let show = MenuItem::with_id(app, "show", "显示面板", true, None::<&str>)?;
             let start = MenuItem::with_id(app, "start", "启动 DSH", true, None::<&str>)?;
