@@ -1,0 +1,60 @@
+name: launcher-build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x64
+          - os: windows-latest
+            artifact: win-x64
+          - os: macos-latest
+            artifact: darwin-arm64
+          - os: macos-13
+            artifact: darwin-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node（--node-plan 冒烟用）
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 壳无头冒烟（--node-plan：环境探针 + 官方最新 LTS）
+        shell: bash
+        run: |
+          cargo build 2>&1 | tail -2
+          ./target/debug/dsh-supervisor-gui --node-plan || true
+        working-directory: src-tauri
+
+      - name: Build + bundle (Tauri)
+        run: npx --yes @tauri-apps/cli@2 build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: src-tauri/target/release/bundle/**/*
+
+      - name: Attach to GitHub Release（tag 触发时）
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: src-tauri/target/release/bundle/**/*
+          generate_release_notes: true

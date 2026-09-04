@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "dsh-supervisor 壳主窗口能力：调用本地 node_status/start_node_install 命令 + 事件监听",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

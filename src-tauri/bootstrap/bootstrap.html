@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsh-supervisor — 环境引导</title>
+<style>
+  :root { --blue:#007aff; --bg:#f5f5f7; --card:#fff; --text:#111112; --muted:#5a5a5f; --border:#e5e5ea; --red:#ff3b30; --green:#34c759; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--text); display:flex; align-items:center; justify-content:center; height:100vh; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:36px 40px; width:520px; box-shadow:0 8px 30px rgba(0,0,0,.08); }
+  h1 { font-size:20px; margin:0 0 6px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:22px; line-height:1.7; }
+  .badge { display:inline-block; padding:3px 10px; border-radius:999px; font-size:12px; margin-bottom:14px; }
+  .badge.miss { background:rgba(255,59,48,.14); color:var(--red); }
+  .badge.ok { background:rgba(52,199,89,.16); color:var(--green); }
+  .row { font-size:13px; color:var(--muted); margin:4px 0; }
+  .row b { color:var(--text); font-family:menlo,consolas,monospace; }
+  .bar { height:8px; background:#e9e9ee; border-radius:4px; margin:16px 0 6px; overflow:hidden; }
+  .fill { height:100%; width:0; background:linear-gradient(90deg,var(--blue),#40c4ff); transition:width .25s; }
+  .pct { font-size:12px; color:var(--muted); }
+  .btn { width:100%; padding:12px; border:0; border-radius:10px; background:var(--blue); color:#fff; font-size:15px; font-weight:600; cursor:pointer; margin-top:18px; }
+  .btn:disabled { opacity:.5; cursor:default; }
+  .btn.ghost { background:transparent; border:1px solid var(--border); color:var(--blue); margin-top:8px; }
+  pre { background:#111; color:#9fe08c; border-radius:8px; padding:10px 12px; font-size:11px; line-height:1.6; max-height:130px; overflow:auto; margin:12px 0 0; white-space:pre-wrap; word-break:break-all; }
+  .err { background:rgba(255,59,48,.08); color:var(--red); border-radius:8px; padding:10px 12px; font-size:12px; margin-top:12px; display:none; }
+  .muted { color:var(--muted); font-size:12px; margin-top:10px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div id="badge" class="badge miss">检测环境…</div>
+  <h1 id="title">dsh-supervisor 环境引导</h1>
+  <div class="sub" id="sub">正在检测是否已安装 Node.js（DSH 与守护服务的运行环境）…</div>
+  <div class="row">当前 Node：<b id="cur">—</b></div>
+  <div class="row">官方最新 LTS：<b id="latest">—</b></div>
+  <div class="row">守卫内核：<b id="core">检测中…</b> <span id="coreHint" style="display:none"></span></div>
+  <div class="bar"><div class="fill" id="fill"></div></div>
+  <div class="pct" id="pct"></div>
+  <button class="btn" id="installBtn" style="display:none">一键安装 Node.js LTS</button>
+  <button class="btn ghost" id="skipBtn" style="display:none">跳过并使用现有版本</button>
+  <button class="btn ghost" id="retryBtn" style="display:none">重新检测</button>
+  <pre id="log" style="display:none"></pre>
+  <div class="err" id="err"></div>
+  <div class="muted">将下载官方 Node.js 最新 LTS 并安装到系统（需一次管理员授权）。安装完成后守卫将自动启动并打开面板。</div>
+</div>
+<script>
+(function () {
+  var core = window.__TAURI__ && window.__TAURI__.core;
+  var evt = window.__TAURI__ && window.__TAURI__.event;
+  var $ = function (id) { return document.getElementById(id); };
+  var lastCore = { installed: null, hint: '' };
+  function renderCore() {
+    var ok = lastCore.installed === true;
+    $('core').textContent = ok ? '已安装' : (lastCore.installed === false ? '未安装' : '检测中…');
+    $('core').style.color = ok ? 'var(--green)' : '#ff3b30';
+    $('coreHint').textContent = ok ? '' : lastCore.hint;
+    $('coreHint').style.display = ok ? 'none' : '';
+  }
+  function setState(st) {
+    $('cur').textContent = st.installed || '未安装';
+    $('latest').textContent = st.latest || '获取中…';
+    if (st.progress > 0) { $('fill').style.width = (st.progress * 100) + '%'; $('pct').textContent = Math.round(st.progress * 100) + '%'; }
+    if (st.status) { $('sub').textContent = st.status; }
+    var miss = !st.installed;
+    var outdated = st.outdated === true; // 已装但低于官方最新 LTS
+    var badge = $('badge');
+    badge.className = 'badge ' + (miss ? 'miss' : (outdated ? 'warn' : 'ok'));
+    badge.textContent = miss ? '缺少 Node.js' : (outdated ? 'Node.js 可升级' : '环境就绪');
+    if (st.busy) { $('installBtn').disabled = true; $('installBtn').textContent = '安装中…'; }
+    else if (miss) { $('installBtn').disabled = false; $('installBtn').textContent = '一键安装 Node.js LTS'; }
+    else if (outdated) { $('installBtn').disabled = false; $('installBtn').textContent = '升级到官方最新 LTS'; }
+    $('installBtn').style.display = (miss || outdated) ? '' : 'none';
+    $('skipBtn').style.display = (outdated && !st.busy) ? '' : 'none';
+    $('retryBtn').style.display = miss ? '' : 'none';
+    if (st.logs && st.logs.length) { $('log').style.display = ''; $('log').textContent = st.logs.join('\n'); }
+    if (st.error) { $('err').style.display = ''; $('err').textContent = '失败：' + st.error; $('retryBtn').style.display = ''; }
+    else { $('err').style.display = 'none'; }
+  }
+  function refresh() {
+    if (!core) return;
+    core.invoke('node_status').then(function (st) {
+      core.invoke('core_status').then(function (cs) { lastCore = cs; renderCore(); }).catch(function () {});
+      setState(st);
+    }).catch(function (e) { $('err').style.display=''; $('err').textContent = '调用失败: ' + e; });
+  }
+  renderCore();
+  $('installBtn').addEventListener('click', function () {
+    if (!core) return;
+    core.invoke('start_node_install').catch(function (e) { $('err').style.display=''; $('err').textContent = '启动安装失败: ' + e; });
+  });
+  $('skipBtn').addEventListener('click', function () {
+    if (!core) return;
+    core.invoke('skip_env_upgrade').catch(function (e) { $('err').style.display=''; $('err').textContent = '跳过失败: ' + e; });
+  });
+  $('retryBtn').addEventListener('click', refresh);
+  if (evt) {
+    evt.listen('env_progress', function (e) { setState(e.payload || {}); });
+    evt.listen('env_done', function (e) { setState({ installed: (e.payload || {}).version, latest: (e.payload || {}).version, progress: 1 }); $('sub').textContent = 'Node.js 就绪，正在打开面板…'; });
+    evt.listen('env_error', function (e) { refresh(); });
+    evt.listen('env_status', function (e) { refresh(); });
+  }
+  refresh();
+  setInterval(refresh, 5000);
+  setInterval(function () { if (lastCore.installed === null) { core.invoke('core_status').then(function (cs) { lastCore = cs; renderCore(); }).catch(function () {}); } }, 5000);
+})();
+</script>
+</body>
+</html>
