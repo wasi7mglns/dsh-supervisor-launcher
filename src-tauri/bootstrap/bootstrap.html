@@ -25,9 +25,18 @@
   pre { background:#111; color:#9fe08c; border-radius:8px; padding:10px 12px; font-size:11px; line-height:1.6; max-height:130px; overflow:auto; margin:12px 0 0; white-space:pre-wrap; word-break:break-all; }
   .err { background:rgba(255,59,48,.08); color:var(--red); border-radius:8px; padding:10px 12px; font-size:12px; margin-top:12px; display:none; }
   .muted { color:var(--muted); font-size:12px; margin-top:10px; }
+  /* Phase 3b: 无边框窗口适配 —— 顶部 40px 自绘标题栏（Tauri 壳环境） */
+  html { background: transparent; }
+  #tb { position:fixed; top:0; left:0; right:0; height:38px; display:flex; align-items:center; justify-content:space-between; -webkit-app-region: drag; user-select:none; z-index:10; }
+  #tb .tb-title { padding-left:12px; font-size:12px; color:var(--muted); letter-spacing:.02em; }
+  #tb .tb-btns { display:flex; height:100%; -webkit-app-region: no-drag; }
+  #tb .tb-btns button { width:44px; height:100%; border:0; background:transparent; color:var(--muted); font-size:15px; cursor:pointer; line-height:1; }
+  #tb .tb-btns button:hover { background:rgba(0,0,0,.06); color:var(--text); }
+  #tb .tb-btns button.tb-close:hover { background:var(--red); color:#fff; }
 </style>
 </head>
 <body>
+<div id="tb"><span class="tb-title">dsh-supervisor 环境引导</span><span class="tb-btns"><button id="tbMin">−</button><button id="tbClose" class="tb-close">×</button></span></div>
 <div class="card">
   <div id="badge" class="badge miss">检测环境…</div>
   <h1 id="title">dsh-supervisor 环境引导</h1>
@@ -101,6 +110,17 @@
     evt.listen('env_status', function (e) { refresh(); });
   }
   refresh();
+  // Phase 3b: 无边框窗口控制（win_ctl IPC）
+  var core2 = window.__TAURI__ && window.__TAURI__.core;
+  if (core2) {
+    var wctl = function (a) { core2.invoke('win_ctl', { action: a }).catch(function () {}); };
+    var tbMin = document.getElementById('tbMin');
+    var tbClose = document.getElementById('tbClose');
+    if (tbMin) tbMin.addEventListener('click', function () { wctl('minimize'); });
+    if (tbClose) tbClose.addEventListener('click', function () { wctl('hide'); });
+  } else {
+    var tb = document.getElementById('tb'); if (tb) tb.style.display = 'none';
+  }
   setInterval(refresh, 5000);
   setInterval(function () { if (lastCore.installed === null) { core.invoke('core_status').then(function (cs) { lastCore = cs; renderCore(); }).catch(function () {}); } }, 5000);
 })();

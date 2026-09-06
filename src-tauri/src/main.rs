@@ -216,6 +216,31 @@ fn api_proxy(method: String, path: String, body: Option<serde_json::Value>, time
     out
 }
 
+/// 桌面自定义窗口控制（Phase 3b：无边框窗口 + 自绘标题栏）。
+/// 前端 WindowTitlebar 按钮 → invoke("win_ctl", {action})：
+///   "minimize" / "toggle-maximize" / "hide"（关闭按钮 = 隐藏到托盘，与 CloseRequested 语义一致）。
+#[tauri::command]
+fn win_ctl(app: tauri::AppHandle, action: String) -> Result<(), String> {
+    let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
+    match action.as_str() {
+        "minimize" => win.minimize().map_err(|e| e.to_string()),
+        "toggle-maximize" => {
+            if win.is_maximized().unwrap_or(false) {
+                win.unmaximize().map_err(|e| e.to_string())
+            } else {
+                win.maximize().map_err(|e| e.to_string())
+            }
+        }
+        "maximize" => win.maximize().map_err(|e| e.to_string()),
+        "unmaximize" => win.unmaximize().map_err(|e| e.to_string()),
+        "hide" => {
+            let _ = win.hide();
+            Ok(())
+        }
+        _ => Err(format!("不支持的窗口动作: {}（minimize/toggle-maximize/maximize/unmaximize/hide）", action)),
+    }
+}
+
 /// 拉起守卫（定位已安装内核 dsh-supervisor daemon——SEA 自足，不依赖 Node），等面板就绪。
 /// 端口从用户 config.apiPort 解析（非硬编码 3100——壳极少更新但内核配置可演进，2026-09 修复 F7）。
 fn ensure_guard(app: &tauri::AppHandle) -> Result<(), String> {
@@ -313,7 +338,7 @@ fn main() {
     }
     tauri::Builder::default()
         .manage(Mutex::new(RunState::default()))
-        .invoke_handler(tauri::generate_handler![node_status, core_status, start_node_install, skip_env_upgrade, api_proxy])
+        .invoke_handler(tauri::generate_handler![node_status, core_status, start_node_install, skip_env_upgrade, api_proxy, win_ctl])
         .setup(|app| {
             // 托盘直发本地 API 的端口：显式 DSH_SUPERVISOR_TRAY_PORT 优先，否则从用户 config.apiPort 解析
             let port: u16 = std::env::var("DSH_SUPERVISOR_TRAY_PORT")

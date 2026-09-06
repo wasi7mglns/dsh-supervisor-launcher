@@ -17,6 +17,8 @@
         "minWidth": 760,
         "minHeight": 540,
         "resizable": true,
+        "decorations": false,
+        "transparent": true,
         "url": "bootstrap.html"
       }
     ],
