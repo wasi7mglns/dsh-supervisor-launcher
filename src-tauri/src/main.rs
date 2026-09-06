@@ -76,9 +76,7 @@ fn skip_env_upgrade(app: tauri::AppHandle) -> Result<(), String> {
     }
     // 用现有版本继续：拉起守卫并进入面板（api 基址从用户 config 解析，用户改 apiPort 后壳仍可达）
     ensure_guard(&app).map_err(|e| e.to_string())?;
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.navigate(env::api_base_url().parse().unwrap());
-    }
+    go_panel(&app);
     Ok(())
 }
 
@@ -178,6 +176,46 @@ fn core_status(app: tauri::AppHandle) -> serde_json::Value {
     })
 }
 
+/// 面板 API 代理（R2：壳内嵌面板经本命令调守卫 3100，绕浏览器 CORS）。
+/// 守卫 API 刻意零 CORS（安全设计：面板同源托管）；壳内 WebView 源 ≠ 守卫端口，故由 Rust 侧转发。
+/// method: GET|POST；path: 如 "/status"；body: POST 可选 JSON；timeout_ms: 覆盖长轮询端点（默认 15s）。
+#[tauri::command]
+fn api_proxy(method: String, path: String, body: Option<serde_json::Value>, timeout_ms: Option<u64>) -> Result<serde_json::Value, String> {
+    let port = env::api_port();
+    let url = format!("http://127.0.0.1:{}{}", port, path);
+    let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(15_000));
+    let m = method.to_uppercase();
+    let out = (|| -> Result<serde_json::Value, String> {
+        // ureq 本仓未启用 json feature → 读字符串后 serde_json 解析（与 node.rs http_get_bytes 同风格）
+        let read_body = |resp: ureq::Response| -> Result<serde_json::Value, String> {
+            let mut buf = Vec::new();
+            let mut reader = resp.into_reader();
+            std::io::Read::read_to_end(&mut reader, &mut buf)
+                .map_err(|e| format!("读取守卫 API 响应失败: {}", e))?;
+            let s = String::from_utf8_lossy(&buf);
+            serde_json::from_str(&s)
+                .map_err(|e| format!("守卫 API 响应解析失败: {}（body 前 200 字节: {}）", e, &s.chars().take(200).collect::<String>()))
+        };
+        match m.as_str() {
+            "GET" => {
+                let resp = ureq::get(&url).timeout(timeout).call()
+                    .map_err(|e| format!("守卫 API 请求失败: {}", e))?;
+                read_body(resp)
+            }
+            "POST" => {
+                let body_str = body.map(|b| b.to_string()).unwrap_or_else(|| "{}".into());
+                let resp = ureq::post(&url).timeout(timeout)
+                    .set("Content-Type", "application/json")
+                    .send_string(&body_str)
+                    .map_err(|e| format!("守卫 API 请求失败: {}", e))?;
+                read_body(resp)
+            }
+            _ => Err(format!("不支持的方法: {}（仅 GET/POST）", method)),
+        }
+    })();
+    out
+}
+
 /// 拉起守卫（定位已安装内核 dsh-supervisor daemon——SEA 自足，不依赖 Node），等面板就绪。
 /// 端口从用户 config.apiPort 解析（非硬编码 3100——壳极少更新但内核配置可演进，2026-09 修复 F7）。
 fn ensure_guard(app: &tauri::AppHandle) -> Result<(), String> {
@@ -227,13 +265,31 @@ fn cli_plan() -> i32 {
     }
 }
 
+/// 打开面板。
+/// - embedded-panel（完整壳，默认）：导航到壳 frontend/ 内的 supervisor.html（壳内嵌 UI），
+///   面板 API 经 api_proxy command（Rust 侧转发守卫 3100，绕浏览器 CORS）。浏览器出口仍由守卫 GET / 托管 ui-react。
+/// - 无 embedded-panel（公开壳引导器，--no-default-features）：导航守卫 3100 托管面板（引导器形态）。
+fn go_panel(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        #[cfg(feature = "embedded-panel")]
+        {
+            // 相对导航到同一 frontendDist 内的面板页（跨平台协议无关：保持当前 scheme/host）
+            let _ = win.eval("window.location.href = 'supervisor.html'");
+        }
+        #[cfg(not(feature = "embedded-panel"))]
+        {
+            let _ = win.navigate(env::api_base_url().parse().unwrap());
+        }
+    }
+}
+
 fn show_main(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
-        // 每次显示都重新导航到面板：WebView 不做陈旧缓存 —— 拿最新 UI（防旧页面残留/资源失效卡死）
-        let _ = win.navigate(env::api_base_url().parse().unwrap());
+        // 每次显示都重新导航到面板（壳内 supervisor.html）：WebView 不做陈旧缓存 —— 拿最新 UI
+        go_panel(app);
     }
 }
 
@@ -257,7 +313,7 @@ fn main() {
     }
     tauri::Builder::default()
         .manage(Mutex::new(RunState::default()))
-        .invoke_handler(tauri::generate_handler![node_status, core_status, start_node_install, skip_env_upgrade])
+        .invoke_handler(tauri::generate_handler![node_status, core_status, start_node_install, skip_env_upgrade, api_proxy])
         .setup(|app| {
             // 托盘直发本地 API 的端口：显式 DSH_SUPERVISOR_TRAY_PORT 优先，否则从用户 config.apiPort 解析
             let port: u16 = std::env::var("DSH_SUPERVISOR_TRAY_PORT")
@@ -286,8 +342,8 @@ fn main() {
                     if locate_core(&handle).is_some() {
                         if let Err(e) = ensure_guard(&handle) {
                             let _ = handle.emit("env_error", serde_json::json!({ "error": e }));
-                        } else if let Some(win) = handle.get_webview_window("main") {
-                            let _ = win.navigate(env::api_base_url().parse().unwrap());
+                        } else {
+                            go_panel(&handle);
                         }
                     } else {
                         // 留在引导页；页面 core_status → 显示「内核未安装」+ 安装命令

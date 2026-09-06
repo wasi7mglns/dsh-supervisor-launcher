@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "dev.bowen.dsh-supervisor",
   "build": {
-    "frontendDist": "bootstrap"
+    "frontendDist": "frontend"
   },
   "app": {
     "withGlobalTauri": true,
@@ -21,7 +21,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self' tauri://localhost http://tauri.localhost; script-src 'self' tauri://localhost http://tauri.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' tauri://localhost http://tauri.localhost"
     }
   },
   "bundle": {
