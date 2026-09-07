@@ -27,7 +27,7 @@
   /* 自定义窗口 = 圆角卡片：窗口透明无边框, .window 即窗口外观(圆角+边框+阴影) */
   .window {
     position: fixed; inset: 0; display: flex; flex-direction: column;
-    background: color-mix(in srgb, var(--sidebar) 92%, transparent);
+    background: var(--sidebar);
     border: 1px solid var(--border);
     border-radius: 14px;
     overflow: hidden;
@@ -37,7 +37,7 @@
   /* ── 唯一窗口栏（产品 WindowTitlebar 同款视觉） ── */
   #titlebar {
     height: 40px; flex: none; display: flex; align-items: center; justify-content: space-between;
-    background: transparent;
+    background: var(--sidebar);
     border-bottom: 1px solid var(--border);
     user-select: none; -webkit-user-select: none;
   }
