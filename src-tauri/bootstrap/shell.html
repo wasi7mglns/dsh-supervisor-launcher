@@ -23,13 +23,21 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { width: 100%; height: 100%; height: 100dvh; }
   body { margin: 0; background: transparent; color: var(--text); overflow: hidden;
-    font-family: Inter, "Noto Sans SC", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    display: flex; flex-direction: column; }
+    font-family: Inter, "Noto Sans SC", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  /* 自定义窗口 = 圆角卡片：窗口透明无边框, .window 即窗口外观(圆角+边框+阴影) */
+  .window {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    background: color-mix(in srgb, var(--sidebar) 92%, transparent);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 24px 80px rgb(15 23 42 / 0.16);
+  }
 
   /* ── 唯一窗口栏（产品 WindowTitlebar 同款视觉） ── */
   #titlebar {
     height: 40px; flex: none; display: flex; align-items: center; justify-content: space-between;
-    background: color-mix(in srgb, var(--sidebar) 95%, transparent);
+    background: transparent;
     border-bottom: 1px solid var(--border);
     user-select: none; -webkit-user-select: none;
   }
@@ -52,6 +60,7 @@
 </style>
 </head>
 <body>
+  <div class="window">
   <!-- 唯一窗口栏（壳提供：产品 WindowTitlebar 同款） -->
   <div id="titlebar">
     <div class="tb-drag" id="dragRegion" data-tauri-drag-region="deep">
@@ -68,6 +77,7 @@
   <!-- 内容区：引导页 / 内核面板（纯网页） -->
   <div id="content">
     <iframe id="frame" src="bootstrap.html" title="内容"></iframe>
+  </div>
   </div>
 
   <script>
