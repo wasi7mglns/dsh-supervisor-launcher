@@ -262,39 +262,9 @@ fn cli_plan() -> i32 {
 ///   面板 API 经 api_proxy command（Rust 侧转发守卫 3100，绕浏览器 CORS）。浏览器出口仍由守卫 GET / 托管 ui-react。
 /// - 无 embedded-panel（公开壳引导器，--no-default-features）：导航守卫 3100 托管面板（引导器形态）。
 fn go_panel(app: &tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
-        #[cfg(feature = "embedded-panel")]
-        {
-            // 完整壳：导航到 frontend 内的 supervisor.html（custom-titlebar 形态，数据直连守卫 API）。
-            // 优先基于当前窗口 URL 构造同源目标（navigate 不依赖页面 JS 就绪，自动跳转也可靠）；
-            // 读 URL 失败再退 eval 相对跳转。
-            let mut navigated = false;
-            if let Ok(cur) = win.url() {
-                let s = cur.as_str();
-                // 当前是 tauri asset 页（bootstrap.html 等）→ 同目录换 supervisor.html
-                if s.contains("bootstrap.html") || s.contains("supervisor.html") || s.ends_with('/') {
-                    if let Some((base, _)) = s.rsplit_once('/') {
-                        if !s.ends_with("supervisor.html") {
-                            let target = format!("{}/supervisor.html", base);
-                            if let Ok(tu) = tauri::Url::parse(&target) {
-                                let _ = win.navigate(tu);
-                                navigated = true;
-                            }
-                        } else {
-                            navigated = true; // 已在面板页，幂等
-                        }
-                    }
-                }
-            }
-            if !navigated {
-                let _ = win.eval("if (!location.pathname.endsWith('/supervisor.html')) location.href = 'supervisor.html';");
-            }
-        }
-        #[cfg(not(feature = "embedded-panel"))]
-        {
-            let _ = win.navigate(env::api_base_url().parse().unwrap());
-        }
-    }
+    // 共用壳架构（2026-09-07 定稿）：窗口加载 shell.html（唯一窗口栏+内容 iframe），
+    // 面板/引导页都是 iframe 内容。切面板 = 通知壳框架把 iframe 切到 supervisor.html。
+    let _ = app.emit("shell:goto-panel", serde_json::json!({}));
 }
 
 fn show_main(app: &tauri::AppHandle) {

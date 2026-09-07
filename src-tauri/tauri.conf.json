@@ -19,7 +19,7 @@
         "resizable": true,
         "decorations": false,
         "transparent": true,
-        "url": "bootstrap.html"
+        "url": "shell.html"
       }
     ],
     "security": {

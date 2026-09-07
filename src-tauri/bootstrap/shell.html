@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsh-supervisor</title>
+<style>
+  /* ============================================================================
+   * dsh-supervisor —— 共用壳（唯一自绘窗口；窗口逻辑全部在此，内核是纯网页）
+   * 窗口加载本页：顶部 40px 产品窗口栏（对齐 ui WindowTitlebar 视觉）+ 空白内容区 iframe。
+   * 引导页 / 内核面板都是 iframe 内容（纯网页, 不参与任何窗口逻辑）。
+   * ============================================================================ */
+  :root {
+    --sidebar: #f9fafb;          /* tokens: --sidebar（浅） */
+    --sidebar-foreground: #61666b;
+    --text: #0f1115;             /* --foreground */
+    --border: rgb(0 0 0 / 5%);
+    --destructive: #e81123;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --sidebar: #16191f; --sidebar-foreground: #9aa3ad; --text: #f1f4f9; --border: rgb(255 255 255 / 12%); }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; height: 100dvh; }
+  body { margin: 0; background: transparent; color: var(--text); overflow: hidden;
+    font-family: Inter, "Noto Sans SC", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; }
+
+  /* ── 唯一窗口栏（产品 WindowTitlebar 同款视觉） ── */
+  #titlebar {
+    height: 40px; flex: none; display: flex; align-items: center; justify-content: space-between;
+    background: color-mix(in srgb, var(--sidebar) 95%, transparent);
+    border-bottom: 1px solid var(--border);
+    user-select: none; -webkit-user-select: none;
+  }
+  .tb-drag { -webkit-app-region: drag; app-region: drag; flex: 1; min-width: 0; height: 100%;
+    display: flex; align-items: center; gap: 8px; padding: 0 12px; }
+  .tb-drag img { width: 16px; height: 16px; border-radius: 4px; }
+  .tb-title { font-size: 12px; font-weight: 500;
+    color: color-mix(in srgb, var(--text) 80%, transparent); letter-spacing: .02em; }
+  .tb-btns { display: flex; height: 100%; }
+  .tb-btns button { width: 44px; height: 100%; border: 0; background: transparent;
+    color: color-mix(in srgb, var(--sidebar-foreground) 55%, transparent);
+    cursor: pointer; display: grid; place-items: center;
+    transition: background .15s, color .15s; }
+  .tb-btns button:hover { background: rgb(0 0 0 / 5%); color: var(--text); }
+  .tb-btns button.close:hover { background: var(--destructive); color: #fff; }
+
+  /* ── 内容区（空白容器, iframe 纯网页） ── */
+  #content { flex: 1; min-height: 0; position: relative; background: transparent; }
+  #content iframe { width: 100%; height: 100%; border: 0; display: block; background: transparent; }
+</style>
+</head>
+<body>
+  <!-- 唯一窗口栏（壳提供：产品 WindowTitlebar 同款） -->
+  <div id="titlebar">
+    <div class="tb-drag" id="dragRegion" data-tauri-drag-region="deep">
+      <img src="dsh-logo.svg" alt="" aria-hidden="true" onerror="this.style.display='none'">
+      <span class="tb-title">dsh-supervisor</span>
+    </div>
+    <div class="tb-btns">
+      <button id="btnMin" title="最小化" aria-label="最小化"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 6h8" stroke="currentColor" stroke-width="1" fill="none"/></svg></button>
+      <button id="btnMax" title="最大化/还原" aria-label="最大化"><svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x="1" y="1" width="8" height="8" rx="0.5" stroke="currentColor" stroke-width="1" fill="none"/></svg></button>
+      <button id="btnClose" class="close" title="关闭（隐藏到托盘）" aria-label="关闭"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.1" fill="none"/></svg></button>
+    </div>
+  </div>
+
+  <!-- 内容区：引导页 / 内核面板（纯网页） -->
+  <div id="content">
+    <iframe id="frame" src="bootstrap.html" title="内容"></iframe>
+  </div>
+
+  <script>
+  (function () {
+    var core = window.__TAURI__ && window.__TAURI__.core;
+    var evt = window.__TAURI__ && window.__TAURI__.event;
+    var frame = document.getElementById('frame');
+    var wctl = function (a) { if (core) core.invoke('win_ctl', { action: a }).catch(function () {}); };
+    document.getElementById('btnMin').addEventListener('click', function () { wctl('minimize'); });
+    document.getElementById('btnMax').addEventListener('click', function () { wctl('toggle-maximize'); });
+    document.getElementById('btnClose').addEventListener('click', function () { wctl('hide'); });
+    // 显式拖动（Linux WebKit drag-region 常不生效的可靠替代）
+    document.getElementById('dragRegion').addEventListener('mousedown', function () { wctl('drag'); });
+    // 引导完成 → 内容区切到面板
+    if (evt) {
+      evt.listen('shell:goto-panel', function () { frame.src = 'supervisor.html'; });
+      evt.listen('shell:goto-bootstrap', function () { frame.src = 'bootstrap.html'; });
+    }
+  })();
+  </script>
+</body>
+</html>
