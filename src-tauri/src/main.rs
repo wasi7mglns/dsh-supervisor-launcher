@@ -312,6 +312,11 @@ fn main() {
         std::process::exit(cli_plan());
     }
     tauri::Builder::default()
+        // 单实例管控（2026-09）：同一 user 会话内只允许一个壳实例——重复启动第二实例时
+        // 插件自动让新进程退出，回调里唤起既有主窗口（show+focus+导航面板），避免双壳/多壳并存。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main(app);
+        }))
         .manage(Mutex::new(RunState::default()))
         .invoke_handler(tauri::generate_handler![node_status, core_status, start_node_install, skip_env_upgrade, finish_boot, win_ctl])
         .setup(|app| {

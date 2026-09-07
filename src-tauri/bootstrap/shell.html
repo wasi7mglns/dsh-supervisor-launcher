@@ -95,9 +95,10 @@
     if (evt) {
       evt.listen('shell:goto-panel', function (e) {
         // 守卫托管面板 URL（Rust go_panel 从 config apiPort 动态给出, 同源直连守卫 API）
-        frame.src = (e && e.payload && e.payload.url) || 'supervisor.html';
+        var u = (e && e.payload && e.payload.url) || 'supervisor.html';
+        if (u !== frame.src) frame.src = u; // 自适应: 同 URL 不强制重载(守卫重启延时重发不刷面板)
       });
-      evt.listen('shell:goto-bootstrap', function () { frame.src = 'bootstrap.html'; });
+      evt.listen('shell:goto-bootstrap', function () { if (frame.src !== 'bootstrap.html') frame.src = 'bootstrap.html'; });
     }
   })();
   </script>
