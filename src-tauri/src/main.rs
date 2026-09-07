@@ -257,14 +257,22 @@ fn cli_plan() -> i32 {
     }
 }
 
-/// 打开面板。
-/// - embedded-panel（完整壳，默认）：导航到壳 frontend/ 内的 supervisor.html（壳内嵌 UI），
-///   面板 API 经 api_proxy command（Rust 侧转发守卫 3100，绕浏览器 CORS）。浏览器出口仍由守卫 GET / 托管 ui-react。
-/// - 无 embedded-panel（公开壳引导器，--no-default-features）：导航守卫 3100 托管面板（引导器形态）。
+/// 打开面板（分体架构 2026-09-07 定稿）：
+/// 壳 = 自绘窗口容器(shell.html 唯一窗口栏 + 内容 iframe)；面板由守卫内核 HTTP 托管（同源）。
+/// 切面板 = emit 守卫实际 API 基址(读 config.apiPort, 动态端口不硬编码) → 壳 iframe 导航该 URL，
+/// 页面与守卫 API 同源直连（无跨源/CORS 透传）。
 fn go_panel(app: &tauri::AppHandle) {
-    // 共用壳架构（2026-09-07 定稿）：窗口加载 shell.html（唯一窗口栏+内容 iframe），
-    // 面板/引导页都是 iframe 内容。切面板 = 通知壳框架把 iframe 切到 supervisor.html。
-    let _ = app.emit("shell:goto-panel", serde_json::json!({}));
+    let url = env::api_base_url(); // http://127.0.0.1:<config.apiPort 或高位段 fallback>/
+    // 壳框架(shell.html)的 evt listener 在首帧注册；setup 线程的 emit 可能早于注册被丢弃，
+    // 故延时重发数次覆盖竞态（listener 就绪后任一次生效即切面板）。
+    for (i, delay_ms) in [400u64, 1200, 2500].iter().enumerate() {
+        let h = app.clone();
+        let u = url.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+            let _ = h.emit("shell:goto-panel", serde_json::json!({ "url": u, "seq": i }));
+        });
+    }
 }
 
 fn show_main(app: &tauri::AppHandle) {

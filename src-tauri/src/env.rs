@@ -51,7 +51,7 @@ pub fn supervisor_dir() -> PathBuf {
 /// 失败/缺失回退 3100。壳极少更新但内核配置可演进——硬编码 3100 会让
 /// 改过 apiPort 的用户导航到死端口（2026-09 审计修复 F7）。
 pub fn api_base_url() -> String {
-    let default_port = 3100u16;
+    let default_port = 36360u16;  // 高位段起始（3100 常用端口易冲突，动态端口 2026-09-07）
     let port = std::fs::read_to_string(supervisor_dir().join("config.json"))
         .ok()
         .and_then(|s| {
