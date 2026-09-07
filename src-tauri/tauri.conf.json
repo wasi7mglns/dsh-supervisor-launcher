@@ -18,7 +18,7 @@
         "minHeight": 540,
         "resizable": true,
         "decorations": false,
-        "transparent": false,
+        "transparent": true,
         "url": "bootstrap.html"
       }
     ],
