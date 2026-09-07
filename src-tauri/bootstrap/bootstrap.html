@@ -5,159 +5,316 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>dsh-supervisor — 环境引导</title>
 <style>
+  /* ============================================================
+   * dsh-supervisor 环境引导 —— 横向安装向导（stepper）
+   * 视觉继承内核 UI 品牌启动加载页 DNA（#FAFBFC + 顶部 #2F54EB 光晕），
+   * 流程做成「一步一圆」的横向步骤条：检测环境 → Node.js → 守卫内核 → 打开面板。
+   * ============================================================ */
   :root {
-    --blue:#4176e6; --bg:#f4f6fb; --card:#ffffff; --text:#0f1115;
-    --muted:#81858c; --border:rgba(0,0,0,0.08);
-    --red:#b42318; --green:#10b981;
-    --ok-soft:#e7f6ed; --warn-soft:#fef3c7; --danger-soft:#fee2e2;
-    --primary-grad: linear-gradient(180deg,#3d5ef0 0%,#2f54eb 100%);
-    --primary-grad-hover: linear-gradient(180deg,#4f7bf0 0%,#2f54eb 100%);
-    --primary-shadow: 0 1px 2px rgba(15,23,42,0.16), inset 0 1px 0 rgba(255,255,255,0.22);
-    --muted-bg: rgba(0,0,0,0.05);
-    --glow: radial-gradient(circle at 50% 0%, rgba(65,118,230,0.13), transparent 62%),
-            linear-gradient(135deg, rgba(65,118,230,0.05), transparent 60%);
-    --font: -apple-system,BlinkMacSystemFont,'Inter','Noto Sans SC',ui-sans-serif,
-            system-ui,'PingFang SC','Microsoft YaHei',sans-serif;
+    font-family: Inter, "Noto Sans SC", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #171717;
+    --brand: #2F54EB;
+    --brand-soft: rgb(47 84 235 / 12%);
+    --bg: #FAFBFC;
+    --text: #0F1115;
+    --status: #6b747d;
+    --line: #DDE3EC;
+    --ok: #10b981;
+    --danger: #b42318;
+    --danger-soft: #fee2e2;
+    --border: rgb(0 0 0 / 8%);
   }
-  @media (prefers-color-scheme: dark){
-    :root{
-      --blue:#6b83ff; --bg:#0f1115; --card:#16191f; --text:#f1f4f9;
-      --muted:#9aa3ad; --border:rgb(255 255 255/14%);
-      --red:#f87171; --green:#34d399;
-      --ok-soft:rgba(16,185,129,0.14); --warn-soft:rgba(245,158,11,0.14);
-      --danger-soft:rgba(239,68,68,0.14);
-      --primary-grad: linear-gradient(180deg,#4f6ef2 0%,#3a56e0 100%);
-      --primary-grad-hover: linear-gradient(180deg,#6484f5 0%,#4f6ef2 100%);
-      --primary-shadow: 0 1px 2px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.14);
-      --muted-bg: rgba(255,255,255,0.06);
-      --glow: radial-gradient(circle at 50% 0%, rgba(107,131,255,0.16), transparent 62%),
-              linear-gradient(135deg, rgba(107,131,255,0.06), transparent 60%);
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --brand: #6b83ff; --brand-soft: rgb(107 131 255 / 18%);
+      --bg: #0f1115; --text: #f1f4f9; --status: #9aa3ad; --line: #262b36;
+      --ok: #34d399; --danger: #f87171; --danger-soft: rgb(239 68 68 / 14%);
+      --border: rgb(255 255 255 / 14%);
     }
   }
-  * { box-sizing:border-box; }
-  html { background:transparent; }
-  body{ margin:0; font-family:var(--font); color:var(--text);
-        background:var(--bg); min-height:100vh; min-height:100dvh;
-        display:flex; align-items:center; justify-content:center; }
-  body::before{ content:''; position:fixed; inset:38px 0 0 0;
-               background:var(--glow); pointer-events:none; z-index:0; }
-  #tb{ position:fixed; top:0; left:0; right:0; height:38px; display:flex;
-       align-items:center; justify-content:space-between; -webkit-app-region:drag;
-       user-select:none; z-index:10;
-       background:color-mix(in srgb, var(--card) 55%, transparent);
-       -webkit-backdrop-filter:blur(12px) saturate(1.4); backdrop-filter:blur(12px) saturate(1.4);
-       border-bottom:1px solid var(--border); }
-  #tb .tb-title{ padding-left:14px; font-size:12.5px; font-weight:500; color:var(--muted);
-                 letter-spacing:.04em; text-transform:uppercase; }
-  #tb .tb-btns{ display:flex; height:100%; -webkit-app-region:no-drag; }
-  #tb .tb-btns button{ width:44px; height:100%; border:0; background:transparent;
-                        color:var(--muted); font-size:15px; cursor:pointer; line-height:1; }
-  #tb .tb-btns button:hover{ background:rgba(65,118,230,0.08); color:var(--text); }
-  #tb .tb-btns button.tb-close:hover{ background:var(--red); color:#fff; }
-  .card{ position:relative; z-index:1; background:var(--card); border:1px solid var(--border);
-         border-radius:20px; padding:34px 40px 30px; width:540px;
-         box-shadow:0 1px 2px rgba(15,23,42,0.04), 0 16px 48px rgba(15,23,42,0.10),
-         inset 0 1px 0 rgba(255,255,255,0.6); }
-  .card::before{ content:''; position:absolute; top:0; left:0; right:0; height:3px;
-                 background:linear-gradient(90deg, transparent, var(--blue), transparent);
-                 border-radius:20px 20px 0 0; opacity:.9; }
-  h1{ font-size:21px; margin:0 0 6px; font-weight:650; letter-spacing:-.01em; }
-  .sub{ color:var(--muted); font-size:13.5px; margin-bottom:22px; line-height:1.7; }
-  .badge{ display:inline-flex; align-items:center; gap:6px; padding:4px 12px;
-          border-radius:999px; font-size:12px; font-weight:550; margin-bottom:16px; }
-  .badge::before{ content:''; width:6px; height:6px; border-radius:50%;
-                  background:currentColor; box-shadow:0 0 6px currentColor; }
-  .badge.miss{ background:var(--danger-soft); color:var(--red); }
-  .badge.warn{ background:var(--warn-soft); color:#92400e; }
-  .badge.ok{ background:var(--ok-soft); color:var(--green); }
-  .row{ font-size:13.5px; color:var(--muted); margin:5px 0; display:flex;
-        justify-content:space-between; align-items:center; }
-  .row b{ color:var(--text); font-family:ui-monospace,menlo,consolas,monospace;
-          font-size:13px; background:var(--muted-bg); padding:1px 7px; border-radius:6px; }
-  .bar{ height:7px; background:rgba(127,127,127,0.12); border-radius:4px;
-        margin:18px 0 8px; overflow:hidden; }
-  .fill{ height:100%; width:0; background:linear-gradient(90deg, var(--blue), #6ea5ff);
-         border-radius:4px; transition:width .3s cubic-bezier(.4,0,.2,1);
-         box-shadow:0 0 8px rgba(65,118,230,0.5); }
-  .pct{ font-size:12px; color:var(--muted); text-align:right; }
-  .btn{ width:100%; margin-top:18px; padding:12px; border:0; border-radius:10px;
-        background:var(--primary-grad); color:#fff; font-size:15px; font-weight:600;
-        font-family:inherit; cursor:pointer; box-shadow:var(--primary-shadow);
-        transition:filter .15s ease, transform .06s ease; }
-  .btn:hover:not(:disabled){ background:var(--primary-grad-hover); filter:brightness(1.04); }
-  .btn:active:not(:disabled){ transform:translateY(1px); }
-  .btn:disabled{ opacity:.5; cursor:default; }
-  .btn.ghost{ background:transparent; border:1px solid var(--border); color:var(--blue);
-              margin-top:8px; box-shadow:none; }
-  .btn.ghost:hover:not(:disabled){ background:rgba(65,118,230,0.07); filter:none; }
-  pre{ background:#0b0e14; color:#8ee6b0; border:1px solid var(--border); border-radius:10px;
-       padding:12px 14px; font-size:11.5px; line-height:1.65; max-height:140px; overflow:auto;
-       margin:14px 0 0; white-space:pre-wrap; word-break:break-all; }
-  .err{ background:var(--danger-soft); color:var(--red); border-radius:10px; padding:11px 14px;
-        font-size:12.5px; margin-top:14px; display:none;
-        border:1px solid rgba(239,68,68,0.18); }
-  .muted{ color:var(--muted); font-size:12px; margin-top:14px; line-height:1.6; }
+  * { box-sizing: border-box; }
+  html { background: transparent; }
+  html, body { width: 100%; height: 100%; height: 100dvh; }
+  body {
+    margin: 0; overflow: hidden; user-select: none; -webkit-user-select: none;
+    background: transparent; color: var(--text);
+  }
+  #tb {
+    position: fixed; top: 0; left: 0; right: 0; height: 38px;
+    display: flex; align-items: center; justify-content: space-between;
+    -webkit-app-region: drag; user-select: none; z-index: 10;
+    background: color-mix(in srgb, var(--bg) 62%, transparent);
+    border-bottom: 1px solid var(--border);
+    -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+  }
+  #tb .tb-title { padding-left: 14px; font-size: 11.5px; font-weight: 500; color: var(--status); letter-spacing: .06em; }
+  #tb .tb-btns { display: flex; height: 100%; -webkit-app-region: no-drag; }
+  #tb .tb-btns button { width: 44px; height: 100%; border: 0; background: transparent; color: var(--status); font-size: 15px; cursor: pointer; line-height: 1; }
+  #tb .tb-btns button:hover { background: rgb(47 84 235 / 8%); color: var(--text); }
+  #tb .tb-btns button.tb-close:hover { background: var(--danger); color: #fff; }
+
+  .startup-shell {
+    display: grid; width: 100%; height: 100%;
+    grid-template-rows: 1fr auto auto 1fr;
+    place-items: center; overflow: hidden; padding: 38px 0 0;
+    background:
+      radial-gradient(circle at 50% 30%, var(--brand-soft), transparent 34%),
+      var(--bg);
+  }
+  /* ── 横向步骤条 ── */
+  .stepper { display: flex; align-items: flex-start; justify-content: center; gap: 0; padding: 34px 40px 6px; }
+  .step { display: flex; flex-direction: column; align-items: center; width: 118px; position: relative; }
+  .step-dot {
+    position: relative; width: 34px; height: 34px; border-radius: 50%;
+    display: grid; place-items: center; z-index: 2;
+    background: var(--bg);
+    border: 2px solid var(--line); color: var(--status);
+    transition: all .3s ease;
+  }
+  /* 完成：品牌绿勾 */
+  .step.done .step-dot { border-color: var(--ok); color: var(--ok); }
+  .step.done .step-dot svg { display: block; }
+  .step.done .step-dot .n, .step.done .step-dot .ring { display: none; }
+  /* 当前：品牌蓝 + 环 */
+  .step.active .step-dot { border-color: var(--brand); color: var(--brand); }
+  .step.active .step-dot .ring { display: block; }
+  .step.active .step-dot .n { display: none; }
+  .step.active .step-dot .svg-ok { display: none; }
+  /* 当前步圆环进度（conic） */
+  .ring {
+    position: absolute; inset: -4px; border-radius: 50%; display: none;
+    background: conic-gradient(var(--brand) calc(var(--p, 0) * 1%), transparent 0);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px));
+            mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px));
+    transition: background .2s;
+  }
+  .step .step-dot svg { display: none; }
+  .step .step-dot .n { font-size: 13px; font-weight: 600; }
+  .step-label { margin-top: 9px; font-size: 12px; color: var(--status); text-align: center; line-height: 1.35; }
+  .step.active .step-label { color: var(--text); font-weight: 600; }
+  .step.done .step-label { color: var(--status); }
+  /* 连接线 */
+  .step:not(:last-child)::after {
+    content: ''; position: absolute; top: 16px; left: calc(50% + 22px); right: calc(-50% + 22px);
+    height: 2px; background: var(--line); z-index: 1;
+  }
+  .step.done:not(:last-child)::after { background: var(--ok); opacity: .45; }
+  .step.active:not(:last-child)::after { background: linear-gradient(90deg, var(--brand), var(--line)); }
+
+  /* ── 中央内容 ── */
+  .stage { display: grid; justify-items: center; gap: 12px; padding: 10px 40px 30px; align-content: start; }
+  .stage-status { color: var(--status); font-size: 13px; line-height: 1.6; text-align: center; min-height: 20px; }
+  .stage-status b { color: var(--text); }
+  .stage-detail { color: var(--status); font-size: 12px; line-height: 1.7; text-align: center; min-height: 16px; }
+  .stage-detail b { color: var(--text); font-weight: 600; }
+  /* Node 子阶段行（步骤②展开） */
+  .substage { display: flex; align-items: center; gap: 8px; color: var(--status); font-size: 12px; line-height: 1.6; }
+  .substage .sdot { width: 6px; height: 6px; border-radius: 50%; background: var(--line); flex: none; }
+  .substage.on .sdot { background: var(--brand); box-shadow: 0 0 6px var(--brand); animation: pulse 1s ease infinite; }
+  .substage.done .sdot { background: var(--ok); }
+  .substage.fail .sdot { background: var(--danger); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  .btn {
+    width: 240px; padding: 10px 16px; border: 0; border-radius: 9px;
+    background: linear-gradient(180deg, #3d5ef0 0%, #2f54eb 100%);
+    color: #fff; font-size: 14px; font-weight: 600; font-family: inherit;
+    cursor: pointer; box-shadow: 0 1px 2px rgb(15 23 42 / 16%), inset 0 1px 0 rgb(255 255 255 / 22%);
+    transition: filter .15s ease, transform .06s ease;
+  }
+  .btn:hover:not(:disabled) { filter: brightness(1.05); }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.ghost { width: 240px; background: transparent; border: 1px solid var(--border); color: var(--brand); box-shadow: none; }
+  .btn.ghost:hover:not(:disabled) { background: rgb(47 84 235 / 7%); filter: none; }
+  .btn.sm { width: auto; padding: 7px 14px; font-size: 12.5px; }
+  .btns { display: grid; gap: 8px; justify-items: center; }
+  .err {
+    display: none; background: var(--danger-soft); color: var(--danger);
+    border-radius: 8px; padding: 8px 12px; font-size: 12px; line-height: 1.5;
+    max-width: 360px; text-align: left;
+  }
+  pre.log {
+    display: none; width: min(420px, calc(100% - 40px)); max-height: 84px; overflow: auto; margin: 0;
+    background: #0b0e14; color: #8ee6b0; border-radius: 8px; padding: 8px 10px;
+    font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+  }
 </style>
 </head>
 <body>
-<div id="tb" data-tauri-drag-region="deep"><span class="tb-title">dsh-supervisor 环境引导</span><span class="tb-btns" data-tauri-drag-region="false"><button id="tbMin">−</button><button id="tbClose" class="tb-close">×</button></span></div>
-<div class="card">
-  <div id="badge" class="badge miss">检测环境…</div>
-  <h1 id="title">dsh-supervisor 环境引导</h1>
-  <div class="sub" id="sub">正在检测是否已安装 Node.js（DSH 与守护服务的运行环境）…</div>
-  <div class="row">当前 Node：<b id="cur">—</b></div>
-  <div class="row">官方最新 LTS：<b id="latest">—</b></div>
-  <div class="row">守卫内核：<b id="core">检测中…</b> <span id="coreHint" style="display:none"></span></div>
-  <div class="bar"><div class="fill" id="fill"></div></div>
-  <div class="pct" id="pct"></div>
-  <button class="btn" id="installBtn" style="display:none">一键安装 Node.js LTS</button>
-  <button class="btn ghost" id="skipBtn" style="display:none">跳过并使用现有版本</button>
-  <button class="btn ghost" id="retryBtn" style="display:none">重新检测</button>
-  <pre id="log" style="display:none"></pre>
-  <div class="err" id="err"></div>
-  <div class="muted">将下载官方 Node.js 最新 LTS 并安装到系统（需一次管理员授权）。安装完成后守卫将自动启动并打开面板。</div>
-</div>
+<div id="tb" data-tauri-drag-region="deep"><span class="tb-title">dsh-supervisor · 环境引导</span><span class="tb-btns" data-tauri-drag-region="false"><button id="tbMin">−</button><button id="tbClose" class="tb-close">×</button></span></div>
+
+<main class="startup-shell">
+  <!-- 横向步骤条：①检测环境 ②Node.js ③守卫内核 ④打开面板 -->
+  <div class="stepper" id="stepper" style="display:none">
+    <div class="step active" id="st-env">
+      <div class="step-dot"><span class="ring" id="rg-env"></span><span class="n">1</span><svg class="svg-ok" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div class="step-label">检测环境</div>
+    </div>
+    <div class="step" id="st-node">
+      <div class="step-dot"><span class="ring" id="rg-node"></span><span class="n">2</span><svg class="svg-ok" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div class="step-label">Node.js 运行时</div>
+    </div>
+    <div class="step" id="st-guard">
+      <div class="step-dot"><span class="ring" id="rg-guard"></span><span class="n">3</span><svg class="svg-ok" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div class="step-label">守卫内核</div>
+    </div>
+    <div class="step" id="st-panel">
+      <div class="step-dot"><span class="ring" id="rg-panel"></span><span class="n">4</span><svg class="svg-ok" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div class="step-label">打开面板</div>
+    </div>
+  </div>
+
+  <!-- 当前步内容 -->
+  <div class="stage" id="stage">
+    <div class="stage-status" id="sub">正在检测环境…</div>
+    <div class="stage-detail" id="detail">
+      <div id="substageNode" style="display:none"></div>
+      <div id="coreLine" style="display:none">守卫内核：<b id="core">检测中…</b></div>
+      <div id="hintLine" style="display:none"></div>
+    </div>
+    <div class="btns" id="btns" style="display:none">
+      <button class="btn" id="installBtn" style="display:none">一键安装 Node.js LTS</button>
+      <button class="btn ghost" id="skipBtn" style="display:none">跳过并使用现有版本</button>
+      <button class="btn ghost sm" id="retryBtn" style="display:none">重新检测</button>
+    </div>
+    <pre class="log" id="log"></pre>
+    <div class="err" id="err"></div>
+  </div>
+</main>
+
 <script>
 (function () {
   var core = window.__TAURI__ && window.__TAURI__.core;
   var evt = window.__TAURI__ && window.__TAURI__.event;
   var $ = function (id) { return document.getElementById(id); };
   var lastCore = { installed: null, hint: '' };
+  var STEP = { ENV: 0, NODE: 1, GUARD: 2, PANEL: 3 };
+  var cur = STEP.ENV;
+  var nodeOk = false, nodeBusy = false, nodeMiss = false, nodeOld = false;
+  var coreOk = false;
+  var steps = ['st-env', 'st-node', 'st-guard', 'st-panel'];
+  var rings = ['rg-env', 'rg-node', 'rg-guard', 'rg-panel'];
+
+  function setStep(idx, cls) {
+    if (idx > cur) cur = idx;
+    steps.forEach(function (id, i) {
+      var el = document.getElementById(id);
+      el.classList.remove('active', 'done');
+      if (i < cur) el.classList.add('done');
+      else if (i === cur) el.classList.add('active');
+    });
+    if (cls) document.getElementById(steps[idx]).classList.add(cls);
+    document.getElementById('stepper').style.display = '';
+  }
+  function ringPct(idx, pct) {
+    var el = document.getElementById(rings[idx]);
+    el.style.setProperty('--p', Math.max(0, Math.min(100, pct)));
+  }
+  function setStatus(txt) { $('sub').textContent = txt; }
+
   function renderCore() {
     var ok = lastCore.installed === true;
+    coreOk = ok;
     $('core').textContent = ok ? '已安装' : (lastCore.installed === false ? '未安装' : '检测中…');
-    $('core').style.color = ok ? 'var(--green)' : 'var(--red)';
-    $('coreHint').textContent = ok ? '' : lastCore.hint;
-    $('coreHint').style.display = ok ? 'none' : '';
+    $('core').style.color = ok ? 'var(--ok)' : 'var(--danger)';
+    $('coreLine').style.display = '';
+    if (!ok && lastCore.hint) { $('hintLine').textContent = lastCore.hint; $('hintLine').style.display = ''; }
+    else $('hintLine').style.display = 'none';
   }
-  function setState(st) {
-    $('cur').textContent = st.installed || '未安装';
-    $('latest').textContent = st.latest || '获取中…';
-    if (st.progress > 0) { $('fill').style.width = (st.progress * 100) + '%'; $('pct').textContent = Math.round(st.progress * 100) + '%'; }
-    if (st.status) { $('sub').textContent = st.status; }
-    var miss = !st.installed;
-    var outdated = st.outdated === true; // 已装但低于官方最新 LTS
-    var badge = $('badge');
-    badge.className = 'badge ' + (miss ? 'miss' : (outdated ? 'warn' : 'ok'));
-    badge.textContent = miss ? '缺少 Node.js' : (outdated ? 'Node.js 可升级' : '环境就绪');
-    if (st.busy) { $('installBtn').disabled = true; $('installBtn').textContent = '安装中…'; }
-    else if (miss) { $('installBtn').disabled = false; $('installBtn').textContent = '一键安装 Node.js LTS'; }
-    else if (outdated) { $('installBtn').disabled = false; $('installBtn').textContent = '升级到官方最新 LTS'; }
-    $('installBtn').style.display = (miss || outdated) ? '' : 'none';
-    $('skipBtn').style.display = (outdated && !st.busy) ? '' : 'none';
-    $('retryBtn').style.display = miss ? '' : 'none';
+
+  /* Node 安装子阶段渲染：从 status 文本推断当前动作 */
+  var NODE_SUBS = [
+    { k: 'latest', label: '获取官方最新版本', re: /最新|LTS/ },
+    { k: 'download', label: '下载 Node.js', re: /下载/ },
+    { k: 'verify', label: '校验完整性 (SHA256)', re: /校验/ },
+    { k: 'install', label: '安装到系统', re: /准备安装|安装中|写入/ }
+  ];
+  function renderNodeSubs(status) {
+    var box = $('substageNode');
+    if (!nodeBusy || !status) { box.style.display = 'none'; return; }
+    box.style.display = 'grid';
+    box.style.justifyItems = 'center';
+    box.innerHTML = '';
+    var hit = false;
+    NODE_SUBS.forEach(function (s, i) {
+      var on = !!status && s.re.test(status);
+      if (on) hit = true;
+      var row = document.createElement('div');
+      row.className = 'substage' + (on ? ' on' : '');
+      row.innerHTML = '<span class="sdot"></span>' + s.label;
+      box.appendChild(row);
+    });
+    if (!hit) box.style.display = 'none';
+  }
+
+  function applyState(st) {
+    if (!st) return;
+    nodeBusy = !!st.busy;
+    if (st.installed) { nodeOk = true; nodeMiss = false; }
+    // 达标判定：壳返回 minOk(>=22.12)；兼容旧壳无字段时回退 outdated 语义
+    var minOk = st.minOk === undefined ? !st.outdated : !!st.minOk;
+    nodeMiss = !st.installed && !nodeBusy;
+    nodeOld = !nodeMiss && !nodeBusy && !minOk;
+    // nodeOld 已在上方按 minOk 推导（低于最低门槛才为真）
+
+    /* 步骤推进：以 node/core 状态推导 */
+    if (nodeMiss || nodeOld) {
+      // 停在 Node 步
+      setStep(STEP.NODE, 'active');
+      if (nodeMiss) setStatus('缺少 Node.js 运行环境，需安装');
+      else setStatus('检测到 Node.js 旧版本，建议升级到官方 LTS');
+    } else if (nodeBusy) {
+      setStep(STEP.NODE, 'active');
+      setStatus(st.status || '正在安装 Node.js…');
+    } else if (nodeOk) {
+      // Node 就绪
+      if (coreOk) { setStep(STEP.PANEL, 'active'); setStatus('环境就绪 · 正在打开面板…'); }
+      else { setStep(STEP.GUARD, 'active'); setStatus('Node.js 已就绪 · 正在准备守卫内核…'); }
+    } else {
+      setStep(STEP.ENV, 'active');
+      setStatus(st.status || '正在检测环境…');
+    }
+
+    // Node 步环进度（busy 且有 progress）
+    if (nodeBusy && st.progress > 0) {
+      ringPct(STEP.NODE, st.progress * 100);
+    } else if (!nodeMiss && !nodeOld && nodeOk && !nodeBusy) {
+      ringPct(STEP.NODE, 100);
+    }
+
+    // 子阶段
+    renderNodeSubs(st.status || '');
+    $('detail').style.display = (nodeBusy || nodeMiss || nodeOld || !coreOk) ? '' : 'none';
+
+    // 按钮
+    if (nodeBusy) { $('btns').style.display = 'none'; }
+    else if (nodeMiss || nodeOld) {
+      $('btns').style.display = 'grid';
+      $('installBtn').disabled = false;
+      $('installBtn').textContent = nodeMiss ? '一键安装 Node.js LTS' : '升级到官方最新 LTS';
+      $('installBtn').style.display = '';
+      $('skipBtn').style.display = nodeOld ? '' : 'none';
+      $('retryBtn').style.display = nodeMiss ? '' : 'none';
+    } else { $('btns').style.display = 'none'; }
+
     if (st.logs && st.logs.length) { $('log').style.display = ''; $('log').textContent = st.logs.join('\n'); }
-    if (st.error) { $('err').style.display = ''; $('err').textContent = '失败：' + st.error; $('retryBtn').style.display = ''; }
-    else { $('err').style.display = 'none'; }
+    if (st.error) {
+      $('err').style.display = ''; $('err').textContent = '失败：' + st.error;
+      $('btns').style.display = 'grid';
+      $('installBtn').style.display = ''; $('retryBtn').style.display = '';
+    } else $('err').style.display = 'none';
   }
+
   function refresh() {
     if (!core) return;
     core.invoke('node_status').then(function (st) {
-      core.invoke('core_status').then(function (cs) { lastCore = cs; renderCore(); }).catch(function () {});
-      setState(st);
+      core.invoke('core_status').then(function (cs) { lastCore = cs; renderCore(); applyState(st); }).catch(function () { applyState(st); });
     }).catch(function (e) { $('err').style.display=''; $('err').textContent = '调用失败: ' + e; });
   }
-  renderCore();
+
+  document.getElementById('stepper').style.display = 'none';
+  setStatus('正在检测环境…');
   $('installBtn').addEventListener('click', function () {
     if (!core) return;
     core.invoke('start_node_install').catch(function (e) { $('err').style.display=''; $('err').textContent = '启动安装失败: ' + e; });
@@ -168,13 +325,18 @@
   });
   $('retryBtn').addEventListener('click', refresh);
   if (evt) {
-    evt.listen('env_progress', function (e) { setState(e.payload || {}); });
-    evt.listen('env_done', function (e) { setState({ installed: (e.payload || {}).version, latest: (e.payload || {}).version, progress: 1 }); $('sub').textContent = 'Node.js 就绪，正在打开面板…'; });
+    evt.listen('env_progress', function (e) { applyState(e.payload || {}); });
+    evt.listen('env_done', function (e) {
+      var p = e.payload || {};
+      applyState({ installed: p.version, latest: p.version, progress: 1, status: 'Node.js 就绪' });
+      ringPct(STEP.NODE, 100);
+      setStatus('Node.js 就绪 · 正在打开面板…');
+      $('btns').style.display = 'none';
+    });
     evt.listen('env_error', function (e) { refresh(); });
     evt.listen('env_status', function (e) { refresh(); });
   }
   refresh();
-  // Phase 3b: 无边框窗口控制（win_ctl IPC）
   var core2 = window.__TAURI__ && window.__TAURI__.core;
   if (core2) {
     var wctl = function (a) { core2.invoke('win_ctl', { action: a }).catch(function () {}); };
@@ -185,8 +347,7 @@
   } else {
     var tb = document.getElementById('tb'); if (tb) tb.style.display = 'none';
   }
-  setInterval(refresh, 5000);
-  setInterval(function () { if (lastCore.installed === null) { core.invoke('core_status').then(function (cs) { lastCore = cs; renderCore(); }).catch(function () {}); } }, 5000);
+  setInterval(refresh, 4000);
 })();
 </script>
 </body>

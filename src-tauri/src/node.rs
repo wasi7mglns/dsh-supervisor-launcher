@@ -180,6 +180,18 @@ pub fn outdated(installed: Option<&str>, latest: &str) -> bool {
     }
 }
 
+/// DSH 运行最低 Node 门槛（commander 要求 Node >= 22.12.0，2026-09 核实）。
+/// 引导策略：达到最低标准即放行（不要求最新 LTS）——旧于最新但 >= 门槛直接进后续。
+pub const MIN_NODE: &str = "v22.12.0";
+
+/// 是否达到 DSH 最低 Node 要求：None（未装）→ false；已装 → 版本 >= MIN_NODE。
+pub fn meets_minimum(installed: Option<&str>) -> bool {
+    match installed {
+        None => false,
+        Some(v) => !version_gt(MIN_NODE, v),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +208,16 @@ mod tests {
         assert!(outdated(Some("v26.7.0"), "v26.8.1"));
         assert!(!outdated(Some("v26.8.1"), "v26.8.1"));
         assert!(!outdated(Some("v27.0.0"), "v26.8.1"));
+    }
+    #[test]
+    fn meets_minimum_logic() {
+        assert!(!meets_minimum(None));
+        assert!(!meets_minimum(Some("v18.20.0")));
+        assert!(!meets_minimum(Some("v21.0.0")));
+        assert!(meets_minimum(Some("v22.12.0")));
+        assert!(meets_minimum(Some("v22.25.0")));
+        assert!(meets_minimum(Some("v26.7.0")));
+        assert!(meets_minimum(Some("v27.0.0")));
     }
 }
 

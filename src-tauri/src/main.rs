@@ -63,6 +63,8 @@ fn node_status(state: tauri::State<Mutex<RunState>>, app: tauri::AppHandle) -> s
     }
     let mut o = log(&st);
     o["installed"] = serde_json::json!(installed);
+    // DSH 最低门槛判定（>=22.12）：引导页据此决定是否需装 Node，outdated 仅展示不再阻塞
+    o["minOk"] = serde_json::json!(node::meets_minimum(installed.as_deref()));
     if let Some(latest) = &st.latest {
         o["outdated"] = serde_json::json!(node::outdated(installed.as_deref(), latest));
     }
@@ -298,8 +300,30 @@ fn go_panel(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         #[cfg(feature = "embedded-panel")]
         {
-            // 相对导航到同一 frontendDist 内的面板页（跨平台协议无关：保持当前 scheme/host）
-            let _ = win.eval("window.location.href = 'supervisor.html'");
+            // 完整壳：导航到 frontend 内的 supervisor.html。
+            // 优先基于当前窗口 URL 构造同源目标（navigate 不依赖页面 JS 就绪，自动跳转也可靠）；
+            // 读 URL 失败再退 eval 相对跳转。
+            let mut navigated = false;
+            if let Ok(cur) = win.url() {
+                let s = cur.as_str();
+                // 当前是 tauri asset 页（bootstrap.html 等）→ 同目录换 supervisor.html
+                if s.contains("bootstrap.html") || s.contains("supervisor.html") || s.ends_with('/') {
+                    if let Some((base, _)) = s.rsplit_once('/') {
+                        if !s.ends_with("supervisor.html") {
+                            let target = format!("{}/supervisor.html", base);
+                            if let Ok(tu) = tauri::Url::parse(&target) {
+                                let _ = win.navigate(tu);
+                                navigated = true;
+                            }
+                        } else {
+                            navigated = true; // 已在面板页，幂等
+                        }
+                    }
+                }
+            }
+            if !navigated {
+                let _ = win.eval("if (!location.pathname.endsWith('/supervisor.html')) location.href = 'supervisor.html';");
+            }
         }
         #[cfg(not(feature = "embedded-panel"))]
         {
@@ -345,8 +369,8 @@ fn main() {
                 .ok().and_then(|p| p.parse().ok()).unwrap_or_else(|| env::api_port());
             let handle = app.handle().clone();
 
-            // 环境判定：missing 或 outdated(低于官方最新 LTS) → 引导页（安装/升级 + 跳过）；
-            // 已最新 → 拉起守卫进入面板。初始 url 即 bootstrap.html，未导航前天然停留在引导页。
+            // 环境判定（2026-09 改）：Node 缺失或低于最低标准(>=22.12, DSH commander 硬门槛) → 引导页安装；
+            // 达标（即使不是最新 LTS）→ 直接拉起守卫进入面板，不卡升级。初始 url 即 bootstrap.html。
             let have = env::probe_system_node();
             {
                 let st = handle.state::<Mutex<RunState>>();
@@ -361,9 +385,11 @@ fn main() {
                     drop(s);
                     let _ = handle.emit("env_status", serde_json::json!({ "latest": v }));
                 }
-                let need = latest.map(|l| node::outdated(have.as_ref().map(|x| x.1.as_str()), &l)).unwrap_or(true);
+                // 引导门槛（2026-09 改）：Node 达到 DSH 最低标准(>=22.12)即放行，不要求最新 LTS。
+                // latest 仅作 node_status 信息展示，不再阻塞升级。
+                let need = !node::meets_minimum(have.as_ref().map(|x| x.1.as_str()));
                 if !need {
-                    // Node 已最新：查内核 → 拉起守卫 → 面板；内核缺失 → 引导页提示安装命令。
+                    // Node 达标：查内核 → 拉起守卫 → 面板；内核缺失 → 引导页提示安装命令。
                     if locate_core(&handle).is_some() {
                         if let Err(e) = ensure_guard(&handle) {
                             let _ = handle.emit("env_error", serde_json::json!({ "error": e }));
