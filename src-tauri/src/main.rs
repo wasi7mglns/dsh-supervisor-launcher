@@ -368,7 +368,7 @@ fn main() {
             let start = tauri::menu::MenuItem::with_id(app, "start", "启动 DSH", true, None::<&str>)?;
             let stop = tauri::menu::MenuItem::with_id(app, "stop", "停止 DSH", true, None::<&str>)?;
             let restart = tauri::menu::MenuItem::with_id(app, "restart", "重启一次", true, None::<&str>)?;
-            let quit = tauri::menu::MenuItem::with_id(app, "quit", "退出托盘", true, None::<&str>)?;
+            let quit = tauri::menu::MenuItem::with_id(app, "quit", "退出管家", true, None::<&str>)?;
             let menu = tauri::menu::Menu::with_items(app, &[&show_m, &start, &stop, &restart, &quit])?;
 
             tauri::tray::TrayIconBuilder::with_id("dsh-supervisor-tray")
@@ -379,10 +379,15 @@ fn main() {
                 .on_menu_event(move |app, event| {
                     match event.id.as_ref() {
                         "show" => show_main(app),
-                        "start" => post_local(port, "/start"),
-                        "stop" => post_local(port, "/stop"),
-                        "restart" => post_local(port, "/restart"),
-                        "quit" => app.exit(0),
+                        // 归一化：启停唯一入口 /lifecycle/dsh/*（旧 /start|/stop|/restart 已删，2026-09）
+                        "start" => post_local(port, "/lifecycle/dsh/start"),
+                        "stop" => post_local(port, "/lifecycle/dsh/stop"),
+                        "restart" => post_local(port, "/lifecycle/dsh/restart"),
+                        // 退出管家 = 完全退出：通知守卫停止全部服务链，随后壳退出
+                        "quit" => {
+                            post_local(port, "/shutdown");
+                            app.exit(0);
+                        }
                         _ => {}
                     }
                 })
@@ -397,6 +402,15 @@ fn main() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // 关闭窗口行为（读守卫 config.closeAction，系统级开关 2026-09）：
+                // 'exit' = 退出管家（通知守卫停止全部服务链 + 壳退出）；默认 'hide' = 隐藏至托盘常驻。
+                if env::close_action() == "exit" {
+                    let app = window.app_handle();
+                    let port = env::api_port();
+                    post_local(port, "/shutdown");
+                    let _ = app.exit(0);
+                    return;
+                }
                 let _ = window.hide();
                 api.prevent_close();
             }

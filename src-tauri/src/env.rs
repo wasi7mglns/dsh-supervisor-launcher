@@ -71,6 +71,23 @@ pub fn api_base_url() -> String {
     format!("http://127.0.0.1:{}/", port)
 }
 
+/// 关闭窗口时的行为（读守卫 config.closeAction；'exit'=退出管家全关，其余=隐藏至托盘）。
+pub fn close_action() -> String {
+    std::fs::read_to_string(supervisor_dir().join("config.json"))
+        .ok()
+        .and_then(|s| {
+            for pat in ["\"closeAction\": \"", "\"closeAction\":\""] {
+                if let Some(idx) = s.find(pat) {
+                    let rest = &s[idx + pat.len()..];
+                    let v: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+                    if v == "exit" || v == "hide" { return Some(v); }
+                }
+            }
+            None
+        })
+        .unwrap_or_else(|| "hide".into())
+}
+
 /// 壳可用性探测用守卫端口（与 api_base_url 同源解析）。
 pub fn api_port() -> u16 {
     let u = api_base_url();
