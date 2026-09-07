@@ -82,6 +82,14 @@ fn skip_env_upgrade(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 引导页走完所有检测步骤后调用：进入面板（go_panel —— emit 守卫 URL，壳框架 iframe 切换）。
+/// 由引导页 JS 在展示完整启动过程后触发，避免步骤一闪而过无感知。
+#[tauri::command]
+fn finish_boot(app: tauri::AppHandle) -> Result<(), String> {
+    go_panel(&app);
+    Ok(())
+}
+
 #[tauri::command]
 fn start_node_install(state: tauri::State<Mutex<RunState>>, app: tauri::AppHandle) -> Result<(), String> {
     let mut st = state.lock().unwrap();
@@ -305,7 +313,7 @@ fn main() {
     }
     tauri::Builder::default()
         .manage(Mutex::new(RunState::default()))
-        .invoke_handler(tauri::generate_handler![node_status, core_status, start_node_install, skip_env_upgrade, win_ctl])
+        .invoke_handler(tauri::generate_handler![node_status, core_status, start_node_install, skip_env_upgrade, finish_boot, win_ctl])
         .setup(|app| {
             // 托盘直发本地 API 的端口：显式 DSH_SUPERVISOR_TRAY_PORT 优先，否则从用户 config.apiPort 解析
             let port: u16 = std::env::var("DSH_SUPERVISOR_TRAY_PORT")
@@ -332,21 +340,22 @@ fn main() {
                 // latest 仅作 node_status 信息展示，不再阻塞升级。
                 let need = !node::meets_minimum(have.as_ref().map(|x| x.1.as_str()));
                 if !need {
-                    // Node 达标：查内核 → 拉起守卫 → 面板；内核缺失 → 引导页提示安装命令。
+                    // Node 达标：拉起守卫（不自动跳面板——引导页须完整走完步骤并展示每步检测
+                    // 反馈后才由页面请求进面板，保留启动感知过程）。
                     if locate_core(&handle).is_some() {
-                        if let Err(e) = ensure_guard(&handle) {
-                            let _ = handle.emit("env_error", serde_json::json!({ "error": e }));
-                        } else {
-                            go_panel(&handle);
-                        }
+                        let guard_ok = ensure_guard(&handle).is_ok();
+                        let _ = handle.emit("env_ready", serde_json::json!({
+                            "core": guard_ok,
+                            "installed": have.as_ref().map(|x| x.1.clone()),
+                        }));
                     } else {
-                        // 留在引导页；页面 core_status → 显示「内核未安装」+ 安装命令
+                        // 留在引导页；页面 core_status → 显示「内核未安装」
                         let _ = handle.emit("env_error", serde_json::json!({
                             "error": "未检测到内核 (dsh-supervisor)。请先安装：npm i -g @dsh-core/dsh-core-<platform>-<arch>"
                         }));
                     }
                 }
-                // need=true：留在引导页（页面据 node_status 展示 安装/升级/跳过）
+                // need=true：留在引导页（页面 node_status 缺失 Node 时自动走安装流程）
             });
 
             // ── 托盘 ──

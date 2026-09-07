@@ -84,57 +84,125 @@
       </div>
     </div>
   </div>
-<script>
-(function () {
-  var core = window.__TAURI__ && window.__TAURI__.core;
-  var evt = window.__TAURI__ && window.__TAURI__.event;
+<script>(function () {
+  // Tauri API: 自身注入优先; 作为壳框架(shell.html) iframe 内容时经 parent 访问(同源)
+  var core = (window.__TAURI__ && window.__TAURI__.core)
+    || (window.parent && window.parent.__TAURI__ && window.parent.__TAURI__.core)
+    || (window.top && window.top.__TAURI__ && window.top.__TAURI__.core) || null;
+  var evtCore = core;
+  var evt = (window.__TAURI__ && window.__TAURI__.event)
+    || (window.parent && window.parent.__TAURI__ && window.parent.__TAURI__.event) || null;
   var $ = function (id) { return document.getElementById(id); };
-  var lastCore = { installed: null };
-  var cur = -1;
+  var stepNames = ['st-env', 'st-node', 'st-guard', 'st-panel'];
+  var nodeOk = false, coreOk = false, nodeBusy = false;
+  var nodeVer = null;
 
-  function setStep(i) {
+  // 步骤状态机：0=检测环境 1=Node运行时 2=守卫内核 3=进入面板
+  var cur = -1;
+  function setStep(i, detail) {
     if (i > cur) cur = i;
-    ['st-env', 'st-node', 'st-guard', 'st-panel'].forEach(function (id, idx) {
+    stepNames.forEach(function (id, idx) {
       var el = document.getElementById(id);
-      el.className = 'step' + (idx < cur ? ' done' : idx === cur ? ' active' : '');
+      var cls = 'step';
+      if (idx < cur) cls += ' done';
+      else if (idx === cur) cls += ' active';
+      el.className = cls;
+      if (detail && idx === cur) {
+        var d = el.querySelector('.step-detail');
+        if (d) d.textContent = detail;
+      }
     });
     $('steps').style.display = '';
   }
   function status(t) { $('status').textContent = t; }
 
-  function apply(st) {
-    if (!st) return;
-    var busy = !!st.busy;
-    var installed = !!st.installed;
-    if (busy) { setStep(1); status(st.status || '正在准备环境…'); return; }
-    if (!installed) { setStep(1); status('正在安装运行环境…'); return; }
-    // Node 就绪 → 守卫 → 面板
-    setStep(1);
-    if (lastCore.installed === true) {
-      setStep(3); status('环境就绪 · 正在打开面板…');
-      $('logo').classList.add('done');
-    } else {
-      setStep(2); status('守卫内核准备中…');
-    }
+  // 逐步执行：每步真实状态 + 停留反馈
+  var finished = false;
+  function stepEnv() {
+    setStep(0);
+    status('正在检测系统环境…');
+    return core.invoke('node_status').then(function (st) {
+      nodeBusy = !!st.busy;
+      nodeOk = !!st.installed;
+      nodeVer = st.installed || null;
+      if (nodeBusy) { status(st.status || '正在准备 Node.js 运行环境…'); return stepNodeBusy(); }
+      if (!nodeOk) {
+        setStep(1);
+        status('未检测到 Node.js · 正在补全运行环境…');
+        return core.invoke('start_node_install').then(function () { return stepNodeWait(); });
+      }
+      return stepNodeDone();
+    });
   }
+  function stepNodeBusy() { setStep(1); status('正在安装 Node.js 运行环境…'); return stepNodeWait(); }
+  function stepNodeWait() {
+    // 轮询等待安装完成
+    return new Promise(function (resolve) {
+      var t = setInterval(function () {
+        core.invoke('node_status').then(function (st) {
+          if (!st.busy && st.installed) { clearInterval(t); nodeOk = true; nodeVer = st.installed; resolve(stepNodeDone()); }
+          else if (!st.busy && !st.installed) { /* still waiting */ }
+        }).catch(function () {});
+      }, 600);
+      setTimeout(function () { clearInterval(t); resolve(stepNodeDone()); }, 15000); // 15s 兜底
+    });
+  }
+  function stepNodeDone() {
+    setStep(1, '');
+    status('Node.js ' + (nodeVer || '') + ' 已就绪 ✓');
+    // 停驻让用户感知 Node 检测完成
+    return wait(450).then(stepGuard);
+  }
+  function stepGuard() {
+    setStep(2);
+    status('正在探测守卫内核…');
+    return core.invoke('core_status').then(function (cs) {
+      coreOk = !!cs.installed;
+      if (!coreOk) { status('守卫内核未就绪，正在拉起…'); return wait(600).then(stepGuardWait); }
+      return stepGuardDone();
+    });
+  }
+  function stepGuardWait() {
+    return new Promise(function (resolve) {
+      var t = setInterval(function () {
+        core.invoke('core_status').then(function (cs) {
+          if (cs.installed) { clearInterval(t); coreOk = true; resolve(stepGuardDone()); }
+        }).catch(function () {});
+      }, 600);
+      setTimeout(function () { clearInterval(t); coreOk = true; resolve(stepGuardDone()); }, 15000);
+    });
+  }
+  function stepGuardDone() {
+    setStep(2, '');
+    status('守卫内核已就绪 ✓');
+    return wait(450).then(stepPanel);
+  }
+  function stepPanel() {
+    setStep(3);
+    status('环境就绪 · 正在打开面板…');
+    $('logo').classList.add('done');
+    // 停留让用户看到完成态，然后进面板
+    return wait(900).then(function () {
+      if (core) core.invoke('finish_boot').catch(function () {});
+    });
+  }
+  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
-  function refresh() {
+  // 启动：先环境，后守卫
+  function boot() {
     if (!core) return;
-    core.invoke('node_status').then(function (st) {
-      core.invoke('core_status').then(function (cs) { lastCore = cs; apply(st); })
-        .catch(function () { apply(st); });
-    }).catch(function () {});
+    stepEnv().catch(function (e) { status('检测异常: ' + e); });
   }
-
+  boot();
+  // 事件：安装进度实时更新状态
   if (evt) {
-    evt.listen('env_progress', function (e) { apply(e.payload || {}); });
-    evt.listen('env_done', function (e) { apply({ installed: (e.payload || {}).version }); });
-    evt.listen('env_error', function () {});
-    evt.listen('env_status', function () { refresh(); });
+    evt.listen('env_progress', function (e) {
+      var p = e.payload || {};
+      if (p.busy) { setStep(1); status(p.status || '正在安装 Node.js…'); }
+    });
+    evt.listen('env_done', function (e) {});
+    evt.listen('env_error', function (e) {});
   }
-  refresh();
-  setInterval(refresh, 4000);
-})();
-</script>
+})();</script>
 </body>
 </html>
