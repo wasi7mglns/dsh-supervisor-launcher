@@ -199,7 +199,12 @@ fn win_ctl(app: tauri::AppHandle, action: String) -> Result<(), String> {
             let _ = win.hide();
             Ok(())
         }
-        _ => Err(format!("不支持的窗口动作: {}（minimize/toggle-maximize/maximize/unmaximize/hide）", action)),
+        "drag" => {
+            // 显式窗口拖动（Linux WebKitGTK drag-region 属性常不生效的可靠替代）：
+            // 前端标题栏拖动区 mousedown → invoke win_ctl drag → 走 Rust start_dragging
+            win.start_dragging().map_err(|e| e.to_string())
+        }
+        _ => Err(format!("不支持的窗口动作: {}（minimize/toggle-maximize/maximize/unmaximize/hide/drag）", action)),
     }
 }
 
@@ -252,11 +257,44 @@ fn cli_plan() -> i32 {
     }
 }
 
-/// 打开面板（分体架构：壳=自绘窗口容器，内容区 iframe 承载页面）。
-/// 通知壳框架页把内容区切到内核面板 :3100 —— 壳窗口栏不动，纯内容切换，无跨进程数据透传。
-/// 面板由守卫内核托管（GET / → ui-react），浏览器/壳内容区同源直连内核 API。
+/// 打开面板。
+/// - embedded-panel（完整壳，默认）：导航到壳 frontend/ 内的 supervisor.html（壳内嵌 UI），
+///   面板 API 经 api_proxy command（Rust 侧转发守卫 3100，绕浏览器 CORS）。浏览器出口仍由守卫 GET / 托管 ui-react。
+/// - 无 embedded-panel（公开壳引导器，--no-default-features）：导航守卫 3100 托管面板（引导器形态）。
 fn go_panel(app: &tauri::AppHandle) {
-    let _ = app.emit("shell:goto-panel", serde_json::json!({}));
+    if let Some(win) = app.get_webview_window("main") {
+        #[cfg(feature = "embedded-panel")]
+        {
+            // 完整壳：导航到 frontend 内的 supervisor.html（custom-titlebar 形态，数据直连守卫 API）。
+            // 优先基于当前窗口 URL 构造同源目标（navigate 不依赖页面 JS 就绪，自动跳转也可靠）；
+            // 读 URL 失败再退 eval 相对跳转。
+            let mut navigated = false;
+            if let Ok(cur) = win.url() {
+                let s = cur.as_str();
+                // 当前是 tauri asset 页（bootstrap.html 等）→ 同目录换 supervisor.html
+                if s.contains("bootstrap.html") || s.contains("supervisor.html") || s.ends_with('/') {
+                    if let Some((base, _)) = s.rsplit_once('/') {
+                        if !s.ends_with("supervisor.html") {
+                            let target = format!("{}/supervisor.html", base);
+                            if let Ok(tu) = tauri::Url::parse(&target) {
+                                let _ = win.navigate(tu);
+                                navigated = true;
+                            }
+                        } else {
+                            navigated = true; // 已在面板页，幂等
+                        }
+                    }
+                }
+            }
+            if !navigated {
+                let _ = win.eval("if (!location.pathname.endsWith('/supervisor.html')) location.href = 'supervisor.html';");
+            }
+        }
+        #[cfg(not(feature = "embedded-panel"))]
+        {
+            let _ = win.navigate(env::api_base_url().parse().unwrap());
+        }
+    }
 }
 
 fn show_main(app: &tauri::AppHandle) {
@@ -264,7 +302,7 @@ fn show_main(app: &tauri::AppHandle) {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
-        // 每次显示回到面板（内容区 iframe 切 :3100；壳栏常驻不动）
+        // 每次显示都重新导航到面板（壳内 supervisor.html）：WebView 不做陈旧缓存 —— 拿最新 UI
         go_panel(app);
     }
 }
