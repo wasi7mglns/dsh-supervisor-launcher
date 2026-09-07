@@ -40,13 +40,6 @@
     background: transparent; color: var(--text);
   }
 
-  /* 无边框窗口拖动热区（无视觉：引导页不显示自绘窗口栏，仅保留可拖能力） */
-  .drag-strip {
-    position: fixed; top: 0; left: 0; right: 0; height: 30px;
-    -webkit-app-region: drag; app-region: drag;
-    z-index: 50; pointer-events: auto;
-  }
-
   .startup-shell {
     display: grid; width: 100%; height: 100%;
     grid-template-rows: 1fr auto auto 1fr;
@@ -137,8 +130,6 @@
 </head>
 <body>
 <!-- 引导页无自绘窗口栏（产品唯一窗口栏=面板 WindowTitlebar，2026-09-07） -->
-
-<div class="drag-strip" data-tauri-drag-region="deep" aria-hidden="true"></div>
 
 <main class="startup-shell">
   <!-- 横向步骤条：①检测环境 ②Node.js ③守卫内核 ④打开面板 -->
