@@ -6,319 +6,314 @@
 <title>dsh-supervisor — 环境引导</title>
 <style>
   /* ============================================================
-   * dsh-supervisor 环境引导 —— 横向安装向导（stepper）
-   * 视觉继承内核 UI 品牌启动加载页 DNA（#FAFBFC + 顶部 #2F54EB 光晕），
-   * 流程做成「一步一圆」的横向步骤条：检测环境 → Node.js → 守卫内核 → 打开面板。
+   * dsh-supervisor 引导页 —— 加载页 DNA × 小圈 stepper 融合（2026-09-07 定稿）
+   * 壳窗口栏(40px) 之下：
+   *   加载页氛围做底（素白 + 顶部品牌光晕）
+   *   上方：居中 64px 大 LOGO 圆 + 旋转环 + DSH-SUP + 实时状态
+   *   下方：原「小圈一步步」横向流程条（检测→Node.js→守卫内核→打开面板）
+   *   需操作时：步骤下方浮现按钮
    * ============================================================ */
   :root {
-    font-family: Inter, "Noto Sans SC", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    color: #171717;
-    --brand: #2F54EB;
-    --brand-soft: rgb(47 84 235 / 12%);
-    --bg: #FAFBFC;
-    --text: #0F1115;
-    --status: #6b747d;
-    --line: #DDE3EC;
-    --ok: #10b981;
-    --danger: #b42318;
-    --danger-soft: #fee2e2;
-    --border: rgb(0 0 0 / 8%);
+    --brand: #2F54EB; --brand-soft: rgb(47 84 235 / 12%);
+    --text: #0F1115; --status: #6b747d; --line: #DDE3EC;
+    --ok: #10b981; --danger: #b42318; --border: rgb(0 0 0 / 8%);
   }
   @media (prefers-color-scheme: dark) {
-    :root {
-      --brand: #6b83ff; --brand-soft: rgb(107 131 255 / 18%);
-      --bg: #0f1115; --text: #f1f4f9; --status: #9aa3ad; --line: #262b36;
-      --ok: #34d399; --danger: #f87171; --danger-soft: rgb(239 68 68 / 14%);
-      --border: rgb(255 255 255 / 14%);
-    }
+    :root { --brand: #6b83ff; --brand-soft: rgb(107 131 255 / 18%);
+      --text: #f1f4f9; --status: #9aa3ad; --line: #262b36;
+      --ok: #34d399; --danger: #f87171; --border: rgb(255 255 255 / 14%); }
   }
-  * { box-sizing: border-box; }
-  html { background: transparent; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { width: 100%; height: 100%; height: 100dvh; }
-  body {
-    margin: 0; overflow: hidden; user-select: none; -webkit-user-select: none;
-    background: transparent; color: var(--text);
-  }
+  body { margin: 0; background: transparent; color: var(--text); overflow: hidden;
+    font-family: Inter, "Noto Sans SC", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
 
-  .startup-shell {
-    display: grid; width: 100%; height: 100%;
-    grid-template-rows: 1fr auto auto 1fr;
-    place-items: center; overflow: hidden;
-    background:
-      radial-gradient(circle at 50% 30%, var(--brand-soft), transparent 34%),
-      var(--bg);
+  /* ── 壳窗口栏（唯一，顶部固定） ── */
+  #titlebar {
+    height: 40px; display: flex; align-items: center; justify-content: space-between;
+    background: rgba(251,252,254,0.92); border-bottom: 1px solid var(--border);
+    user-select: none; -webkit-user-select: none;
   }
-  /* ── 横向步骤条 ── */
-  .stepper { display: flex; align-items: flex-start; justify-content: center; gap: 0; padding: 34px 40px 6px; }
-  .step { display: flex; flex-direction: column; align-items: center; width: 118px; position: relative; }
+  @media (prefers-color-scheme: dark) { #titlebar { background: rgba(22,25,31,0.92); } }
+  .tb-drag { -webkit-app-region: drag; app-region: drag; flex: 1; min-width: 0; height: 100%;
+    display: flex; align-items: center; gap: 8px; padding: 0 14px; }
+  .tb-drag img { width: 16px; height: 16px; border-radius: 4px; }
+  .tb-title { font-size: 12px; font-weight: 600; color: var(--text); }
+  .tb-btns { display: flex; height: 100%; }
+  .tb-btns button { width: 46px; height: 100%; border: 0; background: transparent;
+    color: var(--status); font-size: 15px; cursor: pointer; line-height: 1; font-family: inherit; }
+  .tb-btns button:hover { background: rgb(47 84 235 / 8%); color: var(--text); }
+  .tb-btns button.close:hover { background: #e81123; color: #fff; }
+
+  /* ── 加载页氛围底（整屏） ── */
+  .page {
+    width: 100%; height: calc(100% - 40px);
+    display: grid; grid-template-rows: 1fr auto auto 1fr;
+    justify-items: center; align-items: center;
+    background: radial-gradient(circle at 50% 34%, var(--brand-soft), transparent 36%), #FAFBFC;
+  }
+  @media (prefers-color-scheme: dark) {
+    .page { background: radial-gradient(circle at 50% 34%, rgb(107 131 255 / 14%), transparent 36%), #0f1115; }
+  }
+  .page-inner { grid-row: 2 / 4; display: grid; justify-items: center; gap: 26px;
+    width: min(520px, calc(100% - 60px)); }
+
+  /* ── 上方：大 LOGO + 品牌（内核加载页 DNA） ── */
+  .brand { display: grid; justify-items: center; gap: 14px; }
+  .startup-logo {
+    position: relative; display: grid; width: 68px; height: 68px; place-items: center;
+    border: 1px solid rgb(47 84 235 / 14%); border-radius: 999px;
+    background: linear-gradient(145deg, rgb(255 255 255 / 96%), rgb(239 245 242 / 92%));
+    box-shadow: 0 18px 42px rgb(15 23 42 / 10%), inset 0 1px 0 rgb(255 255 255 / 90%);
+    color: var(--brand);
+  }
+  .startup-logo::after {
+    position: absolute; inset: -8px; content: ""; border-radius: 999px;
+    border: 2px solid rgb(47 84 235 / 10%); border-top-color: var(--brand);
+    animation: startup-spin 960ms linear infinite;
+  }
+  .startup-logo.done::after { animation: none; border-color: rgb(16 185 129 / 30%); border-top-color: var(--ok); }
+  .startup-logo-image { width: 44px; height: 44px; background: currentColor;
+    mask: url("/dsh-logo.svg") center / contain no-repeat;
+    -webkit-mask: url("/dsh-logo.svg") center / contain no-repeat; }
+  .startup-name { color: var(--text); font-size: 22px; font-weight: 760; line-height: 1; letter-spacing: .02em; }
+  .startup-status { color: var(--status); font-size: 13px; line-height: 1.5; text-align: center; }
+  .startup-status b { color: var(--text); font-weight: 600; }
+
+  /* ── 下方：小圈 stepper（原一步步流程） ── */
+  .stepper { display: flex; align-items: flex-start; justify-content: center; }
+  .step { display: flex; flex-direction: column; align-items: center; width: 108px; position: relative; }
   .step-dot {
-    position: relative; width: 34px; height: 34px; border-radius: 50%;
-    display: grid; place-items: center; z-index: 2;
-    background: var(--bg);
-    border: 2px solid var(--line); color: var(--status);
+    position: relative; width: 30px; height: 30px; border-radius: 50%; z-index: 2;
+    display: grid; place-items: center;
+    background: #fff; border: 2px solid var(--line); color: var(--status);
     transition: all .3s ease;
   }
-  /* 完成：品牌绿勾 */
+  @media (prefers-color-scheme: dark) { .step-dot { background: #16191f; } }
+  .step-dot .n { font-size: 12px; font-weight: 600; }
   .step.done .step-dot { border-color: var(--ok); color: var(--ok); }
-  .step.done .step-dot svg { display: block; }
-  .step.done .step-dot .n, .step.done .step-dot .ring { display: none; }
-  /* 当前：品牌蓝 + 环 */
+  .step.done .step-dot .svg-ok { display: block; }
+  .step.done .step-dot .n { display: none; }
   .step.active .step-dot { border-color: var(--brand); color: var(--brand); }
-  .step.active .step-dot .ring { display: block; }
-  .step.active .step-dot .n { display: none; }
-  .step.active .step-dot .svg-ok { display: none; }
-  /* 当前步圆环进度（conic） */
-  .ring {
-    position: absolute; inset: -4px; border-radius: 50%; display: none;
-    background: conic-gradient(var(--brand) calc(var(--p, 0) * 1%), transparent 0);
-    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px));
-            mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px));
-    transition: background .2s;
+  .step .step-dot .svg-ok { display: none; }
+  .step .ring { display: none; }
+  .step.active .ring {
+    display: block; position: absolute; inset: -4px; border-radius: 50%;
+    background: conic-gradient(var(--brand) calc(var(--p,0)*1%), transparent 0);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px));
+            mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px));
   }
-  .step .step-dot svg { display: none; }
-  .step .step-dot .n { font-size: 13px; font-weight: 600; }
-  .step-label { margin-top: 9px; font-size: 12px; color: var(--status); text-align: center; line-height: 1.35; }
+  .step-label { margin-top: 8px; font-size: 11.5px; color: var(--status); text-align: center; line-height: 1.3; }
   .step.active .step-label { color: var(--text); font-weight: 600; }
   .step.done .step-label { color: var(--status); }
-  /* 连接线 */
   .step:not(:last-child)::after {
-    content: ''; position: absolute; top: 16px; left: calc(50% + 22px); right: calc(-50% + 22px);
+    content: ''; position: absolute; top: 14px; left: calc(50% + 19px); right: calc(-50% + 19px);
     height: 2px; background: var(--line); z-index: 1;
   }
   .step.done:not(:last-child)::after { background: var(--ok); opacity: .45; }
-  .step.active:not(:last-child)::after { background: linear-gradient(90deg, var(--brand), var(--line)); }
 
-  /* ── 中央内容 ── */
-  .stage { display: grid; justify-items: center; gap: 12px; padding: 10px 40px 30px; align-content: start; }
-  .stage-status { color: var(--status); font-size: 13px; line-height: 1.6; text-align: center; min-height: 20px; }
-  .stage-status b { color: var(--text); }
-  .stage-detail { color: var(--status); font-size: 12px; line-height: 1.7; text-align: center; min-height: 16px; }
-  .stage-detail b { color: var(--text); font-weight: 600; }
-  /* Node 子阶段行（步骤②展开） */
-  .substage { display: flex; align-items: center; gap: 8px; color: var(--status); font-size: 12px; line-height: 1.6; }
-  .substage .sdot { width: 6px; height: 6px; border-radius: 50%; background: var(--line); flex: none; }
-  .substage.on .sdot { background: var(--brand); box-shadow: 0 0 6px var(--brand); animation: pulse 1s ease infinite; }
-  .substage.done .sdot { background: var(--ok); }
-  .substage.fail .sdot { background: var(--danger); }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  /* ── 细进度条（加载页 DNA，叠加于 stepper 下方/安装时） ── */
+  .progress-row { display: grid; gap: 4px; width: 100%; justify-items: center; }
+  .startup-progress { position: relative; width: min(320px, 100%); height: 3px;
+    overflow: hidden; border-radius: 999px; background: var(--line); }
+  .startup-progress.indet::after { display: block; width: 42%; height: 100%; content: "";
+    animation: startup-progress 1.15s ease-in-out infinite; border-radius: inherit; background: var(--brand); }
+  .startup-progress.det .fill { display: block; width: 0; height: 100%;
+    background: var(--brand); border-radius: inherit; transition: width .25s; }
+  .startup-progress .fill { display: none; }
+  .pct { color: var(--status); font-size: 11px; font-variant-numeric: tabular-nums; }
 
-  .btn {
-    width: 240px; padding: 10px 16px; border: 0; border-radius: 9px;
+  /* ── 操作按钮（Node 缺失/旧时浮现） ── */
+  .actions { display: grid; gap: 8px; width: 100%; justify-items: center; }
+  .btn { width: 260px; padding: 10px; border: 0; border-radius: 9px;
     background: linear-gradient(180deg, #3d5ef0 0%, #2f54eb 100%);
-    color: #fff; font-size: 14px; font-weight: 600; font-family: inherit;
-    cursor: pointer; box-shadow: 0 1px 2px rgb(15 23 42 / 16%), inset 0 1px 0 rgb(255 255 255 / 22%);
-    transition: filter .15s ease, transform .06s ease;
-  }
+    color: #fff; font-size: 14px; font-weight: 600; font-family: inherit; cursor: pointer;
+    box-shadow: 0 1px 2px rgb(15 23 42 / 16%), inset 0 1px 0 rgb(255 255 255 / 22%); }
   .btn:hover:not(:disabled) { filter: brightness(1.05); }
-  .btn:active:not(:disabled) { transform: translateY(1px); }
-  .btn:disabled { opacity: .5; cursor: default; }
-  .btn.ghost { width: 240px; background: transparent; border: 1px solid var(--border); color: var(--brand); box-shadow: none; }
-  .btn.ghost:hover:not(:disabled) { background: rgb(47 84 235 / 7%); filter: none; }
-  .btn.sm { width: auto; padding: 7px 14px; font-size: 12.5px; }
-  .btns { display: grid; gap: 8px; justify-items: center; }
-  .err {
-    display: none; background: var(--danger-soft); color: var(--danger);
-    border-radius: 8px; padding: 8px 12px; font-size: 12px; line-height: 1.5;
-    max-width: 360px; text-align: left;
-  }
-  pre.log {
-    display: none; width: min(420px, calc(100% - 40px)); max-height: 84px; overflow: auto; margin: 0;
-    background: #0b0e14; color: #8ee6b0; border-radius: 8px; padding: 8px 10px;
-    font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
-  }
+  .btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--brand); box-shadow: none; }
+  .btn.ghost:hover { background: rgb(47 84 235 / 7%); }
+  pre.log { display: none; width: min(420px, 100%); max-height: 80px; overflow: auto;
+    background: #0b0e14; color: #8ee6b0; border-radius: 8px; padding: 8px 10px; font-size: 11px;
+    line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
+  .err { display: none; background: #fee2e2; color: var(--danger); border-radius: 8px;
+    padding: 8px 12px; font-size: 12px; max-width: 100%; }
+  @keyframes startup-spin { to { transform: rotate(360deg); } }
+  @keyframes startup-progress { 0% { transform: translateX(-120%); } 100% { transform: translateX(260%); } }
 </style>
 </head>
 <body>
-<!-- 引导页无自绘窗口栏（产品唯一窗口栏=面板 WindowTitlebar，2026-09-07） -->
-
-<main class="startup-shell">
-  <!-- 横向步骤条：①检测环境 ②Node.js ③守卫内核 ④打开面板 -->
-  <div class="stepper" id="stepper" style="display:none">
-    <div class="step active" id="st-env">
-      <div class="step-dot"><span class="ring" id="rg-env"></span><span class="n">1</span><svg class="svg-ok" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
-      <div class="step-label">检测环境</div>
+  <div id="titlebar">
+    <div class="tb-drag" data-tauri-drag-region="deep" id="dragRegion">
+      <img src="dsh-logo.svg" alt="" aria-hidden="true" onerror="this.style.display='none'">
+      <span class="tb-title">dsh-supervisor</span>
     </div>
-    <div class="step" id="st-node">
-      <div class="step-dot"><span class="ring" id="rg-node"></span><span class="n">2</span><svg class="svg-ok" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
-      <div class="step-label">Node.js 运行时</div>
-    </div>
-    <div class="step" id="st-guard">
-      <div class="step-dot"><span class="ring" id="rg-guard"></span><span class="n">3</span><svg class="svg-ok" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
-      <div class="step-label">守卫内核</div>
-    </div>
-    <div class="step" id="st-panel">
-      <div class="step-dot"><span class="ring" id="rg-panel"></span><span class="n">4</span><svg class="svg-ok" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
-      <div class="step-label">打开面板</div>
+    <div class="tb-btns">
+      <button id="btnMin" title="最小化">&#x2212;</button>
+      <button id="btnClose" class="close" title="关闭（隐藏到托盘）">&#x00d7;</button>
     </div>
   </div>
 
-  <!-- 当前步内容 -->
-  <div class="stage" id="stage">
-    <div class="stage-status" id="sub">正在检测环境…</div>
-    <div class="stage-detail" id="detail">
-      <div id="substageNode" style="display:none"></div>
-      <div id="coreLine" style="display:none">守卫内核：<b id="core">检测中…</b></div>
-      <div id="hintLine" style="display:none"></div>
+  <div class="page">
+    <div class="page-inner">
+      <!-- 大 LOGO + 品牌（加载页 DNA） -->
+      <div class="brand">
+        <div class="startup-logo" id="logo" aria-hidden="true"><span class="startup-logo-image"></span></div>
+        <div class="startup-name">DSH-SUP</div>
+        <div class="startup-status" id="status">正在检测环境…</div>
+      </div>
+
+      <!-- 小圈一步步流程（stepper） -->
+      <div class="stepper" id="stepper" style="display:none">
+        <div class="step active" id="st-env">
+          <div class="step-dot"><span class="ring" id="rg-env"></span><span class="n">1</span><svg class="svg-ok" width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="step-label">检测环境</div>
+        </div>
+        <div class="step" id="st-node">
+          <div class="step-dot"><span class="ring" id="rg-node"></span><span class="n">2</span><svg class="svg-ok" width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="step-label">Node.js 运行时</div>
+        </div>
+        <div class="step" id="st-guard">
+          <div class="step-dot"><span class="ring" id="rg-guard"></span><span class="n">3</span><svg class="svg-ok" width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="step-label">守卫内核</div>
+        </div>
+        <div class="step" id="st-panel">
+          <div class="step-dot"><span class="ring" id="rg-panel"></span><span class="n">4</span><svg class="svg-ok" width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="step-label">打开面板</div>
+        </div>
+      </div>
+
+      <!-- 细进度条 -->
+      <div class="progress-row" id="progressRow" style="display:none">
+        <div class="startup-progress indet" id="bar"><span class="fill" id="fill"></span></div>
+        <div class="pct" id="pct"></div>
+      </div>
+
+      <!-- 操作区 -->
+      <div class="actions" id="actions" style="display:none">
+        <button class="btn" id="installBtn" style="display:none">一键安装 Node.js LTS</button>
+        <button class="btn ghost" id="skipBtn" style="display:none">跳过并使用现有版本</button>
+        <button class="btn ghost" id="retryBtn" style="display:none">重新检测</button>
+      </div>
+      <pre class="log" id="log"></pre>
+      <div class="err" id="err"></div>
     </div>
-    <div class="btns" id="btns" style="display:none">
-      <button class="btn" id="installBtn" style="display:none">一键安装 Node.js LTS</button>
-      <button class="btn ghost" id="skipBtn" style="display:none">跳过并使用现有版本</button>
-      <button class="btn ghost sm" id="retryBtn" style="display:none">重新检测</button>
-    </div>
-    <pre class="log" id="log"></pre>
-    <div class="err" id="err"></div>
   </div>
-</main>
 
 <script>
 (function () {
   var core = window.__TAURI__ && window.__TAURI__.core;
   var evt = window.__TAURI__ && window.__TAURI__.event;
   var $ = function (id) { return document.getElementById(id); };
-  var lastCore = { installed: null, hint: '' };
   var STEP = { ENV: 0, NODE: 1, GUARD: 2, PANEL: 3 };
   var cur = STEP.ENV;
-  var nodeOk = false, nodeBusy = false, nodeMiss = false, nodeOld = false;
-  var coreOk = false;
   var steps = ['st-env', 'st-node', 'st-guard', 'st-panel'];
   var rings = ['rg-env', 'rg-node', 'rg-guard', 'rg-panel'];
+  var lastCore = { installed: null, hint: '' };
 
-  function setStep(idx, cls) {
-    if (idx > cur) cur = idx;
+  function setStep(idx) {
+    cur = Math.max(cur, idx);
     steps.forEach(function (id, i) {
       var el = document.getElementById(id);
       el.classList.remove('active', 'done');
       if (i < cur) el.classList.add('done');
       else if (i === cur) el.classList.add('active');
     });
-    if (cls) document.getElementById(steps[idx]).classList.add(cls);
-    document.getElementById('stepper').style.display = '';
+    $('stepper').style.display = '';
   }
   function ringPct(idx, pct) {
     var el = document.getElementById(rings[idx]);
-    el.style.setProperty('--p', Math.max(0, Math.min(100, pct)));
+    if (el) el.style.setProperty('--p', Math.max(0, Math.min(100, pct)));
   }
-  function setStatus(txt) { $('sub').textContent = txt; }
-
-  function renderCore() {
-    var ok = lastCore.installed === true;
-    coreOk = ok;
-    $('core').textContent = ok ? '已安装' : (lastCore.installed === false ? '未安装' : '检测中…');
-    $('core').style.color = ok ? 'var(--ok)' : 'var(--danger)';
-    $('coreLine').style.display = '';
-    if (!ok && lastCore.hint) { $('hintLine').textContent = lastCore.hint; $('hintLine').style.display = ''; }
-    else $('hintLine').style.display = 'none';
+  function setBar(indet, pct) {
+    $('progressRow').style.display = '';
+    var bar = $('bar');
+    if (indet) { bar.classList.add('indet'); bar.classList.remove('det'); $('pct').textContent = ''; }
+    else { bar.classList.remove('indet'); bar.classList.add('det'); $('fill').style.width = Math.max(2, Math.min(100, pct)) + '%'; $('pct').textContent = pct >= 100 ? '' : Math.round(pct) + '%'; }
   }
-
-  /* Node 安装子阶段渲染：从 status 文本推断当前动作 */
-  var NODE_SUBS = [
-    { k: 'latest', label: '获取官方最新版本', re: /最新|LTS/ },
-    { k: 'download', label: '下载 Node.js', re: /下载/ },
-    { k: 'verify', label: '校验完整性 (SHA256)', re: /校验/ },
-    { k: 'install', label: '安装到系统', re: /准备安装|安装中|写入/ }
-  ];
-  function renderNodeSubs(status) {
-    var box = $('substageNode');
-    if (!nodeBusy || !status) { box.style.display = 'none'; return; }
-    box.style.display = 'grid';
-    box.style.justifyItems = 'center';
-    box.innerHTML = '';
-    var hit = false;
-    NODE_SUBS.forEach(function (s, i) {
-      var on = !!status && s.re.test(status);
-      if (on) hit = true;
-      var row = document.createElement('div');
-      row.className = 'substage' + (on ? ' on' : '');
-      row.innerHTML = '<span class="sdot"></span>' + s.label;
-      box.appendChild(row);
-    });
-    if (!hit) box.style.display = 'none';
-  }
+  function hideBar() { $('progressRow').style.display = 'none'; }
 
   function applyState(st) {
     if (!st) return;
-    nodeBusy = !!st.busy;
-    if (st.installed) { nodeOk = true; nodeMiss = false; }
-    // 达标判定：壳返回 minOk(>=22.12)；兼容旧壳无字段时回退 outdated 语义
-    var minOk = st.minOk === undefined ? !st.outdated : !!st.minOk;
-    nodeMiss = !st.installed && !nodeBusy;
-    nodeOld = !nodeMiss && !nodeBusy && !minOk;
-    // nodeOld 已在上方按 minOk 推导（低于最低门槛才为真）
+    var busy = !!st.busy;
+    var miss = !st.installed && !busy;
+    var old = st.outdated === true && !busy;
+    var installed = !!st.installed;
 
-    /* 步骤推进：以 node/core 状态推导 */
-    if (nodeMiss || nodeOld) {
-      // 停在 Node 步
-      setStep(STEP.NODE, 'active');
-      if (nodeMiss) setStatus('缺少 Node.js 运行环境，需安装');
-      else setStatus('检测到 Node.js 旧版本，建议升级到官方 LTS');
-    } else if (nodeBusy) {
-      setStep(STEP.NODE, 'active');
-      setStatus(st.status || '正在安装 Node.js…');
-    } else if (nodeOk) {
-      // Node 就绪
-      if (coreOk) { setStep(STEP.PANEL, 'active'); setStatus('环境就绪 · 正在打开面板…'); }
-      else { setStep(STEP.GUARD, 'active'); setStatus('Node.js 已就绪 · 正在准备守卫内核…'); }
-    } else {
-      setStep(STEP.ENV, 'active');
-      setStatus(st.status || '正在检测环境…');
-    }
-
-    // Node 步环进度（busy 且有 progress）
-    if (nodeBusy && st.progress > 0) {
-      ringPct(STEP.NODE, st.progress * 100);
-    } else if (!nodeMiss && !nodeOld && nodeOk && !nodeBusy) {
+    // 步骤推进
+    if (miss || old || busy) {
+      setStep(STEP.NODE);
+      if (busy) {
+        $('status').innerHTML = (st.status || '正在安装 Node.js…');
+        $('logo').classList.remove('done');
+        setBar(true);
+        if (st.progress > 0) { ringPct(STEP.NODE, st.progress * 100); setBar(false, st.progress * 100); }
+      } else if (miss) {
+        $('status').innerHTML = '缺少 <b>Node.js</b> 运行环境';
+        hideBar(); ringPct(STEP.NODE, 0); $('logo').classList.remove('done');
+      } else {
+        $('status').innerHTML = '检测到 <b>Node.js</b> 旧版本，建议升级';
+        hideBar(); ringPct(STEP.NODE, 0); $('logo').classList.remove('done');
+      }
+    } else if (installed) {
+      // Node 达标 → 守卫 → 面板
+      $('status').innerHTML = 'Node.js 就绪 · 正在准备守卫…';
+      setStep(STEP.GUARD);
       ringPct(STEP.NODE, 100);
+      if (lastCore.installed === true) {
+        $('status').innerHTML = '环境就绪 · 正在打开面板…';
+        setStep(STEP.PANEL);
+        $('logo').classList.add('done');
+        hideBar();
+      }
+    } else {
+      setStep(STEP.ENV);
+      $('status').innerHTML = '正在检测环境…';
+      hideBar();
     }
-
-    // 子阶段
-    renderNodeSubs(st.status || '');
-    $('detail').style.display = (nodeBusy || nodeMiss || nodeOld || !coreOk) ? '' : 'none';
 
     // 按钮
-    if (nodeBusy) { $('btns').style.display = 'none'; }
-    else if (nodeMiss || nodeOld) {
-      $('btns').style.display = 'grid';
+    if (busy) { $('actions').style.display = 'none'; }
+    else if (miss || old) {
+      $('actions').style.display = 'grid';
       $('installBtn').disabled = false;
-      $('installBtn').textContent = nodeMiss ? '一键安装 Node.js LTS' : '升级到官方最新 LTS';
+      $('installBtn').textContent = miss ? '一键安装 Node.js LTS' : '升级到官方最新 LTS';
       $('installBtn').style.display = '';
-      $('skipBtn').style.display = nodeOld ? '' : 'none';
-      $('retryBtn').style.display = nodeMiss ? '' : 'none';
-    } else { $('btns').style.display = 'none'; }
+      $('skipBtn').style.display = old ? '' : 'none';
+      $('retryBtn').style.display = miss ? '' : 'none';
+    } else { $('actions').style.display = 'none'; }
 
-    if (st.logs && st.logs.length) { $('log').style.display = ''; $('log').textContent = st.logs.join('\n'); }
-    if (st.error) {
-      $('err').style.display = ''; $('err').textContent = '失败：' + st.error;
-      $('btns').style.display = 'grid';
-      $('installBtn').style.display = ''; $('retryBtn').style.display = '';
-    } else $('err').style.display = 'none';
+    if (st.logs && st.logs.length) { $('log').style.display = ''; $('log').textContent = st.logs.join(String.fromCharCode(10)); }
+    if (st.error) { $('err').style.display = ''; $('err').textContent = '失败：' + st.error; $('actions').style.display = 'grid'; $('installBtn').style.display=''; $('retryBtn').style.display=''; }
+    else $('err').style.display = 'none';
   }
 
   function refresh() {
     if (!core) return;
     core.invoke('node_status').then(function (st) {
-      core.invoke('core_status').then(function (cs) { lastCore = cs; renderCore(); applyState(st); }).catch(function () { applyState(st); });
+      core.invoke('core_status').then(function (cs) { lastCore = cs; applyState(st); }).catch(function () { applyState(st); });
     }).catch(function (e) { $('err').style.display=''; $('err').textContent = '调用失败: ' + e; });
   }
 
-  document.getElementById('stepper').style.display = 'none';
-  setStatus('正在检测环境…');
-  $('installBtn').addEventListener('click', function () {
-    if (!core) return;
-    core.invoke('start_node_install').catch(function (e) { $('err').style.display=''; $('err').textContent = '启动安装失败: ' + e; });
+  // 窗口栏
+  $('#btnMin').addEventListener('click', function () { if (core) core.invoke('win_ctl', { action: 'minimize' }).catch(function(){}); });
+  $('#btnClose').addEventListener('click', function () { if (core) core.invoke('win_ctl', { action: 'hide' }).catch(function(){}); });
+  $('#dragRegion').addEventListener('mousedown', function () { if (core) core.invoke('win_ctl', { action: 'drag' }).catch(function(){}); });
+  // 操作
+  $('#installBtn').addEventListener('click', function () {
+    if (core) core.invoke('start_node_install').catch(function (e) { $('err').style.display=''; $('err').textContent = '启动安装失败: ' + e; });
   });
-  $('skipBtn').addEventListener('click', function () {
-    if (!core) return;
-    core.invoke('skip_env_upgrade').catch(function (e) { $('err').style.display=''; $('err').textContent = '跳过失败: ' + e; });
+  $('#skipBtn').addEventListener('click', function () {
+    if (core) core.invoke('skip_env_upgrade').catch(function (e) { $('err').style.display=''; $('err').textContent = '跳过失败: ' + e; });
   });
-  $('retryBtn').addEventListener('click', refresh);
+  $('#retryBtn').addEventListener('click', refresh);
   if (evt) {
     evt.listen('env_progress', function (e) { applyState(e.payload || {}); });
     evt.listen('env_done', function (e) {
-      var p = e.payload || {};
-      applyState({ installed: p.version, latest: p.version, progress: 1, status: 'Node.js 就绪' });
+      applyState({ installed: (e.payload || {}).version, progress: 100 });
       ringPct(STEP.NODE, 100);
-      setStatus('Node.js 就绪 · 正在打开面板…');
-      $('btns').style.display = 'none';
+      $('logo').classList.add('done');
+      $('status').innerHTML = 'Node.js 就绪 · 正在打开面板…';
+      hideBar();
     });
     evt.listen('env_error', function (e) { refresh(); });
     evt.listen('env_status', function (e) { refresh(); });
