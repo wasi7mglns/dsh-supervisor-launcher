@@ -39,24 +39,18 @@
     margin: 0; overflow: hidden; user-select: none; -webkit-user-select: none;
     background: transparent; color: var(--text);
   }
-  #tb {
-    position: fixed; top: 0; left: 0; right: 0; height: 38px;
-    display: flex; align-items: center; justify-content: space-between;
-    -webkit-app-region: drag; user-select: none; z-index: 10;
-    background: color-mix(in srgb, var(--bg) 62%, transparent);
-    border-bottom: 1px solid var(--border);
-    -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+
+  /* 无边框窗口拖动热区（无视觉：引导页不显示自绘窗口栏，仅保留可拖能力） */
+  .drag-strip {
+    position: fixed; top: 0; left: 0; right: 0; height: 30px;
+    -webkit-app-region: drag; app-region: drag;
+    z-index: 50; pointer-events: auto;
   }
-  #tb .tb-title { padding-left: 14px; font-size: 11.5px; font-weight: 500; color: var(--status); letter-spacing: .06em; }
-  #tb .tb-btns { display: flex; height: 100%; -webkit-app-region: no-drag; }
-  #tb .tb-btns button { width: 44px; height: 100%; border: 0; background: transparent; color: var(--status); font-size: 15px; cursor: pointer; line-height: 1; }
-  #tb .tb-btns button:hover { background: rgb(47 84 235 / 8%); color: var(--text); }
-  #tb .tb-btns button.tb-close:hover { background: var(--danger); color: #fff; }
 
   .startup-shell {
     display: grid; width: 100%; height: 100%;
     grid-template-rows: 1fr auto auto 1fr;
-    place-items: center; overflow: hidden; padding: 38px 0 0;
+    place-items: center; overflow: hidden;
     background:
       radial-gradient(circle at 50% 30%, var(--brand-soft), transparent 34%),
       var(--bg);
@@ -142,7 +136,9 @@
 </style>
 </head>
 <body>
-<div id="tb" data-tauri-drag-region="deep"><span class="tb-title">dsh-supervisor · 环境引导</span><span class="tb-btns" data-tauri-drag-region="false"><button id="tbMin">−</button><button id="tbClose" class="tb-close">×</button></span></div>
+<!-- 引导页无自绘窗口栏（产品唯一窗口栏=面板 WindowTitlebar，2026-09-07） -->
+
+<div class="drag-strip" data-tauri-drag-region="deep" aria-hidden="true"></div>
 
 <main class="startup-shell">
   <!-- 横向步骤条：①检测环境 ②Node.js ③守卫内核 ④打开面板 -->
@@ -337,16 +333,6 @@
     evt.listen('env_status', function (e) { refresh(); });
   }
   refresh();
-  var core2 = window.__TAURI__ && window.__TAURI__.core;
-  if (core2) {
-    var wctl = function (a) { core2.invoke('win_ctl', { action: a }).catch(function () {}); };
-    var tbMin = document.getElementById('tbMin');
-    var tbClose = document.getElementById('tbClose');
-    if (tbMin) tbMin.addEventListener('click', function () { wctl('minimize'); });
-    if (tbClose) tbClose.addEventListener('click', function () { wctl('hide'); });
-  } else {
-    var tb = document.getElementById('tb'); if (tb) tb.style.display = 'none';
-  }
   setInterval(refresh, 4000);
 })();
 </script>
