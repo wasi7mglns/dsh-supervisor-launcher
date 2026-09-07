@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsh-supervisor</title>
+<style>
+  /* ============================================================
+   * dsh-supervisor 壳 = 自绘窗口容器（唯一窗口栏 + 空白内容区）
+   * 顶部固定：壳窗口栏（拖动区 + 最小化/关闭，win_ctl IPC）
+   * 下方内容区：iframe 承载 引导页(本地 bootstrap) / 内核面板(:3100)
+   * ============================================================ */
+  :root {
+    --brand: #2F54EB;
+    --text: #0F1115;
+    --status: #6b747d;
+    --border: rgb(0 0 0 / 8%);
+    --titlebar-h: 40px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --brand: #6b83ff; --text: #f1f4f9; --status: #9aa3ad;
+      --border: rgb(255 255 255 / 14%);
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; height: 100dvh; overflow: hidden; }
+  body {
+    font-family: Inter, "Noto Sans SC", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #f5f7fc; color: var(--text); display: flex; flex-direction: column;
+  }
+  /* ── 壳窗口栏（唯一，永远在此） ── */
+  #titlebar {
+    height: var(--titlebar-h); flex: none;
+    display: flex; align-items: center; justify-content: space-between;
+    background: #fbfcfe; border-bottom: 1px solid var(--border);
+    user-select: none; -webkit-user-select: none;
+  }
+  @media (prefers-color-scheme: dark) { #titlebar { background: #16191f; } }
+  .tb-drag {
+    -webkit-app-region: drag; app-region: drag;
+    flex: 1; align-self: stretch;
+    display: flex; align-items: center; gap: 8px; padding: 0 14px;
+  }
+  .tb-drag img { width: 16px; height: 16px; }
+  .tb-title { font-size: 12px; font-weight: 600; color: var(--text); letter-spacing: .02em; }
+  .tb-sub { font-size: 11px; color: var(--status); }
+  .tb-btns { display: flex; height: 100%; -webkit-app-region: no-drag; }
+  .tb-btns button {
+    width: 46px; height: 100%; border: 0; background: transparent;
+    color: var(--status); font-size: 15px; cursor: pointer; line-height: 1;
+  }
+  .tb-btns button:hover { background: rgb(47 84 235 / 8%); color: var(--text); }
+  .tb-btns button.close:hover { background: #e81123; color: #fff; }
+  /* ── 内容区（空白容器） ── */
+  #content { flex: 1; min-height: 0; position: relative; background: #f5f7fc; }
+  #content iframe { width: 100%; height: 100%; border: 0; display: block; }
+</style>
+</head>
+<body>
+  <div id="titlebar">
+    <div class="tb-drag" data-tauri-drag-region="deep">
+      <img src="dsh-logo.svg" alt="" aria-hidden="true" onerror="this.style.display='none'">
+      <span class="tb-title">dsh-supervisor</span>
+      <span class="tb-sub" id="tbEnv">· 环境引导</span>
+    </div>
+    <div class="tb-btns">
+      <button id="btnMin" title="最小化">&#x2212;</button>
+      <button id="btnClose" class="close" title="关闭（隐藏到托盘）">&#x00d7;</button>
+    </div>
+  </div>
+  <div id="content">
+    <iframe id="frame" src="bootstrap.html"></iframe>
+  </div>
+  <script>
+    (function () {
+      var core = window.__TAURI__ && window.__TAURI__.core;
+      var evt = window.__TAURI__ && window.__TAURI__.event;
+      var frame = document.getElementById('frame');
+      var wctl = function (a) { if (core) core.invoke('win_ctl', { action: a }).catch(function () {}); };
+      document.getElementById('btnMin').addEventListener('click', function () { wctl('minimize'); });
+      document.getElementById('btnClose').addEventListener('click', function () { wctl('hide'); });
+      // 引导完成 → 内核面板就绪 → 内容区切 :3100
+      if (evt) {
+        evt.listen('shell:goto-panel', function () {
+          document.getElementById('tbEnv').textContent = '· 控制面板';
+          frame.src = 'http://127.0.0.1:3100/';
+        });
+        evt.listen('shell:goto-bootstrap', function () {
+          document.getElementById('tbEnv').textContent = '· 环境引导';
+          frame.src = 'bootstrap.html';
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

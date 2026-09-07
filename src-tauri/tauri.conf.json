@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "dev.bowen.dsh-supervisor",
   "build": {
-    "frontendDist": "frontend"
+    "frontendDist": "bootstrap"
   },
   "app": {
     "withGlobalTauri": true,
@@ -18,12 +18,12 @@
         "minHeight": 540,
         "resizable": true,
         "decorations": false,
-        "transparent": true,
-        "url": "bootstrap.html"
+        "transparent": false,
+        "url": "shell.html"
       }
     ],
     "security": {
-      "csp": "default-src 'self' tauri://localhost http://tauri.localhost; script-src 'self' tauri://localhost http://tauri.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' tauri://localhost http://tauri.localhost"
+      "csp": "default-src 'self' tauri://localhost http://tauri.localhost; script-src 'self' tauri://localhost http://tauri.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' tauri://localhost http://tauri.localhost http://127.0.0.1:*; frame-src 'self' http://127.0.0.1:* http://localhost:*"
     }
   },
   "bundle": {

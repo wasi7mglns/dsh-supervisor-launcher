@@ -8,10 +8,9 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [features]
-# embedded-panel：完整壳（frontendDist=frontend，内嵌闭源面板产物；内核仓本地构建）。
-# 公开壳（MIT 引导器，frontendDist=bootstrap）构建时用 --no-default-features：go_panel 导航守卫 3100。
-default = ["embedded-panel"]
-embedded-panel = []
+# 分体架构（2026-09-07 定案）：壳=自绘窗口容器 + 引导器；面板由内核 :3100 托管。
+# 无 feature 即标准形态：frontendDist=bootstrap；go_panel → emit shell:goto-panel 切内容区。
+default = []
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
