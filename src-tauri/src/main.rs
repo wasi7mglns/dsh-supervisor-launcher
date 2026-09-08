@@ -182,8 +182,37 @@ fn core_status(app: tauri::AppHandle) -> serde_json::Value {
     let installed = locate_core(&app).is_some();
     serde_json::json!({
         "installed": installed,
-        "hint": "npm i -g @dsh-core/dsh-core-<platform>-<arch>"
+        "hint": "npm i -g @dsh-sup/dsh-core-linux-x64（按平台）"
     })
+}
+
+/// 一键安装内核标准包（npm i -g @dsh-sup/dsh-core-<os>-<arch>）——引导器 Phase 3 闭环：
+/// 壳检测到内核缺失时不再只给提示语，直接执行标准产品安装（Node 已就绪前提下）。
+/// npm 前台 spawn（短超时不适用：148MB 包安装耗时数分钟）→ 完成后由轮询 core_status 收尾。
+#[tauri::command]
+fn core_install(app: tauri::AppHandle) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let plat = match std::env::consts::OS {
+        "linux" => "linux",
+        "darwin" => "darwin",
+        "windows" => "win",
+        other => return Err(format!("不支持的平台: {}", other)),
+    };
+    let arch = match std::env::consts::ARCH {
+        "x64" => "x64",
+        "aarch64" => "arm64",
+        other => return Err(format!("不支持的架构: {}", other)),
+    };
+    let pkg = format!("@dsh-sup/dsh-core-{}-{}", plat, arch);
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let _ = Command::new(npm)
+        .args(["install", "-g", "--no-audit", "--no-fund", &pkg])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("npm 启动失败: {}（Node 就绪后才能安装内核）", e))?;
+    let _ = app; // 预留：进度事件
+    Ok(())
 }
 
 /// 桌面自定义窗口控制（Phase 3b：无边框窗口 + 自绘标题栏）。
@@ -222,7 +251,7 @@ fn ensure_guard(app: &tauri::AppHandle) -> Result<(), String> {
     let port = env::api_port();
     if is_alive(port) { return Ok(()); }
     let bin = locate_core(app).ok_or_else(|| format!(
-        "未检测到内核 ({})。请先安装：npm i -g @dsh-core/dsh-core-<platform>-<arch>", core_exe()
+        "未检测到内核 ({})。请先安装：npm i -g @dsh-sup/dsh-core-linux-x64（按平台）", core_exe()
     ))?;
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("daemon");
@@ -318,7 +347,7 @@ fn main() {
             show_main(app);
         }))
         .manage(Mutex::new(RunState::default()))
-        .invoke_handler(tauri::generate_handler![node_status, core_status, start_node_install, skip_env_upgrade, finish_boot, win_ctl])
+        .invoke_handler(tauri::generate_handler![node_status, core_status, core_install, start_node_install, skip_env_upgrade, finish_boot, win_ctl])
         .setup(|app| {
             // 托盘直发本地 API 的端口：显式 DSH_SUPERVISOR_TRAY_PORT 优先，否则从用户 config.apiPort 解析
             let port: u16 = std::env::var("DSH_SUPERVISOR_TRAY_PORT")

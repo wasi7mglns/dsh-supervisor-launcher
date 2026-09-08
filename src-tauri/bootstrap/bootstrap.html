@@ -158,7 +158,11 @@
     status('正在探测守卫内核…');
     return core.invoke('core_status').then(function (cs) {
       coreOk = !!cs.installed;
-      if (!coreOk) { status('守卫内核未就绪，正在拉起…'); return wait(600).then(stepGuardWait); }
+      if (!coreOk) {
+        // 内核缺失：一键安装标准产品包（npm i -g @dsh-sup/dsh-core-<platform>-<arch>）
+        status('守卫内核未安装 · 正在安装标准产品包…');
+        return core.invoke('core_install').catch(function (e) { status('内核安装启动失败: ' + e); }).then(stepGuardWait);
+      }
       return stepGuardDone();
     });
   }
@@ -168,8 +172,9 @@
         core.invoke('core_status').then(function (cs) {
           if (cs.installed) { clearInterval(t); coreOk = true; resolve(stepGuardDone()); }
         }).catch(function () {});
-      }, 600);
-      setTimeout(function () { clearInterval(t); coreOk = true; resolve(stepGuardDone()); }, 15000);
+      }, 1500);
+      // 148MB 包安装耗时数分钟：兜底从 15s 放宽到 10min（安装中轮询继续，超时也放行进面板由 core_status 决定）
+      setTimeout(function () { clearInterval(t); coreOk = true; resolve(stepGuardDone()); }, 600000);
     });
   }
   function stepGuardDone() {
