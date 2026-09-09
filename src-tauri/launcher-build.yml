@@ -45,9 +45,11 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          # runner 镜像自带的 Google Chrome 源常报 Hash Sum mismatch（与本次构建无关），先移除避免 apt 失败
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list /etc/apt/sources.list.d/google*.list 2>/dev/null || true
-          sudo apt-get update -y
+          # runner 镜像自带的第三方源（dl.google.com 等）常报 Hash Sum mismatch，与构建无关——
+          # 全部移除只留 Ubuntu 官方源，apt 稳定可复现；update 失败也容错（官方索引通常已就绪）
+          sudo rm -f /etc/apt/sources.list.d/google*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          sudo find /etc/apt/sources.list.d -name '*.list' -exec grep -l 'dl.google.com' {} \; -delete 2>/dev/null || true
+          sudo apt-get update -y || true
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libfuse2
 
       - name: 壳无头冒烟（--node-plan：环境探针 + 官方最新 LTS）
