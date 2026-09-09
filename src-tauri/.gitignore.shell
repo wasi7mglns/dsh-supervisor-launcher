@@ -1,4 +1,16 @@
+# 截图取证
 screenshots/
-src-tauri/target
+**/screenshots/
+
+# Tauri/壳构建产物（可重新生成，绝不入库）
+target
+gen
+frontend
+AppDir
+
+# 依赖
 node_modules/
+
+# 系统/编辑器
 .DS_Store
+*.log
