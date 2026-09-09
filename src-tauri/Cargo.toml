@@ -8,9 +8,9 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [features]
-# embedded-panel：完整壳（frontendDist=frontend，内嵌闭源面板产物；内核仓本地构建）。
-# 公开壳（MIT 引导器，frontendDist=bootstrap）构建时用 --no-default-features：go_panel 导航守卫 3100。
-default = ["embedded-panel"]
+# 公开壳（MIT 引导器，frontendDist=bootstrap，2026-09 双仓拆分定案）。
+# 说明：embedded-panel 完整壳（内嵌闭源面板产物 frontend/）已随拆分留在内核仓本地，
+# 公开壳仓不自带 default feature——纯引导器形态，自足可独立构建 .deb/.AppImage。
 embedded-panel = []
 
 [dependencies]

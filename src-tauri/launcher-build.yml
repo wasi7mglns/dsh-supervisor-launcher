@@ -1,5 +1,7 @@
 name: launcher-build
 
+# 公开壳仓产线（2026-09 双仓拆分定案）：本仓=壳（src-tauri 引导器形态，MIT 可独立构建）。
+# tag v<壳版本> / push main → 逐平台 Tauri bundle → 安装程序（Linux .deb/.AppImage 等）挂 GitHub Release。
 on:
   push:
     branches: [main]
@@ -17,8 +19,8 @@ jobs:
             artifact: win-x64
           - os: macos-latest
             artifact: darwin-arm64
-          - os: macos-13
-            artifact: darwin-x64
+          # darwin-x64：GitHub 已无 Intel macOS runner（macos-13 弃用）——原生 Rust 无法像 JS
+          # 那样跨 arch override，x64 macOS 安装包暂缺（与内核 darwin-x64 元数据包不同，需真 Intel 机器）。
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +37,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+
+      - name: Install Linux system deps (Tauri v2)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libfuse2
 
       - name: 壳无头冒烟（--node-plan：环境探针 + 官方最新 LTS）
         shell: bash
