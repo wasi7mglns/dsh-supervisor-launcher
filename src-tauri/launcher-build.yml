@@ -58,15 +58,28 @@ jobs:
       - name: Build + bundle (Tauri)
         run: npx --yes @tauri-apps/cli@2 build
 
-      - name: Upload artifacts
+      # 只上传/挂载真正的安装程序文件（.deb/.AppImage/.dmg/.msi）。
+      # 修复：原 `bundle/**/*` 会把 bundle 下 .app 目录（macOS）、AppImage 解包 AppDir、
+      # deb/appimage 构建中间产物（全部 WebKit/GTK .so、gschema、im-module 等数百文件）
+      # 一并递归匹配上传——Release 页被 238 个垃圾资产淹没、artifact 膨胀到 186MB。
+      - name: Upload installer artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: src-tauri/target/release/bundle/**/*
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: warn
 
-      - name: Attach to GitHub Release（tag 触发时）
+      - name: Attach installers to GitHub Release（tag 触发时）
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
-          files: src-tauri/target/release/bundle/**/*
+          files: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/msi/*.msi
           generate_release_notes: true
