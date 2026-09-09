@@ -5,10 +5,13 @@ name: launcher-build
 on:
   push:
     branches: [main]
+    tags: ['v*']            # tag push 触发挂 Release（此前缺失，tag 从不会触发 CI）
   workflow_dispatch: {}
 
 jobs:
   build:
+    permissions:
+      contents: write   # action-gh-release 挂 Release + 资产上传需 GITHUB_TOKEN contents:write
     strategy:
       fail-fast: false
       matrix:

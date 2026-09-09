@@ -5,6 +5,7 @@ name: launcher-build
 on:
   push:
     branches: [main]
+    tags: ['v*']            # tag push 触发挂 Release（此前缺失，tag 从不会触发 CI）
   workflow_dispatch: {}
 
 jobs:
