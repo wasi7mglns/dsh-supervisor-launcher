@@ -6,64 +6,67 @@
 <title>dsh-supervisor — 环境引导</title>
 <style>
   /* ============================================================
-   * dsh-supervisor 引导页（极简自动版，2026-09-07）
-   * 职责单一：初次启动 → 检测环境 → 补全环境 → 拉守卫内核 → 进面板。
-   * 全程自动，无任何用户操作按钮；纯加载页氛围 + 简洁流程状态。
+   * dsh-supervisor 引导页（健壮版）
+   * 职责单一：检测环境 → 补全 Node → 内核版本治理（强制更新+失败回退）→ 守卫就绪 → 进面板。
+   * 关键原则：每步真实成败；失败可重试、可诊断；**绝不假成功**。
    * ============================================================ */
   :root {
     --brand: #2F54EB; --brand-soft: rgb(47 84 235 / 12%);
-    --text: #0F1115; --status: #6b747d; --line: #DDE3EC; --ok: #10b981;
+    --text: #0F1115; --status: #6b747d; --line: #DDE3EC; --ok: #10b981; --err: #e5484d;
   }
   @media (prefers-color-scheme: dark) {
     :root { --brand: #6b83ff; --brand-soft: rgb(107 131 255 / 18%);
-      --text: #f1f4f9; --status: #9aa3ad; --line: #262b36; --ok: #34d399; }
+      --text: #f1f4f9; --status: #9aa3ad; --line: #262b36; --ok: #34d399; --err: #ff6369; }
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { width: 100%; height: 100%; height: 100dvh; }
   body { margin: 0; background: transparent; color: var(--text); overflow: hidden;
     font-family: Inter, "Noto Sans SC", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
-
-  .page {
-    width: 100%; height: 100%;
-    display: grid; place-items: center;
-    background: radial-gradient(circle at 50% 38%, var(--brand-soft), transparent 32%), #FAFBFC;
-  }
+  .page { width: 100%; height: 100%; display: grid; place-items: center;
+    background: radial-gradient(circle at 50% 38%, var(--brand-soft), transparent 32%), #FAFBFC; }
   @media (prefers-color-scheme: dark) {
     .page { background: radial-gradient(circle at 50% 38%, rgb(107 131 255 / 14%), transparent 32%), #0f1115; }
   }
-  .inner { display: grid; justify-items: center; gap: 22px; width: min(460px, calc(100% - 48px)); }
-
-  /* 大 LOGO（加载页 DNA） */
-  .startup-logo {
-    position: relative; display: grid; width: 72px; height: 72px; place-items: center;
+  .inner { display: grid; justify-items: center; gap: 20px; width: min(520px, calc(100% - 48px)); }
+  .startup-logo { position: relative; display: grid; width: 72px; height: 72px; place-items: center;
     border: 1px solid rgb(47 84 235 / 14%); border-radius: 999px;
     background: linear-gradient(145deg, rgb(255 255 255 / 96%), rgb(239 245 242 / 92%));
-    box-shadow: 0 18px 42px rgb(15 23 42 / 10%), inset 0 1px 0 rgb(255 255 255 / 90%);
-    color: var(--brand);
-  }
-  .startup-logo::after {
-    position: absolute; inset: -8px; content: ""; border-radius: 999px;
-    border: 2px solid rgb(47 84 235 / 10%); border-top-color: var(--brand);
-    animation: spin 960ms linear infinite;
-  }
+    box-shadow: 0 18px 42px rgb(15 23 42 / 10%), inset 0 1px 0 rgb(255 255 255 / 90%); color: var(--brand); }
+  .startup-logo::after { position: absolute; inset: -8px; content: ""; border-radius: 999px;
+    border: 2px solid rgb(47 84 235 / 10%); border-top-color: var(--brand); animation: spin 960ms linear infinite; }
   .startup-logo.done::after { animation: none; border-color: rgb(16 185 129 / 30%); border-top-color: var(--ok); }
   .startup-logo-image { width: 46px; height: 46px; background: currentColor;
     mask: url("/dsh-logo.svg") center / contain no-repeat;
     -webkit-mask: url("/dsh-logo.svg") center / contain no-repeat; }
   .startup-name { font-size: 22px; font-weight: 760; line-height: 1; letter-spacing: .02em; }
   .startup-status { color: var(--status); font-size: 13px; line-height: 1.5; text-align: center; min-height: 20px; }
-
-  /* 简洁流程（四小步：检测→环境→守卫→面板） */
-  .steps { display: flex; align-items: center; justify-content: center; gap: 4px; }
+  .steps { display: flex; align-items: center; justify-content: center; gap: 2px; flex-wrap: wrap; }
   .step { display: flex; align-items: center; gap: 6px; color: var(--status); font-size: 12px;
-    padding: 5px 10px; border-radius: 999px; transition: all .3s ease; }
+    padding: 5px 9px; border-radius: 999px; transition: all .3s ease; }
   .step .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--line); flex: none; }
   .step.active { color: var(--text); font-weight: 600; background: rgb(47 84 235 / 8%); }
   .step.active .dot { background: var(--brand); }
   .step.done { color: var(--ok); }
   .step.done .dot { background: var(--ok); }
   .step-arrow { color: var(--line); font-size: 12px; }
-
+  .fail { display: grid; gap: 12px; justify-items: center; width: 100%;
+    border: 1px solid color-mix(in srgb, var(--err) 30%, transparent); border-radius: 12px;
+    padding: 16px; background: color-mix(in srgb, var(--err) 6%, transparent); }
+  .fail-msg { color: var(--text); font-size: 12.5px; line-height: 1.6; text-align: center; word-break: break-word; }
+  .fail-actions { display: flex; gap: 8px; }
+  .fail-actions button { border: 1px solid var(--line); background: var(--brand); color: #fff;
+    border-radius: 8px; padding: 7px 16px; font-size: 12.5px; cursor: pointer; }
+  .fail-actions button.ghost { background: transparent; color: var(--status); }
+  .choice { display: grid; gap: 10px; justify-items: center; width: 100%;
+    border: 1px solid color-mix(in srgb, var(--brand) 32%, transparent); border-radius: 12px;
+    padding: 16px; background: color-mix(in srgb, var(--brand) 6%, transparent); }
+  .choice-title { font-size: 13.5px; font-weight: 680; color: var(--text); }
+  .choice-msg { color: var(--text); font-size: 12.5px; line-height: 1.6; text-align: center; word-break: break-word; }
+  .choice-meta { color: var(--status); font-size: 11.5px; line-height: 1.5; text-align: center; }
+  .choice-actions { display: flex; gap: 8px; }
+  .choice-actions button { border: 1px solid var(--line); background: var(--brand); color: #fff;
+    border-radius: 8px; padding: 7px 16px; font-size: 12.5px; cursor: pointer; }
+  .choice-actions button.ghost { background: transparent; color: var(--status); }
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
@@ -74,35 +77,65 @@
       <div class="startup-name">DSH-SUP</div>
       <div class="startup-status" id="status">正在检测环境…</div>
       <div class="steps" id="steps" style="display:none">
-        <span class="step active" id="st-env"><span class="dot"></span>检测环境</span>
+        <span class="step active" id="st-shell"><span class="dot"></span>壳更新</span>
         <span class="step-arrow">›</span>
-        <span class="step" id="st-node"><span class="dot"></span>环境就绪</span>
+        <span class="step" id="st-env"><span class="dot"></span>检测环境</span>
         <span class="step-arrow">›</span>
-        <span class="step" id="st-guard"><span class="dot"></span>守卫内核</span>
+        <span class="step" id="st-node"><span class="dot"></span>运行环境</span>
+        <span class="step-arrow">›</span>
+        <span class="step" id="st-core"><span class="dot"></span>内核版本</span>
+        <span class="step-arrow">›</span>
+        <span class="step" id="st-guard"><span class="dot"></span>守卫就绪</span>
         <span class="step-arrow">›</span>
         <span class="step" id="st-panel"><span class="dot"></span>进入面板</span>
+      </div>
+      <div class="fail" id="fail" style="display:none">
+        <div class="fail-msg" id="failMsg"></div>
+        <div class="fail-actions">
+          <button id="btnRetry">重试</button>
+          <button id="btnDiag" class="ghost">复制诊断</button>
+        </div>
+      </div>
+      <!-- 壳更新失败选择页（用户定案 2026-09-11）：
+           失败**不静默放行**，给出【重试】【继续使用当前版本】；
+           其中【继续】必须始终可用——这是「有界失败即放行」的用户可见形式，
+           保证极端情况下用户仍能进入产品（绝不把用户永久挡在门外）。 -->
+      <div class="choice" id="updChoice" style="display:none">
+        <div class="choice-title">桌面壳更新未完成</div>
+        <div class="choice-msg" id="updMsg"></div>
+        <div class="choice-meta" id="updMeta"></div>
+        <div class="choice-actions">
+          <button id="btnUpdRetry">重试更新</button>
+          <button id="btnUpdSkip" class="ghost">继续使用当前版本</button>
+        </div>
       </div>
     </div>
   </div>
 <script>(function () {
-  // Tauri API: 自身注入优先; 作为壳框架(shell.html) iframe 内容时经 parent 访问(同源)
+  // Tauri API：自身注入优先；作为壳框架(shell.html) iframe 内容时经 parent 访问（同源）。
   var core = (window.__TAURI__ && window.__TAURI__.core)
     || (window.parent && window.parent.__TAURI__ && window.parent.__TAURI__.core)
     || (window.top && window.top.__TAURI__ && window.top.__TAURI__.core) || null;
-  var evtCore = core;
   var evt = (window.__TAURI__ && window.__TAURI__.event)
     || (window.parent && window.parent.__TAURI__ && window.parent.__TAURI__.event) || null;
   var $ = function (id) { return document.getElementById(id); };
-  var stepNames = ['st-env', 'st-node', 'st-guard', 'st-panel'];
-  var nodeOk = false, coreOk = false, nodeBusy = false;
-  var nodeVer = null;
-
-  // 步骤状态机：0=检测环境 1=Node运行时 2=守卫内核 3=进入面板
+  // 步骤顺序（2026-09-11）：壳更新 → 环境 → Node → 内核 → 守卫 → 面板
+  // 壳更新排最前：新壳才可能带有新的 Node/内核安装要求（每个写动作应由最新版本的壳执行）。
+  var stepNames = ['st-shell', 'st-env', 'st-node', 'st-core', 'st-guard', 'st-panel'];
   var cur = -1;
+  var nodeVer = null;      // 当前 Node 版本
+  var coreFrom = null;     // 更新前内核版本
+  var coreTo = null;       // 更新后内核版本
+  var lastPlan = null;     // 最近一次 core_plan（诊断用）
+  var lastError = null;
+  var shellId = null;      // 壳身份（版本/安装形态/自更新能力/attempt）
+  var updPlan = null;      // 最近一次门 0 检查结果（诊断用）
+
   function setStep(i, detail) {
     if (i > cur) cur = i;
     stepNames.forEach(function (id, idx) {
       var el = document.getElementById(id);
+      if (!el) return;
       var cls = 'step';
       if (idx < cur) cls += ' done';
       else if (idx === cur) cls += ' active';
@@ -115,99 +148,277 @@
     $('steps').style.display = '';
   }
   function status(t) { $('status').textContent = t; }
+  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function hideFail() { $('fail').style.display = 'none'; }
+  // 阶段上报：写入 ~/.dsh/shell/identity.json + shell.log，供内核观察与问题定位。
+  // 这是「壳此前零日志、任何打不开都无法诊断」的结构性修复（P0.1/P0.2）。
+  function phase(p) {
+    try { if (core) core.invoke('shell_set_phase', { phase: p }).catch(function () {}); } catch (e) {}
+  }
 
-  // 逐步执行：每步真实状态 + 停留反馈
-  var finished = false;
-  function stepEnv() {
+  // 失败态：显示原因 + 重试 + 诊断（K7——失败不再死锁在引导页）
+  function fail(msg) {
+    lastError = msg;
+    status('启动未完成');
+    $('failMsg').textContent = msg;
+    $('fail').style.display = '';
+  }
+  function diagText() {
+    return [
+      'node=' + (nodeVer || 'unknown'),
+      'core_from=' + (coreFrom || 'none'),
+      'core_to=' + (coreTo || 'none'),
+      'plan=' + (lastPlan ? JSON.stringify(lastPlan) : 'none'),
+      'shell=' + (shellId ? (shellId.version + '/' + shellId.installKind + '/capable=' + shellId.selfUpdateCapable) : 'unknown'),
+      'shell_attempt=' + (shellId ? shellId.attempt : '?'),
+      'shell_pinned=' + (shellId && shellId.pinned ? JSON.stringify(shellId.pinned) : '[]'),
+      'shell_update=' + (updPlan ? JSON.stringify({ available: updPlan.available, latest: updPlan.latest, skipped: updPlan.skipped, error: updPlan.error }) : 'none'),
+      'error=' + (lastError || 'none'),
+    ].join(' | ');
+  }
+
+  // 壳更新失败选择页（用户定案 2026-09-11）：失败**不静默放行**，给出【重试】【继续】；
+  // 【继续】必须始终可用——这是「有界失败即放行」的用户可见形式。
+  function hideUpdChoice() { $('updChoice').style.display = 'none'; }
+  function showUpdChoice(reason) {
+    // 注意：变量名不可用 cur —— 外层 cur 是步骤索引，遮蔽会造成步骤条错乱。
+    var curVer = (shellId && shellId.version) || "unknown";
+    var target = (updPlan && updPlan.latest) || "unknown";
+    var kind = (shellId && shellId.installKind) || "unknown";
+    $('updMsg').textContent = reason || "更新未能完成";
+    $('updMeta').textContent = "当前 " + curVer + " · 目标 " + target + " · 安装形态 " + kind;
+    $('updChoice').style.display = '';
+  }
+
+  // ── 步骤 0（门 0）：桌面壳自更新 ──
+  // 语义：**尽力更新，失败即放行**。原因一律落盘（identity.json / shell.log）。
+  // 三平台同一路径：check → download → minisign 验签 → 平台安装 → 重启。
+  function stepShellUpdate() {
     setStep(0);
+    status('正在检查桌面壳更新…');
+    return core.invoke('shell_identity').then(function (id) {
+      shellId = id || {};
+      return core.invoke('shell_update_check');
+    }).then(function (r) {
+      updPlan = r || {};
+      // 情形 A：跳过（不可自更新 / 已拉黑 / 达阈值）→ 放行，不打扰用户
+      if (r && r.skipped) {
+        status('跳过壳更新：' + (r.reason || ''));
+        return wait(400).then(stepEnv);
+      }
+      // 情形 B：无更新 → 放行
+      if (r && r.available !== true) {
+        if (r && r.ok === false) {
+          // 检查失败（多为网络/清单不可达）→ 按「失败放行」，但记录状态
+          status('壳更新检查失败，继续启动：' + (r.error || '未知'));
+          return wait(500).then(stepEnv);
+        }
+        status('桌面壳已是最新（v' + ((shellId && shellId.version) || '?') + '）');
+        return wait(300).then(stepEnv);
+      }
+      // 情形 C：有更新 → 下载安装
+      return stepShellApply();
+    }).catch(function (e) {
+      // 桥接异常也按「失败放行」，绝不死锁
+      status('壳更新异常，继续启动：' + e);
+      return wait(500).then(stepEnv);
+    });
+  }
+
+  function stepShellApply() {
+    var target = (updPlan && updPlan.latest) || '';
+    status('发现新版本 v' + target + ' · 正在下载并安装…');
+    return core.invoke('shell_update_apply').then(function (r) {
+      r = r || {};
+      if (r.ok !== true) {
+        showUpdChoice('更新安装失败：' + (r.error || '未知'));
+        return null; // 停在此页，等用户选择（重试 / 继续）
+      }
+      if (r.upToDate) { return stepEnv(); }
+      status('更新已安装（v' + (r.installed || target) + '）· 正在重启…');
+      return wait(600).then(function () {
+        // 重启进入新版本；旧进程装、新进程跑。重启后 version == pendingVersion → 视为成功。
+        return core.invoke('shell_restart');
+      });
+    }).catch(function (e) {
+      showUpdChoice('更新安装异常：' + e);
+      return null;
+    });
+  }
+
+  // ── 步骤 1：环境检测 ──
+  function stepEnv() {
+    setStep(1);
+    phase('env');
     status('正在检测系统环境…');
     return core.invoke('node_status').then(function (st) {
-      nodeBusy = !!st.busy;
-      nodeOk = !!st.installed;
-      nodeVer = st.installed || null;
-      if (nodeBusy) { status(st.status || '正在准备 Node.js 运行环境…'); return stepNodeBusy(); }
-      if (!nodeOk) {
-        setStep(1);
+      st = st || {};
+      if (st.busy) { setStep(2); status(st.status || '正在准备 Node.js 运行环境…'); return stepNodeWait(); }
+      if (!st.installed) {
+        setStep(2);
         status('未检测到 Node.js · 正在补全运行环境…');
         return core.invoke('start_node_install').then(function () { return stepNodeWait(); });
       }
+      nodeVer = st.installed;
       return stepNodeDone();
     });
   }
-  function stepNodeBusy() { setStep(1); status('正在安装 Node.js 运行环境…'); return stepNodeWait(); }
   function stepNodeWait() {
-    // 轮询等待安装完成
+    phase('node');
     return new Promise(function (resolve) {
+      var done = false;
       var t = setInterval(function () {
         core.invoke('node_status').then(function (st) {
-          if (!st.busy && st.installed) { clearInterval(t); nodeOk = true; nodeVer = st.installed; resolve(stepNodeDone()); }
-          else if (!st.busy && !st.installed) { /* still waiting */ }
+          st = st || {};
+          if (!st.busy && st.installed) { if (!done) { done = true; clearInterval(t); nodeVer = st.installed; resolve(stepNodeDone()); } }
         }).catch(function () {});
-      }, 600);
-      setTimeout(function () { clearInterval(t); resolve(stepNodeDone()); }, 15000); // 15s 兜底
+      }, 700);
+      // 兜底：Node 安装可能长达数分钟；超时不当作成功（交给后续步骤如实报错）
+      setTimeout(function () { if (!done) { done = true; clearInterval(t); resolve(stepNodeDone()); } }, 600000);
     });
   }
   function stepNodeDone() {
-    setStep(1, '');
-    status('Node.js ' + (nodeVer || '') + ' 已就绪 ✓');
-    // 停驻让用户感知 Node 检测完成
-    return wait(450).then(stepGuard);
-  }
-  function stepGuard() {
     setStep(2);
-    status('正在探测守卫内核…');
-    return core.invoke('core_status').then(function (cs) {
-      coreOk = !!cs.installed;
-      if (!coreOk) {
-        // 内核缺失：一键安装标准产品包（npm i -g @dsh-sup/dsh-core-<platform>-<arch>）
-        status('守卫内核未安装 · 正在安装标准产品包…');
-        return core.invoke('core_install').catch(function (e) { status('内核安装启动失败: ' + e); }).then(stepGuardWait);
-      }
-      return stepGuardDone();
-    });
+    status('Node.js ' + (nodeVer || '') + ' 已就绪');
+    return wait(350).then(stepCorePlan);
   }
-  function stepGuardWait() {
-    return new Promise(function (resolve) {
-      var t = setInterval(function () {
-        core.invoke('core_status').then(function (cs) {
-          if (cs.installed) { clearInterval(t); coreOk = true; resolve(stepGuardDone()); }
-        }).catch(function () {});
-      }, 1500);
-      // 148MB 包安装耗时数分钟：兜底从 15s 放宽到 10min（安装中轮询继续，超时也放行进面板由 core_status 决定）
-      setTimeout(function () { clearInterval(t); coreOk = true; resolve(stepGuardDone()); }, 600000);
-    });
-  }
-  function stepGuardDone() {
-    setStep(2, '');
-    status('守卫内核已就绪 ✓');
-    return wait(450).then(stepPanel);
-  }
-  function stepPanel() {
+
+  // ── 步骤 2：内核版本治理（强制更新 + 失败回退）──
+  function stepCorePlan() {
     setStep(3);
+    phase('kernel');
+    status('正在检查内核版本…');
+    return core.invoke('core_plan').then(function (p) {
+      lastPlan = p || {};
+      coreFrom = p.installed || null;
+      if (!p.installed) {
+        status('未安装内核 · 正在安装标准产品包…');
+        return coreApply(null);
+      }
+      if (p.action === 'upgrade' && p.latest) {
+        status('发现新内核 v' + p.latest + '（当前 v' + p.installed + '）· 正在强制更新…');
+        return coreApply(p.latest);
+      }
+      status('内核已是最新（v' + p.installed + '）');
+      coreTo = p.installed;
+      return wait(300).then(stepCoreDone);
+    }).catch(function (e) { fail('内核版本检查失败：' + e); });
+  }
+
+  // 执行安装/升级/回退；成功返回 true，失败走 fail() 并返回 false
+  function coreApply(version) {
+    return core.invoke('core_apply', { version: version }).then(function (r) {
+      if (!r || r.ok !== true) {
+        fail('内核' + (coreFrom ? '更新' : '安装') + '失败：' + ((r && r.error) || '未知错误'));
+        return false;
+      }
+      coreTo = r.version;
+      // 校验确实生效：防「装到了别的前缀」（跨平台 npm prefix 不一致的典型症状）
+      return core.invoke('core_status').then(function (st) {
+        st = st || {};
+        if (st.version === r.version) return stepCoreDone();
+        fail('内核已安装 v' + r.version + '，但检测到的是 v' + (st.version || '未知') + '（安装前缀不一致）');
+        return false;
+      });
+    }).catch(function (e) { fail('内核安装异常：' + e); return false; });
+  }
+
+  function stepCoreDone() {
+    setStep(3);
+    status('内核 v' + (coreTo || coreFrom || '') + ' 已就绪');
+    return wait(300).then(stepGuardStart);
+  }
+
+  // ── 步骤 3：守卫就绪（TCP + HTTP 双确认，替代固定延时）──
+  function stepGuardStart() {
+    setStep(4);
+    phase('guard');
+    status('正在启动守卫…');
+    return core.invoke('guard_start').then(function (r) {
+      if (!r || r.ok !== true) return guardFailed('守卫启动失败：' + ((r && r.error) || '未知'));
+      return stepGuardReady(0);
+    }).catch(function (e) { return guardFailed('守卫启动异常：' + e); });
+  }
+  function stepGuardReady(n) {
+    if (n === 0) status('等待守卫就绪…');
+    return core.invoke('guard_ready').then(function (r) {
+      r = r || {};
+      if (r.ready) return stepPanel();
+      if (n >= 40) return guardFailed('守卫未就绪（端口 ' + (r.port || '?') + ' 无响应）');
+      return wait(500).then(function () { return stepGuardReady(n + 1); });
+    }).catch(function () {
+      if (n >= 40) return guardFailed('守卫就绪探测失败');
+      return wait(500).then(function () { return stepGuardReady(n + 1); });
+    });
+  }
+  // 方案 B：本次发生过升级且守卫起不来 → 回退旧版本再试一次（旧版仍可从镜像装回）
+  function guardFailed(msg) {
+    if (coreFrom && coreTo && coreFrom !== coreTo) {
+      status('守卫未就绪 · 正在回退内核 v' + coreFrom + '…');
+      return core.invoke('core_apply', { version: coreFrom }).then(function (r) {
+        if (!r || r.ok !== true) { fail(msg + '；回退亦失败：' + ((r && r.error) || '未知')); return null; }
+        coreTo = coreFrom; // 已回退：再次失败将直接进入失败态（不再循环回退）
+        return core.invoke('guard_start').then(function () { return stepGuardReady(0); });
+      }).catch(function (e) { fail(msg + '；回退异常：' + e); return null; });
+    }
+    fail(msg);
+    return null;
+  }
+
+  // ── 步骤 5：进入面板（= 健康确认：内核据此确认壳更新成功 / 清 journal）──
+  function stepPanel() {
+    setStep(5);
+    phase('ready');   // 关键：这是「壳已健康启动」的确认信号
     status('环境就绪 · 正在打开面板…');
     $('logo').classList.add('done');
-    // 停留让用户看到完成态，然后进面板
-    return wait(900).then(function () {
-      if (core) core.invoke('finish_boot').catch(function () {});
-    });
+    return wait(700).then(function () { if (core) core.invoke('finish_boot').catch(function () {}); });
   }
-  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
-  // 启动：先环境，后守卫
   function boot() {
     if (!core) return;
-    stepEnv().catch(function (e) { status('检测异常: ' + e); });
+    hideFail();
+    hideUpdChoice();
+    cur = -1; nodeVer = null; coreFrom = null; coreTo = null; lastError = null; updPlan = null;
+    // 从门 0（壳自更新）开始；其后依次为环境 → Node → 内核 → 守卫 → 面板。
+    stepShellUpdate().catch(function (e) { fail('引导异常：' + e); });
   }
-  boot();
-  // 事件：安装进度实时更新状态
+
+  // 交互：壳更新失败选择页（用户已确认的定案）
+  //   【重试】重新尝试安装（手动重试是明确意图，给足预算）；
+  //   【继续】始终可用，进入引导后续步骤（有界失败即放行的用户可见形式）。
+  $('btnUpdRetry').addEventListener('click', function () {
+    hideUpdChoice();
+    status('正在重试壳更新…');
+    stepShellApply().catch(function (e) { showUpdChoice('重试异常：' + e); });
+  });
+  $('btnUpdSkip').addEventListener('click', function () {
+    hideUpdChoice();
+    status('已选择继续使用当前版本');
+    try { if (core) core.invoke('shell_set_phase', { phase: 'shell-update-skipped' }); } catch (e) {}
+    stepEnv().catch(function (e) { fail('引导异常：' + e); });
+  });
+
+  // 交互：重试 / 诊断
+  $('btnRetry').addEventListener('click', function () { boot(); });
+  $('btnDiag').addEventListener('click', function () {
+    var t = diagText();
+    try { if (navigator.clipboard) navigator.clipboard.writeText(t); } catch (e) {}
+    status('诊断信息已复制：' + t);
+  });
+
+  // Node 安装进度与失败实时反馈（事件闭环：env_error 不再无人监听）
   if (evt) {
     evt.listen('env_progress', function (e) {
       var p = e.payload || {};
-      if (p.busy) { setStep(1); status(p.status || '正在安装 Node.js…'); }
+      if (p.busy) { setStep(2); status(p.status || '正在安装 Node.js…'); }
     });
-    evt.listen('env_done', function (e) {});
-    evt.listen('env_error', function (e) {});
+    evt.listen('env_error', function (e) {
+      var p = (e && e.payload) || {};
+      fail('运行环境安装失败：' + (p.error || '未知'));
+    });
   }
+
+  boot();
 })();</script>
 </body>
 </html>

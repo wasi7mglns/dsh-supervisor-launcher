@@ -1,29 +1,65 @@
 name: launcher-build
 
 # 公开壳仓产线（2026-09 双仓拆分定案）：本仓=壳（src-tauri 引导器形态，MIT 可独立构建）。
-# tag v<壳版本> / push main → 逐平台 Tauri bundle → 安装程序（Linux .deb/.AppImage 等）挂 GitHub Release。
+# 矩阵 → 逐平台 Tauri bundle → 安装包挂 GitHub Release + 发布 npm 包（自更新产物）。
+#
+# ── 触发策略（2026-09 修复 F5：原 push main 会每次全平台构建，浪费额度）──
+#   仅 tag / 手动；日常 push main 不再触发（壳为低频发布组件）。
 on:
   push:
-    branches: [main]
-    tags: ['v*']            # tag push 触发挂 Release（此前缺失，tag 从不会触发 CI）
+    tags: ['v*']
   workflow_dispatch: {}
 
+# ── 平台矩阵（2026-09 跨平台审计定案）──
+#  1) Linux **基座固定 ubuntu-22.04**（glibc 2.35）——F1 必修：
+#     实测在 Ubuntu 24.04(glibc 2.39) 构建的产物**无法**在 Ubuntu 22.04 / Debian 12 运行
+#     （根因：Rust std process 模块对 pidfd_spawnp/pidfd_getpid 的弱引用在 2.39 主机会被解析
+#      成硬性 verneed）。在 2.35 基座链接则不产生该需求 → 兼容 22.04+/Debian 12+。
+#  2) Linux 已**废弃 AppImage**（改用标准 deb/rpm）。
+#  3) macOS 双架构**原生**构建：arm64 用 macos-latest，x64 用 **macos-15-intel**
+#     （实测该 runner 存在；旧注释「GitHub 已无 Intel macOS runner」已过时）。注意 macos-14 已弃用。
+#  4) Windows 主推 NSIS per-user（免提权 + 可静默更新），MSI 作备选。
 jobs:
+  # 版本单源：从 tauri.conf.json 读取，供下游组装/发布使用（避免各 job 各写一遍）
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      ver: ${{ steps.v.outputs.ver }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        shell: bash
+        run: echo "ver=$(node -p \"require('./src-tauri/tauri.conf.json').version\")" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: version
     permissions:
-      contents: write   # action-gh-release 挂 Release + 资产上传需 GITHUB_TOKEN contents:write
+      contents: write   # action-gh-release 挂 Release + 资产上传
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             artifact: linux-x64
+            bundles: deb,rpm
+            glibc_max: "2.35"
+          # Linux arm64（可选；如需开启，去掉下方注释并在 N2b 决策中确认）
+          # - os: ubuntu-22.04-arm
+          #   artifact: linux-arm64
+          #   bundles: deb,rpm
+          #   glibc_max: "2.35"
           - os: windows-latest
             artifact: win-x64
+            bundles: nsis,msi
+            glibc_max: ""
           - os: macos-latest
             artifact: darwin-arm64
-          # darwin-x64：GitHub 已无 Intel macOS runner（macos-13 弃用）——原生 Rust 无法像 JS
-          # 那样跨 arch override，x64 macOS 安装包暂缺（与内核 darwin-x64 元数据包不同，需真 Intel 机器）。
+            bundles: app,dmg
+            glibc_max: ""
+          - os: macos-15-intel
+            artifact: darwin-x64
+            bundles: app,dmg
+            glibc_max: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +77,7 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Install Linux system deps (Tauri v2)
+      - name: Install Linux system deps (Tauri v2 + rpm)
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -49,7 +85,10 @@ jobs:
           # 直接删除其源文件（含 deb822 .sources 格式），只留 Ubuntu 官方源，update 必须成功。
           sudo rm -f /etc/apt/sources.list.d/google*.list /etc/apt/sources.list.d/google*.sources 2>/dev/null || true
           sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev
+          # webkit2gtk-4.1：Tauri v2 的 Linux webview 依赖（Ubuntu 22.04 已提供该 ABI，实测）
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev \
+            rpm           # rpm 打包需要 rpmbuild
 
       - name: 壳无头冒烟（--node-plan：环境探针 + 官方最新 LTS）
         shell: bash
@@ -59,21 +98,68 @@ jobs:
         working-directory: src-tauri
 
       - name: Build + bundle (Tauri)
-        run: npx --yes @tauri-apps/cli@2 build
+        shell: bash
+        env:
+          # 签名密钥（发布必须签名：Tauri updater 强制验签，不可关闭）
+          # 未配置 secret 时为空 → 仅构建不产 .sig（开发/验证场景不阻断）
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY 未配置 —— 不生成 .sig，产物不可用于自动更新"
+          fi
+          npx --yes @tauri-apps/cli@2 build --bundles "${{ matrix.bundles }}"
 
-      # 只上传/挂载真正的安装程序文件（.deb/.AppImage/.dmg/.msi）。
-      # 修复：原 `bundle/**/*` 会把 bundle 下 .app 目录（macOS）、AppImage 解包 AppDir、
-      # deb/appimage 构建中间产物（全部 WebKit/GTK .so、gschema、im-module 等数百文件）
-      # 一并递归匹配上传——Release 页被 238 个垃圾资产淹没、artifact 膨胀到 186MB。
+      # ── glibc 基座门禁（Linux only）──
+      # 防止「在新基座构建 → 只能装新发行版」的缺陷回归（F1 实测教训）。
+      - name: glibc 基座门禁（Linux）
+        if: runner.os == 'Linux' && matrix.glibc_max != ''
+        shell: bash
+        run: |
+          BIN=src-tauri/target/release/dsh-supervisor-gui
+          test -f "$BIN" || { echo "找不到产物 $BIN"; exit 1; }
+          # 门禁脚本随壳仓携带（由内核 ci/check-glibc.sh 单源导出）
+          bash ci/check-glibc.sh "$BIN" "${{ matrix.glibc_max }}"
+
+      # ── 组装可发布的 npm 包（产物 + .sig + 清单条目）──
+      # 说明：Tauri 的 {{target}}/{{arch}} 取值与 npm 命名不同，故用静态清单解耦；
+      #       组装器负责把「安装包 + .sig」成对收拢，并在缺 .sig 时**直接失败**
+      #       （缺签名 = 自动更新不可用，必须早失败而非静默发布）。
+      - name: 组装 npm 包（更新产物 + 签名）
+        shell: bash
+        run: |
+          node shell-release/assemble-shell-pkg.js             --platform "${{ matrix.artifact }}"             --ver "${{ needs.version.outputs.ver }}"             --bundle-dir src-tauri/target/release/bundle             --out dist/npm-shell
+
+      # ── 产物验收（本地端到端预演的 CI 化）──
+      # 用 **Tauri 自己的依赖** 验证我们产出的东西正是 Tauri 会接受的东西：
+      #   · minisign-verify —— tauri-plugin-updater 内部使用的同一个 crate
+      #   · tauri_plugin_updater::RemoteRelease —— Tauri 自己的清单解析器
+      # 覆盖：清单可解析 / 签名与配置公钥匹配 / 篡改必失败 / 换公钥必失败。
+      # 这一步失败 = 产物不可用于自动更新 → 必须早失败，绝不静默发布。
+      - name: 产物验收（Tauri 同源验签 + 清单契约）
+        shell: bash
+        env:
+          SHELL_REHEARSAL_DIR: dist/npm-shell
+        run: |
+          # 先断言矩阵声明的 glibc 上限（Linux）已在上一步做过；此处专测更新产物契约。
+          cargo test --test updater_artifacts -- --nocapture --test-threads=1
+        working-directory: src-tauri
+
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
+          # 只上传真正的安装程序 + 更新产物（.sig）。
+          # 不用 bundle/**/*（会把 .app 目录、AppDir、构建中间产物全部递归上传，曾致 238 个垃圾资产）。
           path: |
             src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/rpm/*.rpm
             src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/**/*.sig
+            dist/npm-shell/**
           if-no-files-found: warn
 
       - name: Attach installers to GitHub Release（tag 触发时）
@@ -82,7 +168,97 @@ jobs:
         with:
           files: |
             src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/rpm/*.rpm
             src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/**/*.sig
           generate_release_notes: true
+
+  # ── 发布 job：汇总各平台产物 → 生成 Tauri 静态清单 → 发布到 npm ──
+  # 仅在 tag 触发时执行（日常构建只做验证与产物上传）。
+  publish:
+    needs: [version, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: 下载全部平台产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/artifacts
+
+      - name: 归拢 npm 包目录
+        shell: bash
+        run: |
+          mkdir -p dist/npm-shell
+          for d in dist/artifacts/*/; do
+            [ -d "$d/npm-shell" ] && cp -r "$d/npm-shell/." dist/npm-shell/
+          done
+          for d in dist/artifacts/*/@dsh-sup; do
+            [ -d "$d" ] && cp -r "$d" dist/npm-shell/ 2>/dev/null || true
+          done
+          find dist/npm-shell -maxdepth 3 -type d | head -20
+
+      - name: 生成 shell-manifest.json（Tauri 静态清单）
+        shell: bash
+        run: |
+          node shell-release/make-manifest.js \
+            --ver "${{ needs.version.outputs.ver }}" \
+            --entries dist/npm-shell \
+            --out dist/npm-shell/shell-manifest.json
+
+      - name: 校验清单
+        shell: bash
+        run: |
+          node -e "
+          const m = require('./dist/npm-shell/shell-manifest.json');
+          const keys = Object.keys(m.platforms);
+          console.log('版本:', m.version, '平台:', keys.join(', '));
+          if (!keys.length) { console.error('清单为空'); process.exit(1); }
+          for (const k of keys) {
+            const p = m.platforms[k];
+            if (!p.url || !p.signature) { console.error('缺 url/signature: ' + k); process.exit(1); }
+          }
+          console.log('✅ 清单校验通过');
+          "
+
+      - name: 发布平台子包 + 清单包到 npm
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -e
+          VER="${{ needs.version.outputs.ver }}"
+          TAG=""
+          case "$VER" in
+            *-BETA.*) TAG="--tag beta" ;;
+            *-RC.*)   TAG="--tag rc" ;;
+          esac
+          for d in dist/npm-shell/@dsh-sup/shell-*; do
+            [ -d "$d" ] || continue
+            echo "== 发布 $(node -p "require('./$d/package.json').name") =="
+            (cd "$d" && npm publish --access public $TAG)
+          done
+          REL=dist/npm-shell/@dsh-sup/shell-release
+          mkdir -p "$REL"
+          cp dist/npm-shell/shell-manifest.json "$REL/"
+          node -e "
+          const fs=require('fs');
+          fs.writeFileSync('$REL/package.json', JSON.stringify({
+            name:'@dsh-sup/shell-release', version:'$VER',
+            description:'DSH supervisor desktop shell update manifest (Tauri updater static JSON).',
+            license:'MIT', files:['shell-manifest.json']
+          }, null, 2) + '\n');
+          "
+          (cd "$REL" && npm publish --access public $TAG)

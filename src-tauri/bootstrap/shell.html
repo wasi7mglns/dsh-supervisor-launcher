@@ -84,15 +84,27 @@
     document.getElementById('btnClose').addEventListener('click', function () { wctl('hide'); });
     // 显式拖动（Linux WebKit drag-region 常不生效的可靠替代）
     document.getElementById('dragRegion').addEventListener('mousedown', function () { wctl('drag'); });
+    var panelUrl = null;
+    var retried = 0;
     // 引导完成 → 内容区切到面板
     if (evt) {
       evt.listen('shell:goto-panel', function (e) {
         // 守卫托管面板 URL（Rust go_panel 从 config apiPort 动态给出, 同源直连守卫 API）
-        var u = (e && e.payload && e.payload.url) || 'supervisor.html';
-        if (u !== frame.src) frame.src = u; // 自适应: 同 URL 不强制重载(守卫重启延时重发不刷面板)
+        var p = (e && e.payload) || {};
+        var u = p.url || 'supervisor.html';
+        panelUrl = u;
+        // force=true（用户重新显示窗口）→ 强制重载取最新 UI；否则同 URL 不重载（守卫重启延时重发不刷面板）
+        if (p.force || u !== frame.src) { retried = 0; frame.src = u; }
       });
-      evt.listen('shell:goto-bootstrap', function () { if (frame.src !== 'bootstrap.html') frame.src = 'bootstrap.html'; });
+      evt.listen('shell:goto-bootstrap', function () { panelUrl = null; if (frame.src !== 'bootstrap.html') frame.src = 'bootstrap.html'; });
     }
+    // 面板加载失败兜底（守卫尚未就绪/瞬时错误）：同一 URL 最多重试 2 次（一次性 nonce 破缓存）
+    frame.addEventListener('error', function () {
+      if (!panelUrl || retried >= 2) return;
+      retried++;
+      var sep = panelUrl.indexOf('?') >= 0 ? '&' : '?';
+      frame.src = panelUrl + sep + 'dsh_retry=' + Date.now();
+    });
   })();
   </script>
 </body>

@@ -47,44 +47,36 @@ pub fn supervisor_dir() -> PathBuf {
     PathBuf::from(home).join(".dsh").join("supervisor")
 }
 
-/// 守卫本地 API 基址：读 ~/.dsh/supervisor/config.json 的 apiPort（用户可改），
-/// 失败/缺失回退 3100。壳极少更新但内核配置可演进——硬编码 3100 会让
-/// 改过 apiPort 的用户导航到死端口（2026-09 审计修复 F7）。
-pub fn api_base_url() -> String {
-    let default_port = 36360u16;  // 高位段起始（3100 常用端口易冲突，动态端口 2026-09-07）
-    let port = std::fs::read_to_string(supervisor_dir().join("config.json"))
+/// 读取并解析守卫配置 ~/.dsh/supervisor/config.json（serde_json，**壳读内核配置的唯一解析入口**）。
+/// 契约 ARCHITECTURE-CONTRACT-phase0 §3.5：一律真 JSON 解析，禁止字符串扫描
+/// （格式微调——空白/换行/转义差异——即会让扫描失效；此前 apiPort/closeAction 各有一份扫描实现）。
+fn config_json() -> Option<serde_json::Value> {
+    std::fs::read_to_string(supervisor_dir().join("config.json"))
         .ok()
-        .and_then(|s| {
-            // 极简 JSON 提取（无 serde 依赖）："apiPort": <num> 或 "apiPort":<num>
-            for pat in ["\"apiPort\": ", "\"apiPort\":"] {
-                if let Some(idx) = s.find(pat) {
-                    let rest = &s[idx + pat.len()..];
-                    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                    if let Ok(n) = num.parse::<u16>() {
-                        if n > 0 { return Some(n); }
-                    }
-                }
-            }
-            None
-        })
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+}
+
+/// 守卫本地 API 基址：读 config.json 的 apiPort（用户可改），失败/缺失回退默认端口。
+/// 壳极少更新但内核配置可演进——硬编码会让改过 apiPort 的用户导航到死端口（F7）。
+pub fn api_base_url() -> String {
+    let default_port = 36360u16; // 高位段起始（3100 常用端口易冲突，动态端口 2026-09-07）
+    let port = config_json()
+        .and_then(|v| v.get("apiPort").and_then(|x| x.as_u64()))
+        .filter(|n| *n > 0 && *n <= u16::MAX as u64)
+        .map(|n| n as u16)
         .unwrap_or(default_port);
     format!("http://127.0.0.1:{}/", port)
 }
 
 /// 关闭窗口时的行为（读守卫 config.closeAction；'exit'=退出管家全关，其余=隐藏至托盘）。
 pub fn close_action() -> String {
-    std::fs::read_to_string(supervisor_dir().join("config.json"))
-        .ok()
-        .and_then(|s| {
-            for pat in ["\"closeAction\": \"", "\"closeAction\":\""] {
-                if let Some(idx) = s.find(pat) {
-                    let rest = &s[idx + pat.len()..];
-                    let v: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-                    if v == "exit" || v == "hide" { return Some(v); }
-                }
-            }
-            None
-        })
+    // 契约 ARCHITECTURE-CONTRACT-phase0 §3.5：**真正的 JSON 解析**（旧实现用字符串扫描，
+    // config.json 只要出现空白/换行/转义差异即解析失效——例如格式化写入后键值间无空格）。
+    // 语义不变：'exit' = 退出管家（停全部服务）；其余（含缺失/解析失败/非法值）= 隐藏至托盘。
+    // serde_json 已是壳依赖（见 Cargo.toml），零新增依赖。
+    config_json()
+        .and_then(|v| v.get("closeAction").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .filter(|v| v == "exit" || v == "hide")
         .unwrap_or_else(|| "hide".into())
 }
 

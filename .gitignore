@@ -14,3 +14,7 @@ node_modules/
 # 系统/编辑器
 .DS_Store
 *.log
+
+# 签名密钥（绝不入库）
+*.key
+*.key.pub
