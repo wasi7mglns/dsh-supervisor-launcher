@@ -29,7 +29,11 @@ jobs:
       - uses: actions/checkout@v4
       - id: v
         shell: bash
-        run: echo "ver=$(node -p \"require('./src-tauri/tauri.conf.json').version\")" >> "$GITHUB_OUTPUT"
+        # 必须用块标量：行内写法中的 \" 会破坏 $( ) 的引号配对，
+        # 实测报 syntax error near unexpected token `(`（CI run #16 即因此失败）。
+        run: |
+          ver=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
 
   build:
     needs: version
@@ -202,14 +206,24 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/npm-shell
+          # upload-artifact 保留上传时的相对路径：上传 dist/npm-shell/**，
+          # 下载后落在 <artifact>/dist/npm-shell/**（不是 <artifact>/npm-shell）。
+          # 两种形态都兼容，避免路径假设变化导致静默归拢为空。
           for d in dist/artifacts/*/; do
-            [ -d "$d/npm-shell" ] && cp -r "$d/npm-shell/." dist/npm-shell/
+            for cand in "$d/dist/npm-shell" "$d/npm-shell"; do
+              [ -d "$cand" ] && cp -r "$cand/." dist/npm-shell/
+            done
           done
-          for d in dist/artifacts/*/@dsh-sup; do
-            [ -d "$d" ] && cp -r "$d" dist/npm-shell/ 2>/dev/null || true
-          done
-          find dist/npm-shell -maxdepth 3 -type d | head -20
-
+          echo "=== 归拢后的包目录 ==="
+          find dist/npm-shell -maxdepth 2 -type d | sort
+          # 断言：至少 linux-x64 必须归拢成功。与其让后续产出空清单，
+          # 不如在此明确失败并打印实际布局。
+          if [ ! -d dist/npm-shell/@dsh-sup/shell-linux-x64 ]; then
+            echo "::error::未归拢到 shell-linux-x64，artifact 路径假设可能有误"
+            echo "--- dist/artifacts 实际布局 ---"
+            find dist/artifacts -maxdepth 4 -type d | head -40
+            exit 1
+          fi
       - name: 生成 shell-manifest.json（Tauri 静态清单）
         shell: bash
         run: |
