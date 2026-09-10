@@ -53,9 +53,13 @@ fn verify_like_tauri(data: &[u8], signature_b64: &str, pubkey_b64: &str) -> Resu
 
 /// Locate an updatable artifact plus its .sig in the build output.
 fn find_artifact() -> Option<(PathBuf, PathBuf)> {
+    // 跨平台覆盖：deb/rpm（Linux）、macos/*.app.tar.gz（macOS）、nsis/*.exe（Windows）。
+    // 若只列 deb/rpm，macOS/Windows 的 V1-V5 会静默 SKIP —— 等于这些平台根本没被验收。
     let dirs = [
         repo_root().join("target/release/bundle/deb"),
         repo_root().join("target/release/bundle/rpm"),
+        repo_root().join("target/release/bundle/macos"),
+        repo_root().join("target/release/bundle/nsis"),
     ];
     let mut best: Option<(PathBuf, PathBuf)> = None;
     for dir in dirs {
@@ -63,7 +67,11 @@ fn find_artifact() -> Option<(PathBuf, PathBuf)> {
         for e in rd.flatten() {
             let p = e.path();
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name.ends_with(".deb") || name.ends_with(".rpm") {
+            let updatable = name.ends_with(".deb")
+                || name.ends_with(".rpm")
+                || name.ends_with(".app.tar.gz")
+                || (name.ends_with(".exe") && !name.ends_with(".sig"));
+            if updatable {
                 let sig = PathBuf::from(format!("{}.sig", p.display()));
                 if sig.exists() {
                     let bigger = best.as_ref().map_or(true, |(b, _)| {
@@ -194,37 +202,91 @@ fn v5_pubkey_comes_from_config_and_is_wellformed() {
 // Controlled by env var SHELL_REHEARSAL_DIR so normal runs stay self-contained;
 // CI sets it after assembling a release.
 // ---------------------------------------------------------------------------
+/// 递归收集文件名匹配 predicate 的路径。
+fn walk_find(dir: &Path, pred: &dyn Fn(&str) -> bool) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk_find(&p, pred));
+        } else if let Some(n) = p.file_name().and_then(|s| s.to_str()) {
+            if pred(n) { out.push(p); }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// V6: toolchain round-trip, platform-agnostic.
+//
+// Two modes, both meaningful:
+//   * build job  -> per-platform artifact/manifest-entry.json exists
+//     (platform + manifestKey + entries[].sig). We verify THAT platform artifact
+//     with the configured pubkey. This is what actually runs on macOS/Windows/Linux.
+//   * publish job -> aggregated shell-manifest.json exists. We additionally parse it
+//     with Tauri own RemoteRelease to prove the static-manifest contract.
+//
+// NOTE: an earlier version hardcoded linux-x86_64 + shell-linux-x64, so the macOS and
+// Windows jobs failed (and would otherwise have silently skipped all v1-v5 checks).
+// ---------------------------------------------------------------------------
 #[test]
 fn v6_real_toolchain_manifest_roundtrip() {
     let Ok(dir) = std::env::var("SHELL_REHEARSAL_DIR") else {
         eprintln!("SKIP SHELL_REHEARSAL_DIR not set");
         return;
     };
-    let dir = PathBuf::from(dir);
-    let manifest_path = dir.join("shell-manifest.json");
-    let raw = std::fs::read_to_string(&manifest_path)
-        .unwrap_or_else(|e| panic!("read {} failed: {e}", manifest_path.display()));
-
-    // 1) Tauri own deserializer must accept the toolchain output
-    let release: tauri_plugin_updater::RemoteRelease =
-        serde_json::from_str(&raw).expect("V6 FAIL Tauri rejected toolchain manifest");
-
-    // 2) platform key + url + signature present
-    let url = release.download_url("linux-x86_64").expect("V6 FAIL missing linux-x86_64");
-    let sig = release.signature("linux-x86_64").expect("V6 FAIL missing signature");
-
-    // 3) the artifact referenced by the manifest exists locally and verifies
-    let fname = url.path_segments().and_then(|s| s.last()).unwrap_or("");
-    let artifact = dir.join("@dsh-sup/shell-linux-x64/artifact").join(fname);
-    let data = std::fs::read(&artifact)
-        .unwrap_or_else(|e| panic!("V6 FAIL read {} failed: {e}", artifact.display()));
+    let dir = PathBuf::from(&dir);
+    if !dir.exists() {
+        panic!("V6 FAIL SHELL_REHEARSAL_DIR does not exist: {}", dir.display());
+    }
     let pubkey = configured_pubkey();
-    if let Err(e) = verify_like_tauri(&data, sig, &pubkey) {
-        panic!("V6 FAIL toolchain signature does not verify: {e}");
+    let mut checked = 0usize;
+
+    // ---- 模式 A：每平台 manifest-entry.json（build job）----
+    for entry_path in walk_find(&dir, &|n| n == "manifest-entry.json") {
+        let raw = std::fs::read_to_string(&entry_path)
+            .unwrap_or_else(|e| panic!("V6 FAIL read {} failed: {e}", entry_path.display()));
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("V6 FAIL parse {} failed: {e}", entry_path.display()));
+        let platform = v["platform"].as_str().unwrap_or("?");
+        let key = v["manifestKey"].as_str().unwrap_or("?");
+        let adir = entry_path.parent().expect("entry has no parent");
+        let entries = v["entries"].as_array().cloned().unwrap_or_default();
+        if entries.is_empty() {
+            panic!("V6 FAIL {platform}: entries is empty");
+        }
+        for it in entries {
+            let name = it["name"].as_str().unwrap_or("");
+            let sig = it["sig"].as_str().unwrap_or("");
+            if name.is_empty() { continue; }
+            if sig.is_empty() {
+                panic!("V6 FAIL {platform}: {name} has no signature (missing TAURI_SIGNING_PRIVATE_KEY?)");
+            }
+            let artifact = adir.join(name);
+            let data = std::fs::read(&artifact)
+                .unwrap_or_else(|e| panic!("V6 FAIL {platform}: read {} failed: {e}", artifact.display()));
+            if let Err(e) = verify_like_tauri(&data, sig, &pubkey) {
+                panic!("V6 FAIL {platform}: signature does not verify for {name}: {e}");
+            }
+            checked += 1;
+            eprintln!("V6 PASS {platform} ({key}) {name} signature verified, {} bytes", data.len());
+        }
     }
 
-    eprintln!(
-        "V6 PASS toolchain manifest accepted by Tauri and signature verified ({} bytes)",
-        data.len()
-    );
+    // ---- 模式 B：聚合清单（publish job）----
+    let agg = dir.join("shell-manifest.json");
+    if agg.exists() {
+        let raw = std::fs::read_to_string(&agg)
+            .unwrap_or_else(|e| panic!("V6 FAIL read {} failed: {e}", agg.display()));
+        let release: tauri_plugin_updater::RemoteRelease =
+            serde_json::from_str(&raw).expect("V6 FAIL Tauri rejected aggregated manifest");
+        eprintln!("V6 PASS aggregated manifest parsed by Tauri RemoteRelease (v{})", release.version);
+        checked += 1;
+    }
+
+    if checked == 0 {
+        panic!("V6 FAIL found neither manifest-entry.json nor shell-manifest.json under {}", dir.display());
+    }
+    eprintln!("V6 PASS toolchain round-trip complete ({checked} check(s))");
 }

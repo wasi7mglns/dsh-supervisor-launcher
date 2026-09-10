@@ -80,6 +80,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          # 关键：缓存键必须区分 runner 镜像。
+          # 默认键只含 OS（Linux 不细分发行版），于是 ubuntu-latest(=24.04) 的 target/ 与
+          # -sys 的 pkg-config 探测结果会被 ubuntu-22.04 复用到 —— 缓存里的构建脚本输出
+          # 指向 24.04 的库路径/特性集，导致 gtk 这类 -sys 生成绑定大量不匹配
+          # （实测表现为「gtk: 425 errors」，与缺依赖的错误形态极难区分）。
+          key: ${{ matrix.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
 
       - name: Install Linux system deps (Tauri v2 + rpm)
         if: runner.os == 'Linux'
@@ -90,14 +96,20 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google*.list /etc/apt/sources.list.d/google*.sources 2>/dev/null || true
           sudo apt-get update -y
           # webkit2gtk-4.1：Tauri v2 的 Linux webview 依赖（Ubuntu 22.04 已提供该 ABI，实测）
+          # 显式列出 GUI 栈的 -dev 包（不依赖传递依赖）：gtk-rs 的 -sys crate 通过 pkg-config 探测，
+          # 缺任一个都会在编译期炸出大量错误；实测在 ubuntu-22.04 上表现为「gtk 425 errors」。
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev \
+            libglib2.0-dev libcairo2-dev libpango1.0-dev libatk1.0-dev libgdk-pixbuf-2.0-dev \
+            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev pkg-config \
             rpm           # rpm 打包需要 rpmbuild
 
       - name: 壳无头冒烟（--node-plan：环境探针 + 官方最新 LTS）
         shell: bash
         run: |
-          cargo build 2>&1 | tail -2
+          # 不要截断到 tail -2：曾因此在 CI 只看到「gtk 425 errors」的汇总行、看不到任何真实错误，
+          # 排障必须反复烧 CI。保留足够上下文但仍然有界。
+          cargo build 2>&1 | tail -60
           ./target/debug/dsh-supervisor-gui --node-plan || true
         working-directory: src-tauri
 
