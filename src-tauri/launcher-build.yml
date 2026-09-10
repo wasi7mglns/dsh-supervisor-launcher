@@ -139,9 +139,9 @@ jobs:
       - name: 产物验收（Tauri 同源验签 + 清单契约）
         shell: bash
         env:
-          SHELL_REHEARSAL_DIR: dist/npm-shell
+          # 必须绝对路径：本步骤 working-directory=src-tauri，相对路径会解析到 src-tauri/ 下
+          SHELL_REHEARSAL_DIR: ${{ github.workspace }}/dist/npm-shell
         run: |
-          # 先断言矩阵声明的 glibc 上限（Linux）已在上一步做过；此处专测更新产物契约。
           cargo test --test updater_artifacts -- --nocapture --test-threads=1
         working-directory: src-tauri
 
