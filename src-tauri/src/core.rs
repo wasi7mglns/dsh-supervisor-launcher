@@ -181,16 +181,6 @@ pub fn registry_origins() -> Vec<String> {
     DEFAULT_ORIGINS.iter().map(|s| s.to_string()).collect()
 }
 
-fn http_json(url: &str, timeout_ms: u64) -> Result<Value, String> {
-    let resp = ureq::get(url)
-        .timeout(std::time::Duration::from_millis(timeout_ms))
-        .call()
-        .map_err(|e| format!("{}", e))?;
-    let mut buf = Vec::new();
-    resp.into_reader().read_to_end(&mut buf).map_err(|e| format!("读取响应失败: {}", e))?;
-    serde_json::from_slice(&buf).map_err(|e| format!("JSON 解析失败: {}", e))
-}
-
 /// 包名 URL 编码：scope 的 / 编码为 %2F（npm registry 两种写法均可，编码更稳）。
 fn encode_pkg(pkg: &str) -> String {
     pkg.chars().map(|c| if c == '/' { "%2F".to_string() } else { c.to_string() }).collect()

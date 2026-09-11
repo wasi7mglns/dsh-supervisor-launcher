@@ -14,7 +14,6 @@ use std::sync::Mutex;
 // Tauri 的 trait 方法（`app.emit` / `app.state` / `get_webview_window`）
 // 需要这些 trait 在作用域内 —— 不是「多余的 import」。
 use tauri::{Emitter, Manager};
-use tauri_plugin_updater::UpdaterExt;
 
 use crate::RunState;
 

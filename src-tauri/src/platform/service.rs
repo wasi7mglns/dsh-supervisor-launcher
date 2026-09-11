@@ -3,7 +3,7 @@
 //! == 本契约修复的分层违规 ==
 //!
 //! 改造前：
-//!   · `service.rs`   —— 服务**定义**（`ensure_defined`，含 4 份 `#[cfg]`）
+//!   · 顶层 `service.rs`（**已删除**）—— 服务**定义**（`ensure_defined`，含 4 份 `#[cfg]`）
 //!   · `main.rs`      —— 服务**启停**（`start_guard_service` / `stop_guard_service`，另 8 份 `#[cfg]`）
 //!
 //! 同一概念的 per-OS 知识分居两层，是「加一个平台要改两处不同层」的根因。

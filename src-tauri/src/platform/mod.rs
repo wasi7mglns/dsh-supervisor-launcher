@@ -11,7 +11,7 @@
 //!
 //! == 关键的分层违规（本层存在的直接动因）==
 //!
-//! 「服务定义」在 `service.rs`（`ensure_defined`），而「服务启停」(`start_guard_service`
+//! 「服务定义」曾在顶层 `service.rs`（`ensure_defined`），而「服务启停」(`start_guard_service`
 //! / `stop_guard_service`) 在 `main.rs` —— **同一个概念的 per-OS 知识分居两层**，
 //! 各自带 4 份 `#[cfg]`。加一个平台要改两处**不同层**，且很容易只改一处。
 //!
@@ -38,7 +38,7 @@ pub const SVC_NORMAL: std::time::Duration = std::time::Duration::from_secs(10);
 /// 家目录（Windows 用 USERPROFILE，Unix 用 HOME）。
 ///
 /// ⚠ 放在平台层而非业务层：它是**平台事实**（环境变量名不同），
-///   不是业务选择。原实现散在 `service.rs` 与 `env.rs` 各一份。
+///   不是业务选择。原实现散在已删除的 `service.rs` 与 `env.rs` 各一份。
 pub fn home_dir() -> std::path::PathBuf {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))

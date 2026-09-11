@@ -4,7 +4,7 @@
 //!
 //! 「环境探测卡死」的根因是「无界阻塞调用 + 被 await」。审计发现**同一模式散布在多处**：
 //!
-//!   · service.rs —— systemctl / loginctl / launchctl / schtasks 全用 .output()（无界）；
+//!   · 当时的 service.rs 与 main.rs —— systemctl / loginctl / launchctl / schtasks 全用 .output()（无界）；
 //!   · main.rs    —— start_guard_service / stop_guard_service / taskkill 同样无界；
 //!   · node.rs    —— pkexec / osascript / powershell 同样无界。
 //!

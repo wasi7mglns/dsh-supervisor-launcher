@@ -80,9 +80,6 @@ pub const SHELL_PRESETS: [&str; 2] = [
     "https://cdn.jsdelivr.net/npm/@dsh-sup/shell-release@latest/shell-manifest.json",
 ];
 
-/// 测速缓存有效期（与内核 selectRegistry 的 30 分钟一致）。
-const CACHE_TTL_SECS: u64 = 30 * 60;
-
 /// 单次探测的总超时（元数据很小，8 秒足够；避免坏源拖慢整体）。
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -357,14 +354,6 @@ pub fn probe_all(sources: &[String], path: &str) -> Vec<Probe> {
     v
 }
 
-/// 缓存是否仍然新鲜。
-pub fn cache_fresh(m: &Mirrors) -> bool {
-    match m.checked_at {
-        Some(t) => now_secs().saturating_sub(t) < CACHE_TTL_SECS,
-        None => false,
-    }
-}
-
 // ════════════════════════════════════════════════════════════════════
 // 镜像「一等公民」：全程可见 + 预热缓存（2026-09-11 架构修复）
 //
@@ -400,7 +389,6 @@ pub struct ProbeSnapshot {
     /// 选中的 Node 源（最快且提供目标版本者；预热阶段仅取最快可达）。
     pub node_best: Option<String>,
     pub node_latency_ms: Option<u128>,
-    pub node_probes: Vec<(String, bool, u128)>,
     pub npm_best: Option<String>,
     pub npm_latency_ms: Option<u128>,
     pub npm_probes: Vec<(String, bool, u128)>,
@@ -433,20 +421,22 @@ pub fn warmup_async() {
             // 两组并行探测（各自内部已并行）
             let node_p = probe_all(&m.node, "index.json");
             let npm_p = probe_all(&m.npm, "");
-            let pick = |v: &[Probe]| -> (Option<String>, Option<u128>, Vec<(String, bool, u128)>) {
+            // 选中的源 + 其延迟。
+            let pick = |v: &[Probe]| -> (Option<String>, Option<u128>) {
                 let best = v.iter().find(|p| p.ok);
-                (
-                    best.map(|p| p.source.clone()),
-                    best.map(|p| p.latency_ms),
-                    v.iter().map(|p| (p.source.clone(), p.ok, p.latency_ms)).collect(),
-                )
+                (best.map(|p| p.source.clone()), best.map(|p| p.latency_ms))
             };
-            let (nb, nl, np) = pick(&node_p);
-            let (mb, ml, mp) = pick(&npm_p);
+            // 逐源明细：只给 npm（`ProbeSnapshot::npm_probes` 消费）；
+            // node 侧的明细此前也返回，但**从未被读取** —— 2026-09-11 清理时去掉。
+            let pick_all = |v: &[Probe]| -> Vec<(String, bool, u128)> {
+                v.iter().map(|p| (p.source.clone(), p.ok, p.latency_ms)).collect()
+            };
+            let (nb, nl) = pick(&node_p);
+            let (mb, ml) = pick(&npm_p);
+            let mp = pick_all(&npm_p);
             let snap = ProbeSnapshot {
                 node_best: nb,
                 node_latency_ms: nl,
-                node_probes: np,
                 npm_best: mb,
                 npm_latency_ms: ml,
                 npm_probes: mp,

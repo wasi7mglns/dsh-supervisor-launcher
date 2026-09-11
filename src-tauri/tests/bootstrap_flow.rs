@@ -284,14 +284,13 @@ fn b11_windows_config_disables_shadow_and_stays_in_sync() {
 fn b12_no_stale_desktop_update_wording() {
     let html = bootstrap_html();
     for bad in ["桌面更新"] {
-        let mut idx = 0;
+        let idx = 0;
         while let Some(p) = html[idx..].find(bad) {
             let abs = idx + p;
             let line_start = html[..abs].rfind(char::is_whitespace).map(|x| x + 1).unwrap_or(0);
             let line_end = html[abs..].find(char::is_whitespace).map(|x| abs + x).unwrap_or(html.len());
             panic!("B12 FAIL 仍含旧措辞「{}」：{}", bad, html[line_start..line_end].trim());
         }
-        idx += bad.len();
     }
     eprintln!("B12 PASS no stale desktop-update wording");
 }
@@ -401,10 +400,18 @@ fn b18_shell_owns_mirror_adaptation() {
     // 并行探测 + 缓存
     assert!(m.contains("pub fn probe_all"), "B18 FAIL 缺并行探测");
     assert!(m.contains("thread::scope"), "B18 FAIL 探测未并行（串行会被慢源拖死）");
-    assert!(m.contains("CACHE_TTL_SECS"), "B18 FAIL 缺测速缓存");
+    // 2026-09-11 校准：原断言查 `CACHE_TTL_SECS`，但该常量与其配套的 `cache_fresh()`
+    // 是**死代码**（无人调用）——已删除。真正生效的缓存机制是：
+    //   · `warmup_async()` 在独立线程预热（`WARMING` 防重复）；
+    //   · `cached()` 纯读快照（无 I/O，可高频轮询）；
+    //   · 快照的 `at` 时间戳下发给前端（新鲜度**可见**，由用户判断）。
+    // 断言应指向**活的**机制，否则门禁会「因为死代码被删而红」。
     // 壳自持配置 + 导出给内核
     assert!(m.contains("mirrors.json"), "B18 FAIL 缺壳自持配置文件");
     assert!(m.contains("export_to_kernel"), "B18 FAIL 未导出偏好给内核（内核会重新盲选）");
+    assert!(m.contains("pub fn warmup_async"), "B18 FAIL 缺后台预热（前端不应阻塞等测速）");
+    assert!(m.contains("pub fn cached"), "B18 FAIL 缺纯读缓存读取口（轮询会变成网络请求）");
+    assert!(!m.contains("CACHE_TTL_SECS"), "B18 FAIL CACHE_TTL_SECS 已确认是死代码，不应回潮");
     assert!(m.contains("manual"), "B18 FAIL 未保护内核 manual 选择不被覆盖");
     eprintln!("B18 PASS shell owns mirror adaptation");
 }
