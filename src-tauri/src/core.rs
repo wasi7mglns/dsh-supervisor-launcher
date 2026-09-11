@@ -55,16 +55,40 @@ fn num_ok(s: &str) -> bool {
     s.chars().all(|c| c.is_ascii_digit())
 }
 
-/// 版本字面量合法性（对齐内核 VERSION_RE 的语义子集）：X.Y.Z[-pre]（忽略 +build）。
+/// 版本字面量合法性：`X.Y.Z[-pre][+build]`。
+///
+/// ## 2026-09-11 对齐 semver（修复与内核的 3 处分歧）
+///
+/// 旧实现 `v.split('+').next()` 在验证前**丢弃 build 段**，于是：
+///   `1.0.0+`、`1.0.0+!!!`、`1.0.0+あ` 被判**合法**，而内核 `VERSION_RE` 判**非法**。
+/// 两侧对同一输入给出不同答案 —— 正是「同一逻辑两处实现」的典型风险。
+///
+/// 按 semver 规范，build 段必须匹配 `[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*`，
+/// 故上述三例**应当非法**（内核正确、本实现偏宽）。现对齐。
+///
+/// 行为规格由 `shell-release/version-vectors.json` 锁定（内核侧有同一份，
+/// 两侧测试套件都按它断言）—— 跨语言无法共享代码，但可共享行为规格。
 pub fn is_valid_version(v: &str) -> bool {
-    let core = v.split('+').next().unwrap_or("");
-    let mut it = core.splitn(2, '-');
-    let nums = it.next().unwrap_or("");
+    let mut it = v.splitn(2, '+');
+    let core = it.next().unwrap_or("");
+    let build = it.next();
+
+    // ── 主段 + 预发布段 ──
+    let mut core_it = core.splitn(2, '-');
+    let nums = core_it.next().unwrap_or("");
     let parts: Vec<&str> = nums.split('.').collect();
     if parts.len() != 3 || !parts.iter().all(|p| num_ok(p)) { return false; }
-    if let Some(pre) = it.next() {
+    if let Some(pre) = core_it.next() {
         if pre.is_empty() { return false; }
         for seg in pre.split('.') {
+            if seg.is_empty() || !seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') { return false; }
+        }
+    }
+
+    // ── build 段（**不再忽略**）：非空，且每段为 [0-9A-Za-z-]+ ──
+    if let Some(b) = build {
+        if b.is_empty() { return false; }
+        for seg in b.split('.') {
             if seg.is_empty() || !seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') { return false; }
         }
     }
@@ -462,4 +486,119 @@ pub fn plan_text() -> String {
         Err(e) => lines.push(format!("latest_error={}", e)),
     }
     lines.join(" | ")
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 版本语义**共享测试向量**（2026-09-11）。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 壳（Rust）与内核（JS）各自实现版本校验/比较 —— **实测 3 处分歧**：
+    /// `1.0.0+` / `1.0.0+!!!` / `1.0.0+あ` 壳判合法、内核判非法
+    /// （旧壳现在验证前 `split('+')` 丢弃 build 段）。
+    ///
+    /// 跨语言无法共享代码，故共享**行为规格**：
+    /// `shell-release/version-vectors.json`（内核仓有逐字节相同的一份）。
+    /// 两侧测试套件都加载它并按自己的实现断言。
+    ///
+    /// 任何一侧改了语义而没同步 → 本测试失败。这是防止再次分叉的唯一可靠手段。
+    ///
+    /// `include_str!` 是**编译期**嵌入：文件缺失或路径错误会直接编译失败，
+    /// 比运行时读取的门禁更强（不会因「文件恰好不在」而静默跳过）。
+    const VECTORS: &str = include_str!("../../shell-release/version-vectors.json");
+
+    /// 从形如 `{"input": "x", "valid": true}` 的对象体里取字符串字段。
+    fn str_field(body: &str, key: &str) -> Option<String> {
+        let pat = format!("\"{}\":", key);
+        let after = body.split(&pat).nth(1)?;
+        let mut it = after.split('"');
+        it.next()?;
+        Some(it.next()?.to_string())
+    }
+
+    /// 取布尔字段（只认 `"key": true`）。
+    fn bool_field(body: &str, key: &str) -> Option<bool> {
+        let pat = format!("\"{}\":", key);
+        let after = body.split(&pat).nth(1)?;
+        let v = after.trim_start();
+        if v.starts_with("true") { Some(true) } else { Some(false) }
+    }
+
+    /// 取整数字段。
+    fn int_field(body: &str, key: &str) -> Option<i32> {
+        let pat = format!("\"{}\":", key);
+        let after = body.split(&pat).nth(1)?;
+        let digits: String = after.trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '-')
+            .collect();
+        digits.parse().ok()
+    }
+
+    /// 把 JSON 文本里的**每个**对象块（`{` … `}`）都取出来。
+    ///
+    /// 实现：栈记录每个 `{` 的起始位置，遇 `}` 弹出即得一个完整对象。
+    /// 随后按**大小**过滤掉根对象（根对象包住整份文件，必然最长）——
+    /// 只留逐条向量的小对象。
+    ///
+    /// 已知足够：向量文件里字符串不含花括号（数据由本仓维护）。
+    fn object_bodies(raw: &str) -> Vec<String> {
+        let mut all = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+        for (i, c) in raw.char_indices() {
+            match c {
+                '{' => stack.push(i),
+                '}' => {
+                    if let Some(s) = stack.pop() {
+                        all.push(raw[s..=i].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        // 根对象 = 唯一「包住整份文件」的那个（长度接近全文）——过滤掉。
+        let limit = raw.len() / 2;
+        all.into_iter().filter(|b| b.len() < limit).collect()
+    }
+
+    #[test]
+    fn shared_version_vectors_hold() {
+        let bodies = object_bodies(VECTORS);
+        assert!(
+            bodies.len() >= 20,
+            "向量块数异常：{}（模板可能被破坏）",
+            bodies.len()
+        );
+
+        let (mut nv, mut nc) = (0, 0);
+        for b in &bodies {
+            if b.contains("\"input\"") {
+                let input = str_field(b, "input").expect("input 缺失");
+                let valid = bool_field(b, "valid").expect("valid 缺失");
+                let got = is_valid_version(&input);
+                assert_eq!(
+                    got, valid,
+                    "版本合法性分歧：{:?} → 本实现 {}，向量期望 {}",
+                    input, got, valid
+                );
+                nv += 1;
+            } else if b.contains("\"expected\"") {
+                let a = str_field(b, "a").expect("a 缺失");
+                let bq = str_field(b, "b").expect("b 缺失");
+                let exp = int_field(b, "expected").expect("expected 缺失");
+                let got = semver_cmp(&a, &bq);
+                assert_eq!(
+                    got, exp,
+                    "版本比较分歧：{:?} vs {:?} → 本实现 {}，向量期望 {}",
+                    a, bq, got, exp
+                );
+                nc += 1;
+            }
+        }
+        assert!(nv >= 15, "合法性向量过少：{}", nv);
+        assert!(nc >= 8, "比较向量过少：{}", nc);
+        eprintln!("版本向量通过：合法性 {} 条 / 比较 {} 条", nv, nc);
+    }
 }

@@ -183,20 +183,49 @@ pub fn save(m: &Mirrors) -> Result<(), String> {
     Ok(())
 }
 
-/// 导出镜像偏好给内核（~/.dsh/supervisor/registry.json）。
+/// 契约版本（内核据此判断格式是否兼容）。
 ///
-/// 目的：壳在无内核时就完成了镜像选择，装完内核后**不应重新盲选** ——
-/// 内核读取该文件即可继承同一份偏好（格式与内核 DistributionManager 一致：
-/// mode / origins / manualOrigin）。
-pub fn export_to_kernel(npm: &[String]) -> Result<(), String> {
-    if npm.is_empty() {
+/// 变更历史：
+///   1 —— 仅 `mode` / `origins` / `manualOrigin`（旧格式）
+///   2 —— 增加 `catalog`（全集）/ `selected`（选择结果）/ `probe`（**探测规格**）
+///
+/// ⚠ 为什么要 `probe`：修复「两侧选源不一致」——
+///   内核用 `/-/ping`、壳用真实包元数据，同一镜像测出的延迟可差 **6.7 倍**
+///   （实测 ustclug 2613ms vs 389ms），导致内核选 huaweicloud、壳选 npmmirror ——
+///   用户看到「面板显示一个源、实际用另一个」。把探测规格随契约投放，
+///   内核照做即可得到**同一答案**。
+pub const CONTRACT_SCHEMA: u64 = 2;
+
+/// 导出镜像契约给内核（`~/.dsh/supervisor/registry.json`）。
+///
+/// ## 为什么由**壳**写（所有权）
+///
+/// 用户在装壳那一刻机器上**没有内核** —— 壳必须先于内核完成镜像选择
+/// （否则连内核都装不上）。故目录与探测方法的所有权在壳，内核**消费产物**。
+///
+/// ## 与旧行为的两处关键差异
+///
+/// 1. **不再只写被选中的 `origins`** —— 改为写全集 `catalog` + `selected` + `probe`。
+///    只写 origins 会导致：内核无法感知「壳测过哪些源」，且没有探测规格 → 方法分叉。
+/// 2. **不再依赖 `latest_lts()` 成功** —— 旧实现只在 `node::latest_lts()` 内调用，
+///    而该函数在「离线」或「全部 Node 镜像不可达」时返回 Err，**契约便完全不写**。
+///    现由 `main.rs` 的 setup 在**壳启动时无条件调用**一次（见 `export_on_boot`）。
+///
+/// 保留：内核已写为 `manual`（用户在面板手动固定）时**不覆盖**用户选择。
+pub fn export_to_kernel(m: &Mirrors) -> Result<(), String> {
+    export_to_kernel_with(m, None)
+}
+
+/// 同 [`export_to_kernel`]，但可携带选中源的实测延迟（`selected.latencyMs`）。
+pub fn export_to_kernel_with(m: &Mirrors, latency_ms: Option<u128>) -> Result<(), String> {
+    if m.npm.is_empty() {
         return Ok(());
     }
     let path = crate::env::supervisor_dir().join("registry.json");
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("创建内核状态目录失败: {}", e))?;
     }
-    // 若内核已写入过（含手动模式），**不覆盖**用户/内核的选择。
+    // 用户在内核面板手动固定过 → 不覆盖（尊重显式意图）。
     if let Ok(s) = std::fs::read_to_string(&path) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
             if v.get("mode").and_then(|x| x.as_str()) == Some("manual") {
@@ -204,16 +233,46 @@ pub fn export_to_kernel(npm: &[String]) -> Result<(), String> {
             }
         }
     }
+    let selected = m.selected_npm.as_ref().map(|origin| {
+        serde_json::json!({
+            "origin": origin,
+            "latencyMs": latency_ms,
+            "checkedAt": m.checked_at,
+        })
+    });
     let v = serde_json::json!({
+        "schema": CONTRACT_SCHEMA,
+        "writtenBy": format!("shell@{}", env!("CARGO_PKG_VERSION")),
+        "writtenAt": now_secs(),
         "mode": "auto",
-        "origins": npm,
-        "manualOrigin": npm.first().cloned().unwrap_or_default(),
+        // 既有字段：保持向后兼容（旧内核只读这三项也能工作）
+        "origins": m.npm,
+        "manualOrigin": m.selected_npm.clone().unwrap_or_else(|| m.npm.first().cloned().unwrap_or_default()),
+        // v2 新增：全集 + 选择结果 + 探测规格
+        "catalog": m.npm,
+        "selected": selected,
+        "probe": {
+            "kind": "package-metadata",
+            "pathTemplate": npm_probe_path(),
+            "timeoutMs": 6000,
+        },
     });
     let body = serde_json::to_string_pretty(&v).unwrap_or_default();
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, body + "\n").map_err(|e| format!("写入内核 registry.json 失败: {}", e))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("提交内核 registry.json 失败: {}", e))?;
     Ok(())
+}
+
+/// **壳启动时无条件导出契约**（修复「`latest_lts()` 失败 ⇒ 契约完全不写」）。
+///
+/// 时机：`main.rs` 的 `setup()` 中、`init_identity` 之后（此时 HOME/状态目录已就绪）。
+/// 失败只记日志，**绝不阻断引导** —— 契约是增强，不是壳启动的前提。
+pub fn export_on_boot() {
+    let m = load();
+    if let Err(e) = export_to_kernel(&m) {
+        crate::update::log(&format!("启动导出镜像契约失败（不影响引导）: {}", e));
+    }
 }
 
 /// 一次并行探测的结果。

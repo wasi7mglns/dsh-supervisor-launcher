@@ -1,0 +1,136 @@
+{
+  "schema": 1,
+  "note": "壳与内核共用的版本语义测试向量。两侧测试套件都加载本文件并按自己的实现断言 —— 跨语言无法共享代码，但可共享行为规格。两份副本必须逐字节相同（由各自门禁校验）。",
+  "versionValidation": [
+    {
+      "input": "1.0.0",
+      "valid": true
+    },
+    {
+      "input": "0.0.0",
+      "valid": true
+    },
+    {
+      "input": "22.12.0",
+      "valid": true
+    },
+    {
+      "input": "1.02.3",
+      "valid": false,
+      "why": "前导零"
+    },
+    {
+      "input": "01.0.0",
+      "valid": false,
+      "why": "前导零"
+    },
+    {
+      "input": "1.0",
+      "valid": false,
+      "why": "段数不足"
+    },
+    {
+      "input": "1.0.0.0",
+      "valid": false,
+      "why": "段数过多"
+    },
+    {
+      "input": "abc",
+      "valid": false,
+      "why": "非数字"
+    },
+    {
+      "input": "1.0.0-rc.1",
+      "valid": true
+    },
+    {
+      "input": "1.0.0-rc..1",
+      "valid": false,
+      "why": "空标识符"
+    },
+    {
+      "input": "1.0.0-",
+      "valid": false,
+      "why": "空 pre"
+    },
+    {
+      "input": "1.0.0+build5",
+      "valid": true
+    },
+    {
+      "input": "1.0.0+",
+      "valid": false,
+      "why": "空 build"
+    },
+    {
+      "input": "1.0.0+!!!",
+      "valid": false,
+      "why": "build 含非法字符"
+    },
+    {
+      "input": "1.0.0+あ",
+      "valid": false,
+      "why": "build 含非 ASCII"
+    },
+    {
+      "input": "1.0.0-rc.1+build.5",
+      "valid": true
+    }
+  ],
+  "compare": [
+    {
+      "a": "1.0.0",
+      "b": "1.0.0",
+      "expected": 0
+    },
+    {
+      "a": "1.0.1",
+      "b": "1.0.0",
+      "expected": 1
+    },
+    {
+      "a": "1.0.0",
+      "b": "10.0.0",
+      "expected": -1
+    },
+    {
+      "a": "1.0.0",
+      "b": "1.0.0-rc.1",
+      "expected": 1,
+      "why": "release > prerelease"
+    },
+    {
+      "a": "1.0.0-rc.1",
+      "b": "1.0.0",
+      "expected": -1
+    },
+    {
+      "a": "1.0.0-rc.2",
+      "b": "1.0.0-rc.10",
+      "expected": -1,
+      "why": "数字段按数值比较"
+    },
+    {
+      "a": "1.0.0-rc.1",
+      "b": "1.0.0-beta.1",
+      "expected": 1,
+      "why": "数字段 > 字符串段"
+    },
+    {
+      "a": "1.0.0+aaa",
+      "b": "1.0.0+bbb",
+      "expected": 0,
+      "why": "build 不参与比较"
+    },
+    {
+      "a": "0.1.5-BETA.1",
+      "b": "0.1.4",
+      "expected": 1
+    },
+    {
+      "a": "0.1.5-BETA.1",
+      "b": "0.1.5",
+      "expected": -1
+    }
+  ]
+}

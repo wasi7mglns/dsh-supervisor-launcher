@@ -173,9 +173,10 @@ pub fn latest_lts() -> Result<LtsChoice, String> {
             if let Err(e) = crate::mirror::save(&m) {
                 crate::update::log(&format!("镜像配置写入失败（不影响本次安装）: {}", e));
             }
-            // 同步导出给内核（若内核已存在则继承同一偏好；不存在时也无害，
+            // 同步导出契约给内核（若内核已存在则继承同一偏好；不存在时也无害，
             // 内核首次安装后会读到这份文件）。
-            if let Err(e) = crate::mirror::export_to_kernel(&m.npm) {
+            // 携带本次实测延迟：契约的 selected.latencyMs 供内核直接采用，免重复测速。
+            if let Err(e) = crate::mirror::export_to_kernel_with(&m, Some(latency_ms)) {
                 crate::update::log(&format!("导出内核镜像偏好失败（不影响本次安装）: {}", e));
             }
             Ok(LtsChoice { version, file, source, latency_ms, probes: diag })
@@ -374,7 +375,12 @@ pub fn probe_after() -> Option<(PathBuf, String)> {
     crate::env::known_install_node_path().and_then(|p| crate::env::node_version(&p).map(|v| (p, v)))
 }
 
-/// 写运行时纪要（版本/路径/时间）供面板透明展示。
+/// 写运行时纪要（版本/路径/时间/**最低门槛**）供面板透明展示，并**供内核做环境判定**。
+///
+/// ⚠ 原子写（tmp + rename，2026-09-11 架构修复）：
+///   内核会读这个文件做「环境是否就绪」判定，非原子写可能让它读到**半截 JSON**，
+///   从而误判为「Node 未安装」。同一目录下其它契约文件（identity.json / registry.json）
+///   都已是原子写，此处补齐保持一致。
 pub fn record_runtime_meta(node_path: &str, version: &str) {
     let dir = crate::env::supervisor_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -383,8 +389,20 @@ pub fn record_runtime_meta(node_path: &str, version: &str) {
         "nodePath": node_path,
         "installedAt": now_iso(),
         "source": "official-lts",
+        // 最低门槛由**壳**投放（内核读它做判定）—— 修复「面板谎报环境就绪」：
+        //   内核原只判 `which node` 成功即 ok，而壳会因门槛不足**拒绝启动内核**，
+        //   用户看到的是「面板说没问题，但就是起不来」。门槛的所有权在壳。
+        "minNode": MIN_NODE,
     });
-    let _ = std::fs::write(dir.join("runtime.json"), serde_json::to_string_pretty(&meta).unwrap_or_default());
+    let path = dir.join("runtime.json");
+    let body = serde_json::to_string_pretty(&meta).unwrap_or_default();
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, body + "\n").is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    } else {
+        // 落盘失败不影响安装结果（纪要仅用于展示与判定），但保留旧文件不破坏内部一致性
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// 当前 UTC 时间，ISO 8601（`YYYY-MM-DDTHH:MM:SSZ`）。

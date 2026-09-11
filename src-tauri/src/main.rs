@@ -1074,9 +1074,13 @@ fn mirror_set(kind: String, urls: Vec<String>) -> Result<serde_json::Value, Stri
         _ => return Err(format!("未知镜像类型: {}（支持 node / npm / shell）", kind)),
     }
     m.checked_at = None; // 使缓存失效，下次重新测速
+    if kind == "npm" {
+        m.selected_npm = None; // 用户改了候选集 → 旧的选择结果失效
+    }
     crate::mirror::save(&m)?;
     if kind == "npm" {
-        let _ = crate::mirror::export_to_kernel(&list);
+        // 导出**完整契约**（schema/catalog/selected/probe），而非仅 origins。
+        let _ = crate::mirror::export_to_kernel(&m);
     }
     update::log(&format!("镜像配置已更新 {}: {}", kind, list.join(", ")));
     Ok(serde_json::json!({ "ok": true, "kind": kind, "urls": list }))
@@ -1361,6 +1365,14 @@ fn main() {
             bt!("init_identity...");
             let _ = update::init_identity(&app.package_info().version.to_string());
             bt!("init_identity done");
+
+            // 镜像契约**无条件导出**（2026-09-11 架构修复）：
+            //   旧实现只在 node::latest_lts() 内导出，而该函数在「离线」或
+            //   「全部 Node 镜像不可达」时返回 Err → **契约完全不写**，
+            //   内核便只能用它自己的硬编码副本（与壳的目录可能已分叉）。
+            //   故在壳启动时无条件导出一份，保证内核永远有契约可读。
+            //   ⚠ 不阻断引导：失败只记 shell.log。
+            crate::mirror::export_on_boot();
 
             // 环境判定（2026-09 改）：Node 缺失或低于最低标准(>=22.12, DSH commander 硬门槛) → 引导页安装；
             // 达标（即使不是最新 LTS）→ 直接拉起守卫进入面板，不卡升级。初始 url 即 bootstrap.html。
