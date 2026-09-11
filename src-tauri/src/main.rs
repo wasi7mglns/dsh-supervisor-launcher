@@ -20,11 +20,12 @@ mod node;
 // ★ 平台适配层（2026-09-11）：**全仓唯一的平台分支所在地**。
 // 它接管了原先分居两处的「服务定义」（service.rs）与「服务启停」（原本文件），
 // 消除「同一概念分居两层」的分层违规 —— 加平台不再需要改两处不同层。
+/// 业务层（平台无关）：从 main.rs 拆出的可独立测试的模块。
+mod domain;
 mod platform;
 // 桌面壳自更新 + 落盘日志 + 身份上报（2026-09-11）
 mod update;
 
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
@@ -173,7 +174,7 @@ async fn node_latest() -> serde_json::Value {
 /// 由引导页 JS 在展示完整启动过程后触发，避免步骤一闪而过无感知。
 #[tauri::command]
 fn finish_boot(app: tauri::AppHandle) -> Result<(), String> {
-    go_panel(&app, false); // 引导完成：URL 变化即导航
+    domain::windowing::go_panel(&app, false); // 引导完成：URL 变化即导航
     Ok(())
 }
 
@@ -265,78 +266,6 @@ fn run_install(app: &tauri::AppHandle) -> Result<(String, String), String> {
 
 /// 内核可执行名候选（跨平台）：Windows 上 npm 可能生成 .cmd 垫片；Unix 无扩展名。
 
-fn core_exe_names() -> &'static [&'static str] {
-    if cfg!(windows) { &["dsh-supervisor.exe", "dsh-supervisor.cmd", "dsh-supervisor"] }
-    else { &["dsh-supervisor"] }
-}
-
-/// 收集全部内核候选（去重 + 解析符号链接），供「按版本最高仲裁」使用。
-/// 跨平台路径规范：
-///   - PATH（env::find_in_path，Windows 走 PATHEXT）
-///   - Windows: %APPDATA%\npm（npm 全局 bin 目录）+ 包内真实脚本
-///   - macOS:   /opt/homebrew/bin（Apple Silicon）、/usr/local/bin（Intel）
-///   - Unix:    ~/.npm-global/bin、~/.local/bin（内核 install 写入的软链）
-///   - 资源目录内嵌兜底（旧版过渡）
-///
-/// `resource_dir` 为 None 时跳过「资源目录内嵌兜底」——CLI 自检（无 AppHandle）走这条。
-fn locate_core_candidates(resource_dir: Option<PathBuf>) -> Vec<PathBuf> {
-    let home = env::home();
-    let mut out: Vec<PathBuf> = Vec::new();
-    // ⚠ 与 env.rs 的 PATH 探测同一类防护（2026-09-11 架构修复）：
-    //   is_file() / canonicalize() 底层会触网 —— 在断开的映射盘或 UNC 路径上
-    //   可能阻塞数十秒，而本函数在**内核定位的关键路径**上（引导页每一步都要用）。
-    //   故先做「本地固定盘」判定（GetDriveTypeW 自身不触网），再访问文件系统。
-    let add = |p: PathBuf, out: &mut Vec<PathBuf>| {
-        if let Some(dir) = p.parent() {
-            if !env::is_local_fixed_dir(dir) { return; }
-        }
-        if !p.is_file() { return; }
-        let real = std::fs::canonicalize(&p).unwrap_or(p); // 解析 ~/.local/bin 软链到包内真实路径
-        if !out.contains(&real) { out.push(real); }
-    };
-    for name in core_exe_names().iter().copied() {
-        if let Some(p) = env::find_in_path(name) { add(p, &mut out); }
-    }
-    // 平台额外候选（Windows 的 %APPDATA%\npm 与包内真实脚本；macOS 的 Homebrew 落点）
-    // —— 已下沉到 platform 层（2026-09-11），本文件不再出现平台分支。
-    {
-        let names: Vec<&str> = core_exe_names().iter().copied().collect();
-        let pkg = core::package_name().ok();
-        for p in crate::platform::current().core_extra_candidates(&names, pkg.as_deref()) {
-            add(p, &mut out);
-        }
-    }
-    for name in core_exe_names().iter().copied() {
-        add(home.join(".npm-global").join("bin").join(name), &mut out);
-        add(home.join(".local").join("bin").join(name), &mut out);
-    }
-    if let Some(res) = resource_dir {
-        for name in core_exe_names().iter().copied() { add(res.join("bin").join(name), &mut out); }
-    }
-    out
-}
-
-/// 定位已安装内核：多候选**按版本最高**仲裁（K5 修复）——旧内核不得遮蔽新内核。
-fn locate_core(app: &tauri::AppHandle) -> Option<PathBuf> {
-    locate_core_with_version(app).map(|(p, _)| p)
-}
-
-/// 定位内核并**一并返回其版本**（避免调用方再执行一次二进制取版本）。
-///
-/// 仲裁规则（K5）：多候选中**按版本最高**选取 —— 旧内核不得遮蔽新内核。
-/// 每个候选的版本探测都经有界执行器（10 秒上限），单个坏候选不会拖死定位。
-fn locate_core_with_version(app: &tauri::AppHandle) -> Option<(PathBuf, String)> {
-    let cands = locate_core_candidates(app.path().resource_dir().ok());
-    if cands.is_empty() { return None; }
-    let mut best: Option<(PathBuf, String)> = None;
-    for c in &cands {
-        let v = core::installed_version(c).unwrap_or_else(|| "0.0.0".into());
-        let better = best.as_ref().map(|(_, bv)| core::semver_cmp(&v, bv) > 0).unwrap_or(true);
-        if better { best = Some((c.clone(), v)); }
-    }
-    best.or_else(|| cands.into_iter().next().map(|p| (p, "0.0.0".into())))
-}
-
 /// 引导页查询用：内核是否已安装 + 当前版本 + 真实包名提示（不再硬编码平台字符串）。
 ///
 /// 内核状态查询。
@@ -357,7 +286,7 @@ async fn core_status(app: tauri::AppHandle) -> serde_json::Value {
     let pkg = core::package_name().unwrap_or_else(|_| "@dsh-sup/dsh-core-<platform>".into());
     let located = tauri::async_runtime::spawn_blocking(move || {
         let a = app.clone();
-        locate_core_with_version(&a)
+        domain::coreloc::locate_core_with_version(&a)
     })
     .await
     .ok()
@@ -379,7 +308,7 @@ async fn core_status(app: tauri::AppHandle) -> serde_json::Value {
 /// 网络调用放线程池，不阻塞 UI 线程。
 #[tauri::command]
 async fn core_plan(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    let installed = locate_core(&app).and_then(|b| core::installed_version(&b));
+    let installed = domain::coreloc::locate_core(&app).and_then(|b| core::installed_version(&b));
     let pkg = core::package_name()?;
     let latest = tauri::async_runtime::spawn_blocking(move || core::latest_version(&pkg))
         .await.map_err(|e| e.to_string())?;
@@ -393,7 +322,7 @@ async fn core_plan(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn core_apply(app: tauri::AppHandle, version: Option<String>) -> Result<serde_json::Value, String> {
     let pkg = core::package_name()?;
-    let prefix = locate_core(&app).and_then(|b| core::global_prefix_for(&b));
+    let prefix = domain::coreloc::locate_core(&app).and_then(|b| core::global_prefix_for(&b));
     let origins = core::registry_origins();
     let target = match version {
         Some(v) if core::is_valid_version(&v) => v,
@@ -446,7 +375,7 @@ async fn guard_start(app: tauri::AppHandle) -> Result<serde_json::Value, String>
     // 但**命令会返回**，前端因此能拿到结论并给出重试/诊断入口。
     const GUARD_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
     let a = app.clone();
-    let task = tauri::async_runtime::spawn_blocking(move || ensure_guard(&a));
+    let task = tauri::async_runtime::spawn_blocking(move || domain::guardctl::ensure_guard(&a));
     let r = match tokio::time::timeout(GUARD_TOTAL_BUDGET, task).await {
         Ok(Ok(inner)) => inner,
         Ok(Err(e)) => Err(format!("守卫启动任务异常: {}", e)),
@@ -471,8 +400,8 @@ async fn guard_start(app: tauri::AppHandle) -> Result<serde_json::Value, String>
 async fn guard_ready() -> serde_json::Value {
     tauri::async_runtime::spawn_blocking(|| {
         let port = env::api_port();
-        if !is_alive(port) { return serde_json::json!({"ready": false, "reason": "tcp", "port": port}); }
-        match http_get_local(port, "/healthz", std::time::Duration::from_secs(3)) {
+        if !domain::guardctl::is_alive(port) { return serde_json::json!({"ready": false, "reason": "tcp", "port": port}); }
+        match domain::localhttp::http_get_local(port, "/healthz", std::time::Duration::from_secs(3)) {
             Some((code, _)) if (200..300).contains(&code) => serde_json::json!({"ready": true, "port": port}),
             Some((code, _)) => serde_json::json!({"ready": false, "reason": "http", "status": code, "port": port}),
             None => serde_json::json!({"ready": false, "reason": "http", "port": port}),
@@ -526,101 +455,6 @@ fn win_ctl(app: tauri::AppHandle, action: String) -> Result<(), String> {
 
 /// 退出管家（契约 §4.1 冻结时序）：请求内核停全部被管对象（同步等待回执）→ 由所有者停止守卫。
 /// 内核在回执前**不会**停止自己（阶段 1 已移除内核自停）。
-fn shutdown_all(port: u16) {
-    // 契约 §4.1 退出握手（阶段 3 增强）：
-    //   1) 带超时请求内核停全部被管对象，并等待回执（防止守卫挂起时壳无限阻塞）；
-    //   2) 轮询 sessionState 直到 stopped（确认内核确实停好；守卫已不可达同样视为完成）；
-    //   3) 由所有者停止守卫进程——守卫自身从不停止自己（阶段 1 所有权归一）。
-    let _ = post_local_timeout(port, "/session/stop", std::time::Duration::from_secs(60));
-    for _ in 0..40 {
-        match get_session_state(port) {
-            Some(s) if s == "stopped" => break, // 内核已确认停链完成
-            None => break,                      // 守卫已不可达 = 已退出
-            _ => std::thread::sleep(std::time::Duration::from_millis(250)),
-        }
-    }
-    if let Err(e) = platform::service().stop() {
-        eprintln!("[shell] 停止守卫失败: {}（可手动 systemctl --user stop dsh-supervisor）", e);
-    }
-}
-
-/// 拉起守卫（定位已安装内核 + 请求所有者启动），等面板就绪。
-/// 端口从用户 config.apiPort 解析（非硬编码 3100）。
-fn ensure_guard(app: &tauri::AppHandle) -> Result<(), String> {
-    let port = env::api_port();
-    // 进度上报（2026-09-11 架构修复）：本函数最长可耗时约 2 分钟（服务管理器启动最多 30s，
-    // 兜底 spawn 后再等 60s），而这段时间前端只有一句静态的「正在启动守卫…」——
-    // **静默等待与卡死无法区分**，用户会误判为卡住并强杀。故每个阶段都上报。
-    let step = |s: &str| {
-        let _ = app.emit("guard_progress", serde_json::json!({ "status": s }));
-        update::log(s);
-    };
-    if is_alive(port) { step("守卫已在运行"); return Ok(()); }
-
-    let guard = locate_core(app).ok_or_else(|| match core::package_name() {
-        Ok(p) => format!("未检测到内核。请先安装：npm i -g {}", p),
-        Err(e) => format!("未检测到内核：{}", e),
-    })?;
-
-    // ① 建立服务定义（**首次安装的关键一步**）。
-    //    旧实现直接跳到 start，而首启时服务定义根本不存在 -> 必然失败 -> 卡在「守卫就绪」。
-    //    这一步是幂等的：已存在则直接返回。
-    step("正在建立守卫服务定义…");
-    match platform::service().ensure_defined(&guard) {
-        Ok(desc) => update::log(&format!("守卫服务定义: {}", desc)),
-        Err(e) => update::log(&format!("守卫服务定义失败（稍后走 spawn 兜底）: {}", e)),
-    }
-
-    // ② 请求服务管理器启动（正常路径：由 systemd/launchd/schtasks 托管，具备开机自启与崩溃自拉）
-    step("正在请求服务管理器启动守卫…");
-    let started = platform::service().start();
-    if let Err(e) = &started {
-        update::log(&format!("服务管理器启动失败: {}", e));
-    }
-    step("等待守卫就绪（服务管理器路径）…");
-    if wait_alive(port, 60) { return Ok(()); }
-
-    // ③ 兜底：直接拉起守护进程。
-    //    服务管理器不可用的场景真实存在（容器/无 user session/策略拦截），
-    //    此时若不给兜底，用户将被永久挡在门外。
-    step("服务管理器未能在 30s 内拉起守卫 · 改用直接启动兜底…");
-    match platform::service().spawn_daemon(&guard) {
-        Ok(pid) => update::log(&format!("兜底 spawn 守卫 pid={}", pid)),
-        Err(e) => {
-            return Err(format!(
-                "守卫启动失败：服务管理器错误({}) 且直接拉起也失败({})",
-                started.err().unwrap_or_else(|| "无".into()),
-                e
-            ));
-        }
-    }
-    if wait_alive(port, 120) { return Ok(()); }
-
-    Err(format!(
-        "守卫启动超时（服务管理器与直接拉起均未就绪）。服务管理器错误：{}",
-        started.err().unwrap_or_else(|| "无".into())
-    ))
-}
-
-/// 轮询等待端口存活（每 tick 500ms）。
-fn wait_alive(port: u16, ticks: u32) -> bool {
-    for _ in 0..ticks {
-        if is_alive(port) { return true; }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    false
-}
-
-fn is_alive(port: u16) -> bool {
-    let addr = format!("127.0.0.1:{}", port);
-    if let Ok(mut it) = addr.to_socket_addrs() {
-        if let Some(sa) = it.next() {
-            return TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(400)).is_ok();
-        }
-    }
-    false
-}
-
 /// 无头自检：**环境探测**（架构修复后的可诊断入口）。
 ///
 /// 为什么需要：探测根因是「环境特有」的（某个候选上有阻塞型系统调用），
@@ -633,94 +467,6 @@ fn is_alive(port: u16) -> bool {
 /// 功能本身是好的，但可见性缺失会被合理地理解为能力不存在。
 /// 本入口把「测了哪些源、各自延迟、最终选了谁」变成**可核对的事实**。
 /// 用法：dsh-supervisor-gui --mirror-plan
-fn cli_mirror_plan() -> i32 {
-    println!("== 镜像测速自检 ==");
-    let m = mirror::load();
-    println!("Node 候选 {} 个 / npm 候选 {} 个", m.node.len(), m.npm.len());
-    println!("");
-    println!("--- 并行测速（Node index.json）---");
-    let np = mirror::probe_all(&m.node, "index.json");
-    for p in &np {
-        println!(
-            "  {:<48} {} {:>6} ms",
-            p.source,
-            if p.ok { "可达" } else { "不可达" },
-            p.latency_ms
-        );
-    }
-    println!("");
-    println!("--- 并行测速（npm registry）---");
-    let pp = mirror::probe_all(&m.npm, "");
-    for p in &pp {
-        println!(
-            "  {:<48} {} {:>6} ms",
-            p.source,
-            if p.ok { "可达" } else { "不可达" },
-            p.latency_ms
-        );
-    }
-    println!("");
-    match np.iter().find(|p| p.ok) {
-        Some(b) => println!("Node 选中: {} ({} ms)", b.source, b.latency_ms),
-        None => println!("Node 选中: 无（全部不可达）"),
-    }
-    match pp.iter().find(|p| p.ok) {
-        Some(b) => println!("npm  选中: {} ({} ms)", b.source, b.latency_ms),
-        None => println!("npm  选中: 无（全部不可达）"),
-    }
-    0
-}
-
-fn cli_env_plan() -> i32 {
-    println!("== 环境探测自检 ==");
-    println!("平台          = {}", std::env::consts::OS);
-    // 注意顺序：候选摘要由**探测线程**写入缓存，必须在 status() 之后再读，
-    // 否则首次调用会读到空串（诊断输出出现空白，易被误读为「没有候选」）。
-    let out = nodeprobe::status(std::time::Duration::from_secs(60));
-    println!("{}", nodeprobe::candidate_summary());
-    println!("完成          = {}", out.finished);
-    println!("耗时          = {} ms", out.elapsed_ms);
-    if let Some(e) = &out.error {
-        println!("失败原因      = {}", e);
-    }
-    match (&out.path, &out.version) {
-        (Some(p), Some(v)) => println!("node          = {} @ {}", v, p.display()),
-        _ => println!("node          = （未找到）"),
-    }
-    if let Some((on, ms)) = nodeprobe::current_stuck() {
-        println!("⚠ 仍在探测    = {} （已 {} ms）", on, ms);
-    }
-    println!("逐候选追踪:");
-    print!("{}", nodeprobe::render_trace(&out.trace));
-    0
-}
-
-fn cli_plan() -> i32 {
-    let out = nodeprobe::status(std::time::Duration::from_secs(30));
-    let sys = match (&out.path, &out.version) {
-        (Some(p), Some(v)) => Some((p.clone(), v.clone())),
-        _ => None,
-    };
-    match &sys {
-        Some((p, v)) => println!("node=present {} @ {}", v, p.display()),
-        None => println!("node=missing（finished={}）", out.finished),
-    }
-    println!("node_probe_candidates={}", nodeprobe::candidate_summary());
-    print!("{}", nodeprobe::render_trace(&out.trace));
-    match node::latest_lts() {
-        Ok(c) => {
-            println!("latest_lts={} file={}", c.version, c.file);
-            println!("mirror_selected={}", c.source);
-            for (s, ok, ms) in &c.probes {
-                println!("mirror_probe={} ok={} latency_ms={}", s, ok, ms);
-            }
-            println!("node_outdated={}", node::outdated(sys.as_ref().map(|x| x.1.as_str()), &c.version));
-            0
-        }
-        Err(e) => { eprintln!("latest_lts_error={}", e); 1 }
-    }
-}
-
 /// 打开面板（分体架构 2026-09-07 定稿）：
 /// 壳 = 自绘窗口容器(shell.html 唯一窗口栏 + 内容 iframe)；面板由守卫内核 HTTP 托管（同源）。
 /// 切面板 = emit 守卫实际 API 基址(读 config.apiPort, 动态端口不硬编码) → 壳 iframe 导航该 URL，
@@ -738,117 +484,6 @@ fn shell_panel_url() -> serde_json::Value {
     update::log(&format!("壳框架就绪（主帧导航完成），面板 URL: {}", url));
     serde_json::json!({ "url": url })
 }
-
-fn go_panel(app: &tauri::AppHandle, force: bool) {
-    let url = env::api_base_url(); // http://127.0.0.1:<config.apiPort 或高位段 fallback>/
-    // 壳框架(shell.html)的 evt listener 在首帧注册；setup 线程的 emit 可能早于注册被丢弃，
-    // 故延时重发数次覆盖竞态（listener 就绪后任一次生效即切面板）。
-    // force=true（如用户重新显示窗口）→ 即使 URL 相同也强制重载，保证拿到最新 UI。
-    for (i, delay_ms) in [400u64, 1200, 2500].iter().enumerate() {
-        let h = app.clone();
-        let u = url.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-            let _ = h.emit("shell:goto-panel", serde_json::json!({ "url": u, "seq": i, "force": force }));
-        });
-    }
-}
-
-fn show_main(app: &tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.show();
-        let _ = win.unminimize();
-        let _ = win.set_focus();
-        // 每次显示都强制重新导航到面板：WebView 不做陈旧缓存，保证拿最新 UI（force=true）
-        go_panel(app, true);
-    }
-}
-
-fn post_local(port: u16, path: &str) {
-    let _ = post_local_timeout(port, path, std::time::Duration::from_secs(60));
-}
-
-/// 把本地 API 调用派发到独立线程（**绝不阻塞 UI 线程**）。
-///
-/// 用于托盘菜单等由 UI 线程派发的回调：这些回调里的网络 I/O 一旦阻塞，
-/// 整个界面（含重绘）都会被冻结 —— 实测观感是「点击无反应」。
-///
-/// 退出流程同样经此派发：即使守卫无响应，菜单也立即响应，
-/// 用户不会觉得「程序关不掉」。
-fn spawn_local_post(port: u16, path: &'static str) {
-    std::thread::spawn(move || post_local(port, path));
-}
-
-/// 同 post_local，但带读写超时（防止守卫挂起时壳无限阻塞）。返回响应体（解码 utf8 尽力）。
-/// 与本地守卫建立连接，**带连接超时**。
-///
-/// ⚠ 必须用 `connect_timeout` 而非 `connect`（2026-09-11 审计）：`TcpStream::connect`
-///   **没有超时** —— 若端口被防火墙 DROP（而非 REJECT），连接会一直等到操作系统的
-///   SYN 重试耗尽，Windows 上默认可达 20+ 秒。而本函数被 `guard_ready`（引导页每次
-///   500ms 轮询一次、最多 40 次）与托盘动作调用，等同于反复长时间阻塞。
-///   回环地址正常时是微秒级，但**不能依赖「正常时很快」来省略上限**。
-fn connect_local(port: u16, timeout: std::time::Duration) -> Option<TcpStream> {
-    use std::net::ToSocketAddrs;
-    let addr = format!("127.0.0.1:{}", port);
-    let sa = addr.to_socket_addrs().ok()?.next()?;
-    TcpStream::connect_timeout(&sa, timeout).ok()
-}
-
-/// 本地 HTTP 请求的连接预算（回环地址，正常为微秒级；此处仅作兜底上限）。
-const LOCAL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(800);
-
-fn post_local_timeout(port: u16, path: &str, timeout: std::time::Duration) -> Option<String> {
-    let mut stream = connect_local(port, LOCAL_CONNECT_TIMEOUT)?;
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-    let req = format!(
-        "POST {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        path, port
-    );
-    std::io::Write::write_all(&mut stream, req.as_bytes()).ok()?;
-    let mut buf = Vec::new();
-    let _ = std::io::Read::read_to_end(&mut stream, &mut buf);
-    Some(String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// 本地 HTTP GET（返回 (状态码, 全文)）——守卫就绪探针用。
-fn http_get_local(port: u16, path: &str, timeout: std::time::Duration) -> Option<(u16, String)> {
-    let mut stream = connect_local(port, LOCAL_CONNECT_TIMEOUT)?;
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-    let req = format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", path, port);
-    std::io::Write::write_all(&mut stream, req.as_bytes()).ok()?;
-    let mut buf = Vec::new();
-    let _ = std::io::Read::read_to_end(&mut stream, &mut buf);
-    let s = String::from_utf8_lossy(&buf).into_owned();
-    let code = s.split_whitespace().nth(1).and_then(|c| c.parse::<u16>().ok()).unwrap_or(0);
-    Some((code, s))
-}
-
-/// 读取会话态（GET /session/status 的最小解析：找 "sessionState":"xxx"）。
-fn get_session_state(port: u16) -> Option<String> {
-    let mut stream = connect_local(port, LOCAL_CONNECT_TIMEOUT)?;
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(3)));
-    let req = format!("GET /session/status HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", port);
-    std::io::Write::write_all(&mut stream, req.as_bytes()).ok()?;
-    let mut buf = Vec::new();
-    let _ = std::io::Read::read_to_end(&mut stream, &mut buf);
-    let s = String::from_utf8_lossy(&buf);
-    let key = "\"sessionState\":\"";
-    let i = s.find(key)? + key.len();
-    let rest = &s[i..];
-    let v: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-    if v.is_empty() { None } else { Some(v) }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 桌面壳自更新命令（2026-09-11）
-//
-// 三平台**同一代码路径**：检查 → 下载 → minisign 验签 → 平台安装 → 重启。
-// 平台差异（Linux pkexec dpkg -i / macOS .app 替换 / Windows NSIS passive）
-// 全部由 tauri-plugin-updater 内部处理，壳侧无平台分支。
-// ═══════════════════════════════════════════════════════════════════
 
 /// 无头输出：壳自更新基线（供 CI 冒烟与人工诊断）。
 /// 副作用：写 identity.json + shell.log（验证落盘链路）。
@@ -1158,8 +793,7 @@ fn shell_restart(app: tauri::AppHandle) {
 ///   dsh-supervisor-gui --service-plan              # 只报告，不写盘
 ///   dsh-supervisor-gui --service-plan --service-apply   # 实际建立服务定义
 fn cli_service_plan() -> i32 {
-    use std::path::PathBuf;
-    println!("== 守卫服务定义自检 ==");
+        println!("== 守卫服务定义自检 ==");
     println!("平台          = {}", std::env::consts::OS);
     println!("服务定义路径  = {}", platform::service().definition_path().display());
     println!("现存          = {}", if platform::service().definition_path().is_file() { "是" } else { "否" });
@@ -1225,11 +859,11 @@ fn main() {
     bt!("main enter");
     // 无头自检：镜像测速与选择（用户要求「镜像必须可见」的验证入口）。
     if std::env::args().any(|a| a == "--mirror-plan") {
-        std::process::exit(cli_mirror_plan());
+        std::process::exit(domain::cli::cli_mirror_plan());
     }
     // 无头自检：环境探测（架构修复后的可诊断入口）。
     if std::env::args().any(|a| a == "--env-plan") {
-        std::process::exit(cli_env_plan());
+        std::process::exit(domain::cli::cli_env_plan());
     }
     // 无头自检：守卫服务定义（P0 修复的功能验证入口，任何平台可用）。
     if std::env::args().any(|a| a == "--service-plan") {
@@ -1237,7 +871,7 @@ fn main() {
     }
     // 无头冒烟入口：--node-plan 仅打印环境探针 + 官方最新 LTS，不启动窗口。
     if std::env::args().any(|a| a == "--node-plan") {
-        std::process::exit(cli_plan());
+        std::process::exit(domain::cli::cli_plan());
     }
     // 无头自检：**平台矩阵**（2026-09-11，门禁 A4/G4）。
     //
@@ -1265,7 +899,7 @@ fn main() {
         // 单实例管控（2026-09）：同一 user 会话内只允许一个壳实例——重复启动第二实例时
         // 插件自动让新进程退出，回调里唤起既有主窗口（show+focus+导航面板），避免双壳/多壳并存。
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_main(app);
+            domain::windowing::show_main(app);
         }))
         // 壳自更新插件：强制 minisign 验签；平台安装语义内部处理。
         // 未配置 pubkey 时插件仍可注册（check 会失败并返回错误，由引导页按「失败放行」处理）。
@@ -1348,23 +982,23 @@ fn main() {
                 .menu(&menu)
                 // 左键=显示窗口 / 右键=弹出菜单（Windows·Linux 惯例）。
                 // ⚠ 原为 true（左键也弹菜单），叠加下方 on_tray_icon_event 不区分按键，
-                //   导致右键时既弹菜单又调用 show_main() 抢焦点 → 菜单被顶掉，
+                //   导致右键时既弹菜单又调用 domain::windowing::show_main() 抢焦点 → 菜单被顶掉，
                 //   用户感知为「右键不好用」（2026-09-11 Windows 真机实测）。
                 // 注：上游文档明确 Linux 不支持该开关（菜单由桌面环境决定）——
                 //     故 Linux 上左键可能仍显示菜单，属平台限制，非本仓可控。
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| {
                     match event.id.as_ref() {
-                        "show" => show_main(app),
+                        "show" => domain::windowing::show_main(app),
                         // ⚠ 网络 I/O **必须离开 UI 线程**（2026-09-11 架构修复）。
                         //   托盘菜单事件由 UI 线程派发，而 post_local 最多阻塞 60 秒
                         //   （TCP 连接 + 读写超时）。守卫挂起或端口无响应时，
                         //   点击「启动/停止/重启」会**把整个界面冻结 60 秒** ——
                         //   用户看到的是「点了没反应」，且期间窗口无法重绘。
                         //   改为派发到独立线程：菜单立即响应，结果异步生效。
-                        "start" => spawn_local_post(port, "/lifecycle/dsh/start"),
-                        "stop" => spawn_local_post(port, "/lifecycle/dsh/stop"),
-                        "restart" => spawn_local_post(port, "/lifecycle/dsh/restart"),
+                        "start" => domain::localhttp::spawn_local_post(port, "/lifecycle/dsh/start"),
+                        "stop" => domain::localhttp::spawn_local_post(port, "/lifecycle/dsh/stop"),
+                        "restart" => domain::localhttp::spawn_local_post(port, "/lifecycle/dsh/restart"),
                         // 退出管家 = 完全退出：通知守卫停止全部服务链，随后壳退出
                         "quit" => {
                             // 契约 §4.1：请求内核停被管对象（等回执）→ 由所有者停止守卫 → 壳退出。
@@ -1373,7 +1007,7 @@ fn main() {
                             //   误以为「程序关不掉」而强杀 —— 那会跳过退出握手，留下未停的 DSH。
                             let h = app.clone();
                             std::thread::spawn(move || {
-                                shutdown_all(port);
+                                domain::guardctl::shutdown_all(port);
                                 h.exit(0);
                             });
                         }
@@ -1391,7 +1025,7 @@ fn main() {
                         ..
                     } = event
                     {
-                        show_main(tray.app_handle());
+                        domain::windowing::show_main(tray.app_handle());
                     }
                 })
                 .build(app)?;
@@ -1406,7 +1040,7 @@ fn main() {
                     let app = window.app_handle();
                     let port = env::api_port();
                     // 契约 §4.1：停被管对象（等回执）→ 由所有者停止守卫 → 壳退出
-                    shutdown_all(port);
+                    domain::guardctl::shutdown_all(port);
                     let _ = app.exit(0);
                     return;
                 }

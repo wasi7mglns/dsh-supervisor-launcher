@@ -334,8 +334,11 @@ fn b13_shell_owns_service_definition() {
         m.contains("platform::service().ensure_defined"),
         "B13 FAIL ensure_guard 未建立服务定义"
     );
+    // ⚠ 2026-09-11：`ensure_guard` 已迁入 domain/guardctl.rs（分层），
+    //   故「是否调用 spawn 兜底」须连同 domain 层一起查 ——
+    //   而「main.rs 是否引入 platform」仍只查 main.rs（那是**分层断言**）。
     assert!(
-        m.contains("platform::service().spawn_daemon"),
+        crate_sources().contains("platform::service().spawn_daemon"),
         "B13 FAIL 缺少 spawn 兜底调用"
     );
     eprintln!("B13 PASS shell owns 3-platform service definition + spawn fallback");
@@ -520,7 +523,7 @@ fn b24_service_plan_cli_exists() {
 /// B25：无 GUI 定位守卫时不得要求 AppHandle（CLI 路径必须可独立工作）。
 #[test]
 fn b25_candidates_work_without_apphandle() {
-    let m = main_rs();
+    let m = crate_sources();
     assert!(
         m.contains("fn locate_core_candidates(resource_dir: Option<PathBuf>)"),
         "B25 FAIL 候选定位仍要求 AppHandle（CLI 无法复用）"
@@ -656,6 +659,26 @@ fn platform_sources() -> String {
     out
 }
 
+/// 业务层的全部源码（`main.rs` + `domain/`）。
+///
+/// 2026-09-11 分层后，原先针对 `main.rs` 的断言必须覆盖 domain 层 ——
+/// 否则测试会盯着一个已不含该逻辑的文件，产生**假红**（如 B25/B37/B44）。
+///
+/// ⚠ 但**分层断言本身**仍必须针对 `main.rs`（如 B13 要求 main.rs 引入 platform），
+///   故本助手只用于「逻辑存在性」，不用于「位于哪一层」。
+fn crate_sources() -> String {
+    let mut out = main_rs();
+    let dir = manifest_dir().join("src").join("domain");
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if e.path().extension().and_then(|x| x.to_str()) == Some("rs") {
+                out.push_str(&fs::read_to_string(e.path()).unwrap_or_default());
+            }
+        }
+    }
+    out
+}
+
 fn all_rust_sources() -> Vec<(String, String)> {
     // ⚠ **必须递归**（2026-09-11 修复门禁盲区）：
     //   原实现只读顶层 `src/`，而 `platform/` 是**子目录** ——
@@ -738,7 +761,7 @@ fn b33_guard_start_has_timeout() {
 /// B34：壳必须上报守卫启动阶段进度（静默等待与卡死无法区分）。
 #[test]
 fn b34_guard_progress_is_reported() {
-    assert!(main_rs().contains("guard_progress"), "B34 FAIL Rust 侧未上报 guard_progress");
+    assert!(crate_sources().contains("guard_progress"), "B34 FAIL Rust 侧未上报 guard_progress");
     let h = bootstrap_html();
     assert!(h.contains("evt.listen('guard_progress'"), "B34 FAIL 前端未监听 guard_progress");
     eprintln!("B34 PASS guard progress reported");
@@ -762,10 +785,11 @@ fn b35_blocking_work_not_on_main_thread() {
 /// B36：托盘/退出回调不得在 UI 线程做网络 I/O。
 #[test]
 fn b36_tray_io_off_ui_thread() {
+    // 派发函数已迁 domain/localhttp.rs；「托盘回调是否用它」仍看 main.rs。
     let m = main_rs();
-    assert!(m.contains("spawn_local_post"), "B36 FAIL 缺 off-thread 派发函数");
+    assert!(crate_sources().contains("spawn_local_post"), "B36 FAIL 缺 off-thread 派发函数");
     assert!(
-        m.contains(r#""start" => spawn_local_post("#),
+        m.contains(r#""start" => domain::localhttp::spawn_local_post("#),
         "B36 FAIL 托盘 start 仍在 UI 线程调用 post_local"
     );
     assert!(
@@ -779,7 +803,8 @@ fn b36_tray_io_off_ui_thread() {
 #[test]
 fn b37_core_candidates_filter_network_paths() {
     assert!(
-        main_rs().contains("env::is_local_fixed_dir(dir)"),
+        // 候选定位已迁 domain/coreloc.rs（分层）；过滤器经 platform 层。
+        crate_sources().contains("is_local_fixed_dir(dir)"),
         "B37 FAIL 内核候选定位未过滤非本地盘（网络盘 is_file 会阻塞）"
     );
     eprintln!("B37 PASS core candidates filter network paths");
@@ -947,7 +972,8 @@ fn b43_windows_cmd_quoting_handles_spaces() {
 /// 原则：**不能依赖「回环地址正常时很快」来省略上限。**
 #[test]
 fn b44_local_connect_bounded_and_async() {
-    let m = main_rs();
+    // 连接助手已迁 domain/localhttp.rs（2026-09-11）。
+    let m = crate_sources();
     assert!(m.contains("connect_local"), "B44 FAIL 缺统一的带超时连接助手");
     assert!(m.contains("connect_timeout"), "B44 FAIL 未用 connect_timeout");
     assert!(
