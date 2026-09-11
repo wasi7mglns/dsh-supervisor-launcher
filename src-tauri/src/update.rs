@@ -196,6 +196,13 @@ pub fn init_identity(version: &str) -> serde_json::Value {
         "phase": "boot",
         "pid": std::process::id(),
         "startedAt": now,
+        "lastSeenAt": now,
+        // 壳自身的可执行路径（2026-09-11 新增）。
+        //   **为什么记录它**：守卫看护（domains/shell/watchdog）需要在壳崩溃后把它拉起，
+        //   而那时壳进程已不存在、`pgrepList` 拿不到它的 cmdline —— 必须有一个**已落盘**的路径来源。
+        //   `std::env::current_exe()` 是权威值（真实运行中的二进制），优于按安装形态猜测。
+        //   刷新时机：每次壳启动（含自更新后重启），故升级换路径后会自动跟随。
+        "exe": std::env::current_exe().ok().map(|p| p.display().to_string()),
     });
     write_json(&identity_path(), &id);
     log(&format!("壳启动 v{} kind={} 可自更新={} attempt={}", version, kind, capable, g.attempt));
