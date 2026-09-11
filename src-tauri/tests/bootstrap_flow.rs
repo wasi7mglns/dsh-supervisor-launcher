@@ -743,3 +743,130 @@ fn b39_mutex_poisoning_recovered() {
     );
     eprintln!("B39 PASS mutex poisoning recovered");
 }
+
+/// B40：**命令路径上不得做 I/O** —— 这是我上一轮修复时自己引入的缺陷。
+///
+/// 背景（真实事故）：为让诊断串显示候选数量，`node_status` 里调了
+/// `candidate_summary()`，而它内部会枚举候选 —— 那要做 `read_dir`（版本管理器目录）
+/// 并对每个 PATH 条目调 `GetDriveTypeW`。
+/// **这正是我声称已经消除的那类无界阻塞 I/O**，等于把刚搬走的石头又搬回来；
+/// 而前端轮询当时没有独立心跳，于是 invoke 不返回 = 永久静默、不报错。
+///
+/// 断言：摘要必须来自缓存（探测线程写入），命令路径只读字符串。
+#[test]
+fn b40_command_path_must_not_enumerate() {
+    let p = fs::read_to_string(manifest_dir().join("src").join("nodeprobe.rs")).expect("nodeprobe.rs");
+    // candidate_summary 不得直接调用 candidates()
+    let start = p.find("pub fn candidate_summary()").expect("B40 FAIL 缺 candidate_summary");
+    let rest = &p[start..];
+    let body_end = rest.find("\n}").unwrap_or(rest.len());
+    let body = &rest[..body_end];
+    assert!(
+        !body.contains("candidates()"),
+        "B40 FAIL candidate_summary 仍在现算候选（命令路径上做 I/O）"
+    );
+    assert!(body.contains("summary"), "B40 FAIL candidate_summary 未读缓存");
+    // 摘要必须在探测线程里写入
+    assert!(p.contains("l.summary = summary"), "B40 FAIL 摘要未在探测线程写入缓存");
+    eprintln!("B40 PASS command path does not enumerate");
+}
+
+/// B41：前端**轮询循环**必须有独立于被调方的心跳。
+///
+/// 轮询与单次调用不同：若 `invoke` 永不 settle 而轮询只在其 `.then` 里再调度，
+/// 整个循环就**静默停摆** —— 不报错、不推进。用户实测的「卡住且不报错」正是如此。
+#[test]
+fn b41_polling_loops_have_independent_heartbeat() {
+    let h = bootstrap_html();
+    // 环境探测轮询：每次查询都必须包超时
+    assert!(h.contains("withTimeout(core.invoke('node_status'), 15000"), "B41 FAIL 环境轮询未包超时");
+    assert!(h.contains("查询无响应，重试中"), "B41 FAIL 环境轮询无超时分支（无法自愈）");
+    // 守卫就绪轮询
+    assert!(h.contains("withTimeout(core.invoke('guard_ready'), 10000"), "B41 FAIL 守卫就绪轮询未包超时");
+    eprintln!("B41 PASS polling loops have heartbeat");
+}
+
+/// B42：macOS 的平台标签必须与 `platform_file()` 选定的产物**语义一致**。
+///
+/// 原实现 arm64 用 `osx-arm64-tar` 判定、却下载 `.pkg` —— 靠两者恰好都存在而侥幸可用。
+/// 实测（逐版本核对官方 index.json）：`osx-x64-pkg` 所有 LTS 都存在，
+/// 而 `osx-arm64-pkg` 从不存在；通用 pkg 的标签就是 `osx-x64-pkg`。
+#[test]
+fn b42_macos_tag_matches_pkg_artifact() {
+    let n = fs::read_to_string(manifest_dir().join("src").join("node.rs")).expect("node.rs");
+    // 选了 .pkg 就必须用 pkg 的标签
+    assert!(n.contains("node-v{}.pkg"), "B42 FAIL macOS 未选 .pkg");
+    assert!(n.contains("osx-x64-pkg"), "B42 FAIL macOS 标签未与 .pkg 对齐");
+    assert!(
+        !n.contains("return if std::env::consts::ARCH == \"aarch64\" { \"osx-arm64-tar\" }"),
+        "B42 FAIL macOS 仍在用 tar 标签判定 pkg 产物"
+    );
+    eprintln!("B42 PASS macOS tag matches artifact");
+}
+
+/// B43：Windows 经 `cmd /C` 启动时，引号必须能承受**含空格的路径**。
+///
+/// `%APPDATA%` 含 Windows 用户名，而用户名可以含空格（如 "John Smith"）。
+/// 旧写法 `.args(["/C", path, "daemon"])` 会让 cmd 拆错 → 守卫启动失败且错误难解读。
+#[test]
+fn b43_windows_cmd_quoting_handles_spaces() {
+    let s = fs::read_to_string(manifest_dir().join("src").join("service.rs")).expect("service.rs");
+    assert!(s.contains("raw_arg(line)"), "B43 FAIL Windows 未用 raw_arg 精确控制引号");
+    assert!(
+        !s.contains(".args([\"/C\", &guard.display().to_string(), \"daemon\"])"),
+        "B43 FAIL Windows 仍用会拆错的 args 形式"
+    );
+    eprintln!("B43 PASS windows cmd quoting handles spaces");
+}
+
+/// B44：本地 TCP 连接必须有**连接**超时，且守卫探针不得占用主线程。
+///
+/// `TcpStream::connect` **没有超时**：端口被防火墙 DROP（而非 REJECT）时会等到 OS
+/// SYN 重试耗尽（Windows 默认 20+ 秒）。而 `guard_ready` 被引导页每 500ms 轮询、最多 40 次。
+/// 原则：**不能依赖「回环地址正常时很快」来省略上限。**
+#[test]
+fn b44_local_connect_bounded_and_async() {
+    let m = main_rs();
+    assert!(m.contains("connect_local"), "B44 FAIL 缺统一的带超时连接助手");
+    assert!(m.contains("connect_timeout"), "B44 FAIL 未用 connect_timeout");
+    assert!(
+        !m.contains("TcpStream::connect(addr)"),
+        "B44 FAIL 仍有裸 TcpStream::connect（无连接超时）"
+    );
+    assert!(
+        m.contains("async fn guard_ready"),
+        "B44 FAIL guard_ready 仍是同步命令（主线程被轮询探针占住）"
+    );
+    eprintln!("B44 PASS local connect bounded and guard_ready async");
+}
+
+/// B45：**判定标签必须按架构给出**（与产物语义一致），不得硬编码 x64。
+///
+/// 与 B42（macOS）同类：arch 相关的产物，其判定标签也必须 arch 相关。
+/// Linux arm64 上若用 `linux-x64` 判定、却下载 `linux-arm64` 文件，
+/// 就是「靠恰好在同一个 files[] 里」而侥幸通过。
+#[test]
+fn b45_platform_tag_is_arch_aware() {
+    let n = fs::read_to_string(manifest_dir().join("src").join("node.rs")).expect("node.rs");
+    assert!(n.contains("linux-arm64"), "B45 FAIL Linux 标签未按架构区分");
+    // 不得对 linux 直接 return 硬编码字面量
+    assert!(
+        !n.contains("#[cfg(target_os = \"linux\")]\n    { return \"linux-x64\"; }"),
+        "B45 FAIL Linux 标签仍硬编码 x64"
+    );
+    // Windows arm64 限制必须被如实记录（诚实性断言）
+    assert!(n.contains("win-arm64-msi"), "B45 FAIL 未记录 Windows arm64 的 msi 缺失限制");
+    eprintln!("B45 PASS platform tag arch-aware");
+}
+
+/// B46：Windows 路径不得硬编码（系统盘符/语言/Program Files(x86) 都会变化）。
+#[test]
+fn b46_windows_paths_from_env_not_hardcoded() {
+    let e = fs::read_to_string(manifest_dir().join("src").join("env.rs")).expect("env.rs");
+    assert!(
+        !e.contains(r#"PathBuf::from(r"C:\Program Files\nodejs\node.exe")"#),
+        "B46 FAIL env.rs 仍硬编码 C:\\Program Files"
+    );
+    assert!(e.contains("ProgramFiles(x86)"), "B46 FAIL 未覆盖 Program Files (x86)");
+    eprintln!("B46 PASS windows paths from env");
+}

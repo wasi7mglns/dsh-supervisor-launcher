@@ -167,14 +167,33 @@ pub fn probe_system_node() -> Option<(PathBuf, String)> {
 }
 
 /// 安装后已知候选路径（官方安装的标准落点）。
+///
+/// ⚠ Windows 不得硬编码 `C:\Program Files`（2026-09-11 审计）：
+///   真实路径随**系统盘符**与**系统语言**变化（中文系统是 `Program Files` 的本地化目录名），
+///   也可能装在 `Program Files (x86)`。故一律经 `ProgramFiles` / `ProgramFiles(x86)`
+///   环境变量推导 —— 这也是 `nodeprobe::known_locations()` 采用的口径，两处必须一致。
 pub fn known_install_node_path() -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    { let p = PathBuf::from("/usr/local/bin/node"); if p.is_file() { return Some(p); } }
-    #[cfg(target_os = "macos")]
-    { let p = PathBuf::from("/usr/local/bin/node"); if p.is_file() { return Some(p); } }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Linux 与 macOS：官方安装（tar / pkg）都落到 /usr/local/bin。
+        let p = PathBuf::from("/usr/local/bin/node");
+        if p.is_file() { return Some(p); }
+        // macOS Apple Silicon 上的 Homebrew 落点（原生 arm64 安装常见于此）
+        let hb = PathBuf::from("/opt/homebrew/bin/node");
+        if hb.is_file() { return Some(hb); }
+        None
+    }
     #[cfg(target_os = "windows")]
-    { let p = PathBuf::from(r"C:\Program Files\nodejs\node.exe"); if p.is_file() { return Some(p); } }
-    None
+    {
+        let exe = "node.exe";
+        for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Ok(base) = std::env::var(var) {
+                let p = PathBuf::from(base).join("nodejs").join(exe);
+                if p.is_file() { return Some(p); }
+            }
+        }
+        None
+    }
 }
 
 /// 产品用户数据根（~/.dsh/supervisor）。

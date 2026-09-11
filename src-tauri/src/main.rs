@@ -441,15 +441,24 @@ async fn guard_start(app: tauri::AppHandle) -> Result<serde_json::Value, String>
 }
 
 /// 守卫就绪探针（TCP + HTTP /healthz 双确认）：引导页据此决定进面板，替代固定延时（K6）。
+///
+/// ⚠ 必须 async（2026-09-11 审计）：旧实现是**同步命令** → 在**主线程**执行一次
+///   最多 400ms 的 TCP 探测 + 最多 3 秒的 HTTP 往返；而引导页每 500ms 轮询一次、
+///   最多 40 次 —— 合计可占住主线程十几秒，界面在此期间**无法重绘**。
+///   现放进阻塞线程池：主线程立即返回。
 #[tauri::command]
-fn guard_ready() -> serde_json::Value {
-    let port = env::api_port();
-    if !is_alive(port) { return serde_json::json!({"ready": false, "reason": "tcp", "port": port}); }
-    match http_get_local(port, "/healthz", std::time::Duration::from_secs(3)) {
-        Some((code, _)) if (200..300).contains(&code) => serde_json::json!({"ready": true, "port": port}),
-        Some((code, _)) => serde_json::json!({"ready": false, "reason": "http", "status": code, "port": port}),
-        None => serde_json::json!({"ready": false, "reason": "http", "port": port}),
-    }
+async fn guard_ready() -> serde_json::Value {
+    tauri::async_runtime::spawn_blocking(|| {
+        let port = env::api_port();
+        if !is_alive(port) { return serde_json::json!({"ready": false, "reason": "tcp", "port": port}); }
+        match http_get_local(port, "/healthz", std::time::Duration::from_secs(3)) {
+            Some((code, _)) if (200..300).contains(&code) => serde_json::json!({"ready": true, "port": port}),
+            Some((code, _)) => serde_json::json!({"ready": false, "reason": "http", "status": code, "port": port}),
+            None => serde_json::json!({"ready": false, "reason": "http", "port": port}),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| serde_json::json!({"ready": false, "reason": "probe-panic"}))
 }
 
 /// 桌面自定义窗口控制（Phase 3b：无边框窗口 + 自绘标题栏）。
@@ -673,8 +682,10 @@ fn is_alive(port: u16) -> bool {
 fn cli_env_plan() -> i32 {
     println!("== 环境探测自检 ==");
     println!("平台          = {}", std::env::consts::OS);
-    println!("{}", nodeprobe::candidate_summary());
+    // 注意顺序：候选摘要由**探测线程**写入缓存，必须在 status() 之后再读，
+    // 否则首次调用会读到空串（诊断输出出现空白，易被误读为「没有候选」）。
     let out = nodeprobe::status(std::time::Duration::from_secs(60));
+    println!("{}", nodeprobe::candidate_summary());
     println!("完成          = {}", out.finished);
     println!("耗时          = {} ms", out.elapsed_ms);
     match (&out.path, &out.version) {
@@ -760,9 +771,25 @@ fn spawn_local_post(port: u16, path: &'static str) {
 }
 
 /// 同 post_local，但带读写超时（防止守卫挂起时壳无限阻塞）。返回响应体（解码 utf8 尽力）。
-fn post_local_timeout(port: u16, path: &str, timeout: std::time::Duration) -> Option<String> {
+/// 与本地守卫建立连接，**带连接超时**。
+///
+/// ⚠ 必须用 `connect_timeout` 而非 `connect`（2026-09-11 审计）：`TcpStream::connect`
+///   **没有超时** —— 若端口被防火墙 DROP（而非 REJECT），连接会一直等到操作系统的
+///   SYN 重试耗尽，Windows 上默认可达 20+ 秒。而本函数被 `guard_ready`（引导页每次
+///   500ms 轮询一次、最多 40 次）与托盘动作调用，等同于反复长时间阻塞。
+///   回环地址正常时是微秒级，但**不能依赖「正常时很快」来省略上限**。
+fn connect_local(port: u16, timeout: std::time::Duration) -> Option<TcpStream> {
+    use std::net::ToSocketAddrs;
     let addr = format!("127.0.0.1:{}", port);
-    let mut stream = TcpStream::connect(addr).ok()?;
+    let sa = addr.to_socket_addrs().ok()?.next()?;
+    TcpStream::connect_timeout(&sa, timeout).ok()
+}
+
+/// 本地 HTTP 请求的连接预算（回环地址，正常为微秒级；此处仅作兜底上限）。
+const LOCAL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(800);
+
+fn post_local_timeout(port: u16, path: &str, timeout: std::time::Duration) -> Option<String> {
+    let mut stream = connect_local(port, LOCAL_CONNECT_TIMEOUT)?;
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
     let req = format!(
@@ -777,8 +804,7 @@ fn post_local_timeout(port: u16, path: &str, timeout: std::time::Duration) -> Op
 
 /// 本地 HTTP GET（返回 (状态码, 全文)）——守卫就绪探针用。
 fn http_get_local(port: u16, path: &str, timeout: std::time::Duration) -> Option<(u16, String)> {
-    let addr = format!("127.0.0.1:{}", port);
-    let mut stream = TcpStream::connect(addr).ok()?;
+    let mut stream = connect_local(port, LOCAL_CONNECT_TIMEOUT)?;
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
     let req = format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", path, port);
@@ -792,8 +818,7 @@ fn http_get_local(port: u16, path: &str, timeout: std::time::Duration) -> Option
 
 /// 读取会话态（GET /session/status 的最小解析：找 "sessionState":"xxx"）。
 fn get_session_state(port: u16) -> Option<String> {
-    let addr = format!("127.0.0.1:{}", port);
-    let mut stream = TcpStream::connect(addr).ok()?;
+    let mut stream = connect_local(port, LOCAL_CONNECT_TIMEOUT)?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(3)));
     let req = format!("GET /session/status HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", port);

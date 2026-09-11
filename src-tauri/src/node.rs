@@ -23,12 +23,44 @@ fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// index.json files[] 里的平台标签（如 linux-x64 / osx-arm64-tar / win-x64-msi）。
+/// index.json `files[]` 里的平台标签 —— **必须与 `platform_file()` 选定的产物语义一致**。
+///
+/// ⚠ macOS 标签语义修正（2026-09-11，实测驱动）：
+///   原实现 arm64 返回 `osx-arm64-tar`、x64 返回 `osx-x64-tar`，而 `platform_file()`
+///   返回的是官方 **`.pkg`** —— 判定依据（tar 标签）与下载对象（pkg）**不是一回事**。
+///   它能工作只是因为两者恰好都存在，属**侥幸而非正确**。
+///
+///   实测（逐版本核对官方 index.json 的 files[]）：
+///     · `osx-x64-pkg`   —— 所有 LTS 版本**都存在**（这就是通用 pkg 的标签）
+///     · `osx-arm64-pkg` —— **从不存在**
+///     · `osx-arm64-tar` / `osx-x64-tar` —— 存在，但那是 tarball 的标签
+///   故 pkg 路径的正确标签是 `osx-x64-pkg`（适用于两种架构 —— 官方只发一个通用 pkg）。
+///
+///   补充实测证据：解包 `node-v24.21.0.pkg` 可见其 payload 同时含 x86_64 与 arm64
+///   两个 Mach-O 切片（fat 二进制），即 .pkg 确为**通用包**，两种 Arch 都能原生安装。
+/// 判定标签必须**按架构**给出，且与 `platform_file()` 的产物语义一致。
+///
+/// ⚠ Linux 也曾硬编码 `linux-x64`（2026-09-11 审计发现，与 macOS 同类）：
+///   在 arm64 上 `platform_file()` 返回 `node-v{V}-linux-arm64.tar.xz`，
+///   而标签却是 `linux-x64` —— 判定依据与产物不是一回事。
+///   它能通过 `has` 检查只是因为「恰好 x64 标签也在 files[] 里」，
+///   属**侥幸而非正确**：若某版本只有 x64 而无 arm64，代码仍会判定可用，
+///   随后去下载一个不存在的 arm64 文件（404）。
+///
+/// 各平台实测口径：
+///   Linux   : `linux-x64` / `linux-arm64`（files[] 两者均存在）
+///   macOS   : `osx-x64-pkg`（官方**只发一个通用 pkg**，无 osx-arm64-pkg；实测确认）
+///   Windows : `win-x64-msi`（官方**无 win-arm64-msi**，只有 win-arm64-7z/zip）
+///
+/// ⚠ 已知限制（诚实记录）：Windows arm64 上只能装 x64 msi（依赖系统模拟执行），
+///   因为官方未提供 arm64 msi。若要原生 arm64，需改用 zip 解包路径 —— 当前未实现。
 fn platform_tag() -> &'static str {
     #[cfg(target_os = "linux")]
-    { return "linux-x64"; }
+    {
+        return if std::env::consts::ARCH == "aarch64" { "linux-arm64" } else { "linux-x64" };
+    }
     #[cfg(target_os = "macos")]
-    { return if std::env::consts::ARCH == "aarch64" { "osx-arm64-tar" } else { "osx-x64-tar" }; }
+    { return "osx-x64-pkg"; }
     #[cfg(target_os = "windows")]
     { return "win-x64-msi"; }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -57,7 +89,13 @@ fn platform_file(version: &str) -> Option<String> {
         Some(format!("node-v{}.pkg", version))
     }
     #[cfg(target_os = "windows")]
-    { Some(format!("node-v{}-x64.msi", version)) }
+    {
+        // 官方**没有** win-arm64-msi（files[] 只有 win-arm64-7z / win-arm64-zip）。
+        // 故 arm64 Windows 也取 x64 msi —— 依赖系统的 x64 模拟执行。这是**有意为之的
+        // 折中**（原生 arm64 需改用 zip 解包，当前未实现），并在 platform_tag() 中如实记录。
+        let _ = arch;
+        Some(format!("node-v{}-x64.msi", version))
+    }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     { None }
 }

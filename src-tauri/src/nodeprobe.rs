@@ -58,17 +58,26 @@ pub struct Outcome {
 struct Live {
     current: Option<(String, Instant)>,
     done: Vec<TraceEntry>,
+    /// 候选清单摘要（**在探测线程里算好后缓存**）。
+    ///
+    /// ⚠ 绝不能在命令路径上现算（2026-09-11 二次修复）：
+    ///   生成摘要需要枚举候选 —— 那会 `read_dir`（版本管理器目录）并对每个 PATH 条目
+    ///   调 `GetDriveTypeW`。这正是我们声称已经消除的那类**无界阻塞 I/O**；
+    ///   把它放进 `node_status` 等于把刚搬走的石头又搬回来。
+    ///   而探测线程本身是**带外**的（命令只 recv_timeout），故在那边算是安全的。
+    summary: String,
 }
 
 fn live() -> &'static Mutex<Live> {
     static L: OnceLock<Mutex<Live>> = OnceLock::new();
-    L.get_or_init(|| Mutex::new(Live { current: None, done: Vec::new() }))
+    L.get_or_init(|| Mutex::new(Live { current: None, done: Vec::new(), summary: String::new() }))
 }
 
 fn live_reset() {
     if let Ok(mut l) = live().lock() {
         l.current = None;
         l.done.clear();
+        // summary 不重置：候选构成与「本次探测是否已开始」无关，保留上次结果更有用。
     }
 }
 
@@ -246,7 +255,14 @@ fn spawn_worker(tx: Sender<Outcome>) {
 }
 
 fn detect() -> (Option<PathBuf>, Option<String>) {
-    for (source, cand) in candidates() {
+    // ⚠ 本函数运行在**探测线程**（带外），故此处枚举候选是安全的；
+    //   摘要经 live 缓存供命令路径只读，避免把 I/O 带回 node_status。
+    let cands = candidates();
+    let summary = summarize(&cands);
+    if let Ok(mut l) = live().lock() {
+        l.summary = summary;
+    }
+    for (source, cand) in cands {
         let p = cand.to_string_lossy().to_string();
         live_stage(source.clone() + " " + &p);
         let t0 = Instant::now();
@@ -417,9 +433,19 @@ fn latest_versioned_node(root: PathBuf) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
-/// 供诊断：候选数量与来源分布（不执行任何探测）。
+/// 候选摘要（**只读缓存，不做任何 I/O**）。
+///
+/// 缓存由探测线程在开始时写入；命令路径只读一个 `String`。
+/// 若探测尚未开始，返回空串（调用方据此显示「尚未探测」）。
 pub fn candidate_summary() -> String {
-    let c = candidates();
+    match live().lock() {
+        Ok(l) => l.summary.clone(),
+        Err(e) => e.into_inner().summary.clone(),
+    }
+}
+
+/// 由候选清单生成摘要文本（**只在探测线程中调用**）。
+fn summarize(c: &[(String, PathBuf)]) -> String {
     let recorded = c.iter().filter(|(s, _)| s == "记录").count();
     let known = c.iter().filter(|(s, _)| s == "已知").count();
     let path = c.iter().filter(|(s, _)| s == "PATH").count();

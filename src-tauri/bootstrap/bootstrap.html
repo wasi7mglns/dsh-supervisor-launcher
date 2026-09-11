@@ -422,8 +422,21 @@
       var settled = false;
       function poll() {
         if (settled) return;
-        core.invoke('node_status').then(function (st) {
+        // ⚠ 必须给**每次**查询包一层超时（2026-09-11 二次修复）。
+        //   原实现是裸 `core.invoke(...).then(...)`：一旦该 invoke 永不 settle，
+        //   `poll()` 就**再也不会被调度** —— 既不报错、也不推进，
+        //   界面永久停在「正在检测系统环境…」。
+        //   这正是用户实测到的「卡住且不报错」：不是探测慢，而是轮询自己停摆了。
+        //   （轮询循环与单次调用不同：它**必须**有独立于被调方的心跳。）
+        withTimeout(core.invoke('node_status'), 15000, '环境查询无响应').then(function (st) {
           if (settled) return;
+          if (st && st.__timeout) {
+            // 单次查询无响应：不就此放弃，继续轮询到总预算耗尽再给出口。
+            if (Date.now() >= deadline) { settled = true; failEnvTimeout(lastEnv || {}); resolve(null); return; }
+            status('正在检测系统环境…（查询无响应，重试中）');
+            setTimeout(poll, 400);
+            return;
+          }
           st = st || {};
           lastEnv = st;
           if (st.probing) {
@@ -511,9 +524,11 @@
     phase('node');
     return new Promise(function (resolve) {
       var done = false;
+      // 同样包超时：等待安装完成期间也不能因单次查询无响应而永久静默。
       var t = setInterval(function () {
-        core.invoke('node_status').then(function (st) {
+        withTimeout(core.invoke('node_status'), 15000, '环境查询无响应').then(function (st) {
           st = st || {};
+          if (st.__timeout) return;   // 下次 tick 重试
           if (!st.busy && st.installed) { if (!done) { done = true; clearInterval(t); nodeVer = st.installed; resolve(stepNodeDone()); } }
         }).catch(function () {});
       }, 700);
@@ -599,7 +614,9 @@
   }
   function stepGuardReady(n) {
     if (n === 0) status('等待守卫就绪…');
-    return core.invoke('guard_ready').then(function (r) {
+    // 同样有界：守卫若在启动中，健康探针可能长时间无响应。
+    return withTimeout(core.invoke('guard_ready'), 10000, '守卫就绪探测无响应').then(function (r) {
+      if (r && r.__timeout) { if (n >= 40) return guardFailed('守卫未就绪（健康探针持续无响应）'); return wait(500).then(function () { return stepGuardReady(n + 1); }); }
       r = r || {};
       if (r.ready) return stepPanel();
       if (n >= 40) return guardFailed('守卫未就绪（端口 ' + (r.port || '?') + ' 无响应）');

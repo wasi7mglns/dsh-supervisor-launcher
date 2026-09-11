@@ -170,22 +170,35 @@ pub fn ensure_defined(guard: &Path) -> Result<String, String> {
     }
     let shim = format!("@echo off\r\n\"{}\" daemon\r\n", guard.display());
     std::fs::write(&wrapper, shim).map_err(|e| format!("写入包装脚本失败: {}", e))?;
-    let out = crate::bounded::run(
-        Command::new("schtasks").args([
-            "/Create",
-            "/TN", "DSH-Supervisor",
-            "/SC", "ONLOGON",
-            "/RL", "HIGHEST",
-            "/F",
-            "/TR", &wrapper.display().to_string(),
-        ]),
-        SVC_NORMAL,
-    )?;
-    if out.success {
-        Ok(format!("已建立 计划任务 DSH-Supervisor -> {}", wrapper.display()))
-    } else {
-        Err(format!("schtasks /Create 失败: {}", out.stderr.trim()))
+    // ⚠ `/RL HIGHEST` 需要相应权限（2026-09-11 审计）：
+    //   在**非提权**会话中创建「以最高权限运行」的计划任务可能被拒（Access is denied）。
+    //   而壳默认以普通用户权限运行 —— 若首次尝试失败，退化为普通权限任务，
+    //   保证「服务定义一定能建立」（守卫本身不需要管理员权限，它只管理当前用户的 DSH）。
+    //   原则：**权限不足时应降级而非彻底失败**，否则用户会卡在「守卫就绪」。
+    let base = |rl: Option<&str>| {
+        let mut c = Command::new("schtasks");
+        c.args(["/Create", "/TN", "DSH-Supervisor", "/SC", "ONLOGON"]);
+        if let Some(level) = rl {
+            c.args(["/RL", level]);
+        }
+        c.args(["/F", "/TR", &wrapper.display().to_string()]);
+        c
+    };
+
+    let first = crate::bounded::run(&mut base(Some("HIGHEST")), SVC_NORMAL)?;
+    if first.success {
+        return Ok(format!("已建立 计划任务 DSH-Supervisor（最高权限）-> {}", wrapper.display()));
     }
+    // 降级重试（去掉 /RL HIGHEST）
+    let second = crate::bounded::run(&mut base(None), SVC_NORMAL)?;
+    if second.success {
+        return Ok(format!("已建立 计划任务 DSH-Supervisor（普通权限，HIGHEST 被拒）-> {}", wrapper.display()));
+    }
+    Err(format!(
+        "schtasks /Create 失败（含降级重试）: 首次={} / 降级={}",
+        first.stderr.trim(),
+        second.stderr.trim()
+    ))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -208,8 +221,20 @@ pub fn spawn_daemon(guard: &Path) -> Result<u32, String> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
+        // ⚠ 引号处理必须正确（2026-09-11 修复）：
+        //   npm 全局安装的守卫是 `dsh-supervisor.cmd` 垫片，须经 `cmd /C` 启动。
+        //   而旧写法 `.args(["/C", path, "daemon"])` 在**路径含空格**时会被 cmd 拆错 ——
+        //   而 `%APPDATA%` 形如 `C:\Users\<用户名>\AppData\Roaming`，
+        //   Windows 用户名**可以含空格**（如 "John Smith"），故此风险真实存在。
+        //   症状是「守卫启动失败」，且错误信息难以解读（cmd 报路径语法错误）。
+        //
+        //   正确形态（cmd 的经典引号规则）：整个命令用**外层引号**包住，
+        //   路径自身再包一层 —— 即 `cmd /C ""<path>" daemon"`。
+        //   用 raw_arg 直接给出该形式，避免 Rust 再次转义。
+        let line = format!("\"\"{}\" daemon\"", guard.display());
         let child = Command::new("cmd")
-            .args(["/C", &guard.display().to_string(), "daemon"])
+            .arg("/C")
+            .raw_arg(line)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
