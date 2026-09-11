@@ -57,6 +57,18 @@
   .fail-actions button { border: 1px solid var(--line); background: var(--brand); color: #fff;
     border-radius: 8px; padding: 7px 16px; font-size: 12.5px; cursor: pointer; }
   .fail-actions button.ghost { background: transparent; color: var(--status); }
+  /* 镜像设置（仅失败态显示） */
+  .mirror { display: grid; gap: 8px; width: 100%; border-top: 1px solid var(--line); padding-top: 12px; }
+  .mirror-title { font-size: 12.5px; font-weight: 650; text-align: center; }
+  .mirror-hint { font-size: 11.5px; color: var(--status); text-align: center; word-break: break-word; }
+  .mirror-row { display: grid; grid-template-columns: 44px 1fr; align-items: center; gap: 8px; }
+  .mirror-label { font-size: 11.5px; color: var(--status); }
+  .mirror-row input { width: 100%; border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 8px; font-size: 11.5px; background: transparent; color: var(--text); }
+  .mirror-actions { display: flex; gap: 8px; justify-content: center; }
+  .mirror-actions button { border: 1px solid var(--line); background: var(--brand); color: #fff;
+    border-radius: 8px; padding: 6px 14px; font-size: 12px; cursor: pointer; }
+  .mirror-actions button.ghost { background: transparent; color: var(--status); }
   .choice { display: grid; gap: 10px; justify-items: center; width: 100%;
     border: 1px solid color-mix(in srgb, var(--brand) 32%, transparent); border-radius: 12px;
     padding: 16px; background: color-mix(in srgb, var(--brand) 6%, transparent); }
@@ -117,6 +129,26 @@
         <div class="fail-actions">
           <button id="btnRetry">重试</button>
           <button id="btnDiag" class="ghost">复制诊断</button>
+          <button id="btnMirror" class="ghost">网络/镜像设置</button>
+        </div>
+        <!-- 镜像设置（**仅失败时出现**，避免干扰普通用户）：
+             壳装机那一刻没有内核，面板里的「镜像源」卡不可用；
+             若镜像不可达，用户将没有任何自助出口。此处只给最小可用的输入。 -->
+        <div class="mirror" id="mirrorBox" style="display:none">
+          <div class="mirror-title">镜像源（下载 Node / 内核时使用）</div>
+          <div class="mirror-hint" id="mirrorHint">正在探测各镜像延迟…</div>
+          <div class="mirror-row">
+            <span class="mirror-label">Node</span>
+            <input id="mirrorNode" placeholder="https://nodejs.org/dist" />
+          </div>
+          <div class="mirror-row">
+            <span class="mirror-label">内核</span>
+            <input id="mirrorNpm" placeholder="https://registry.npmmirror.com" />
+          </div>
+          <div class="mirror-actions">
+            <button id="btnMirrorSave">保存并重试</button>
+            <button id="btnMirrorProbe" class="ghost">重新探测</button>
+          </div>
         </div>
       </div>
       <!-- 桌面版本失败选择页（用户定案 2026-09-11）：
@@ -228,6 +260,11 @@
     status('启动未完成');
     $('failMsg').textContent = msg;
     $('fail').style.display = '';
+    // 网络/镜像类失败 → **自动展开**镜像设置，让用户一眼看到自助出口；
+    // 其余失败（如内核安装报错）不展开，避免噪声。
+    if (/网络|镜像|超时|下载|不可达|timeout|network|mirror/i.test(String(msg))) {
+      showMirror();
+    }
   }
   function diagText() {
     return [
@@ -520,6 +557,58 @@
   // 交互：跳过（网络步骤的即时出口）
   $('btnSkipShell').addEventListener('click', function () {
     if (skipAction) skipAction();
+  });
+
+  // ── 镜像设置（仅失败态出现）──
+  // 为什么需要：壳装机时没有内核，面板的「镜像源」卡不可用；
+  // 若镜像不可达，用户将没有任何自助出口（本次审计发现的可用性缺口）。
+  function showMirror() {
+    $('mirrorBox').style.display = '';
+    loadMirror();
+  }
+  function loadMirror() {
+    $('mirrorHint').textContent = '正在探测各镜像延迟…';
+    return core.invoke('mirror_status').then(function (r) {
+      r = r || {};
+      $('mirrorNode').value = (r.node || []).join(', ');
+      $('mirrorNpm').value = (r.npm || []).join(', ');
+      var lines = [];
+      (r.nodeProbes || []).forEach(function (p) {
+        lines.push('Node ' + p.source.replace(/^https?:\/\//, '') + ' ' + (p.ok ? p.latencyMs + 'ms' : '不可达'));
+      });
+      var okNode = (r.nodeProbes || []).filter(function (p) { return p.ok; }).length;
+      var okNpm = (r.npmProbes || []).filter(function (p) { return p.ok; }).length;
+      $('mirrorHint').textContent = lines.join(' · ') + "\n内核镜像可达 " + okNpm + '/' + (r.npmProbes || []).length;
+    }).catch(function (e) {
+      $('mirrorHint').textContent = '探测失败：' + e;
+    });
+  }
+  $('btnMirror').addEventListener('click', function () {
+    var shown = $('mirrorBox').style.display !== 'none';
+    if (shown) { $('mirrorBox').style.display = 'none'; } else { showMirror(); }
+  });
+  $('btnMirrorProbe').addEventListener('click', function () { loadMirror(); });
+  $('btnMirrorSave').addEventListener('click', function () {
+    var split = function (v) {
+      return String(v || '').split(/[,\n]/).map(function (x) { return x.trim(); }).filter(Boolean);
+    };
+    var node = split($('mirrorNode').value);
+    var npm = split($('mirrorNpm').value);
+    if (!node.length && !npm.length) { $('mirrorHint').textContent = '请至少填写一项镜像地址'; return; }
+    $('mirrorHint').textContent = '正在保存…';
+    var jobs = [];
+    if (node.length) jobs.push(core.invoke('mirror_set', { kind: 'node', urls: node }));
+    if (npm.length) jobs.push(core.invoke('mirror_set', { kind: 'npm', urls: npm }));
+    Promise.all(jobs).then(function () {
+      $('mirrorHint').textContent = '已保存，正在重新开始引导…';
+      return wait(500);
+    }).then(function () {
+      hideFail();
+      $('mirrorBox').style.display = 'none';
+      boot();
+    }).catch(function (e) {
+      $('mirrorHint').textContent = '保存失败：' + e;
+    });
   });
 
   // 交互：重试 / 诊断

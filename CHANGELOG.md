@@ -6,6 +6,84 @@
 
 以下修复**已完成代码与测试，尚未构建/发布**（按用户要求：先逐项确认后再构建）。
 
+### 新功能：壳内镜像源适配（三条下载链路全覆盖，用户要求）
+
+#### 问题（用户指正的核心）
+
+> 「你根本在安装完壳之后去做的所有的动作，它是没有镜像源的，它是没有内核的。
+>  你要理解整个工程的逻辑，在初始安装完壳的那一瞬的时候，里面是没有内核的。」
+
+**装机那一刻机器上没有内核**（内核是随后由壳自己安装的），因此壳的每一处下载都**不能**
+依赖内核的 `registry.json`。审计确认改造前壳的三条下载链路几乎没有镜像适配：
+
+| # | 链路 | 改造前 |
+|---|---|---|
+| ① | Node 运行时（index.json + 安装包 + SHASUMS） | 2 源硬编码，**官方优先、仅报错才回退**，无测速/配置/UI |
+| ② | 内核 npm 包（元数据 + `npm install -g`） | 4 源但**串行先到**，`registry.json` 缺失时用内建默认 |
+| ③ | 壳自更新（清单 + 安装包） | 2 源**编译期写死**于 tauri.conf.json |
+
+关键后果：`nodejs.org` 在受限网络下常常**可达但极慢**，于是永远不会回退镜像 ——
+而安装包有 30–90 MB（macOS `.pkg` 实测 89.4 MB），用户要等到超时才失败。
+（注：上一轮把下载超时从 60 秒放宽到 15 分钟后，该缺陷的代价从 1 分钟变成 15 分钟。）
+
+#### 实测支撑（决定了实现方式）
+
+| Node 镜像 | index | 版本新鲜度 | SHASUMS | .pkg |
+|---|---|---|---|---|
+| npm 官方 | ✅ | v24.21.0 | ✅ | ✅ |
+| npmmirror | ✅ | v24.21.0 | ✅ | ✅ |
+| 华为云 | ✅ | v24.21.0 | ✅ | ✅ |
+| 腾讯云 | ✅ | **v24.20.0（滞后一版）** | ✅ | ✅ |
+
+→ 腾讯云滞后一版，故必须「**跨全部源取最高版本**」；若「首个成功即采用」会静默装到旧版。
+
+#### 实现
+
+**新增 `src/mirror.rs`（壳自持镜像模块）**：
+- `NODE_PRESETS` / `NPM_PRESETS` / `SHELL_PRESETS` 三组预设（全部实测可用）；
+- `~/.dsh/shell/mirrors.json` 壳自持配置（装机即可用，**不依赖内核**）；
+- `probe_all()` 用 `std::thread::scope` **并行**探测（零新增依赖）；
+- `export_to_kernel()` 把 npm 偏好导出为内核 `registry.json`，让内核**继承**同一份选择
+  （若内核已进入 `manual` 模式则不覆盖——尊重用户在面板里的显式选择）；
+- 测速缓存 TTL 30 分钟（与内核 `selectRegistry` 一致）。
+
+**① Node 下载（`node.rs` 重写）**：并行探测全部镜像 → 跨源取**最高 LTS** →
+在提供该版本的源中选**延迟最低**者下载 → SHASUMS256 强校验，校验失败换源重试。
+
+**② 内核 npm（`core.rs` 重写）**：`registry_origins()` 优先级改为
+「内核 manual > **壳自持配置** > 内核 auto 列表 > 内建默认」；
+`latest_version()` 由串行先到改为**并行 + 跨源取最高**。
+
+**③ 壳自更新（`main.rs`）**：用 `UpdaterBuilder::endpoints()` **运行时覆盖**编译期端点，
+使更新源可在不重新编译的前提下切换。
+
+**引导页镜像自助入口**（新增 `mirror_status` / `mirror_set` 命令 + UI）：
+- 壳装机时面板（`RegistryCard`）不可用，用户若遇镜像不可达将**没有任何出口**——这是可用性缺口；
+- 故引导页在**失败态**提供镜像设置：显示各镜像实测延迟、可手填 Node/内核镜像、保存后自动重试；
+- **默认隐藏**（不干扰普通用户），仅当失败信息含网络/镜像/超时/下载等关键词时自动展开。
+
+#### 实测验证
+
+干净 HOME 下运行 `--node-plan`（等价首启）：
+
+```
+mirror_selected=https://mirrors.huaweicloud.com/nodejs   ← 自动选中最低延迟
+mirror_probe=https://mirrors.huaweicloud.com/nodejs      ok=true latency_ms=276
+mirror_probe=https://npmmirror.com/mirrors/node          ok=true latency_ms=278
+mirror_probe=https://mirrors.cloud.tencent.com/nodejs-release ok=true latency_ms=356
+mirror_probe=https://nodejs.org/dist                     ok=true latency_ms=1458  ← 最慢
+```
+
+生成文件：`~/.dsh/shell/mirrors.json`（壳自持）+ `~/.dsh/supervisor/registry.json`（导出给内核）。
+两次运行分别选中 npmmirror 与华为云 —— 证明是**真实测速**而非写死。
+
+#### 回归防护
+`tests/bootstrap_flow.rs` 增至 **21 断言**，新增：
+- B18 壳必须自持镜像适配（三组预设 + 并行探测 + 缓存 + 导出内核 + 保护 manual）；
+- B19 三条下载链路都必须接入镜像（不能只做一处）；
+- B20 引导页必须有失败态镜像自助入口，且**默认隐藏**；
+- B21 不得再出现「并发尝试」这类与实现不符的失真注释。
+
 ### 修复：守卫服务定义从未被建立 —— 全新机器上流程必然断裂（架构级，用户质疑驱动）
 
 #### 问题（本次审计最严重的发现）

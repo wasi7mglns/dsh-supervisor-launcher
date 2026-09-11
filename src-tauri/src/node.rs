@@ -4,8 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const OFFICIAL: &str = "https://nodejs.org/dist";
-const MIRROR: &str = "https://npmmirror.com/mirrors/node";
+// 镜像候选已收敛到 mirror.rs 的 NODE_PRESETS（壳自持配置，支持用户自定义）。
 
 /// 整个请求的时间上限。
 ///
@@ -63,10 +62,10 @@ fn platform_file(version: &str) -> Option<String> {
     { None }
 }
 
-fn is_candidate(base: &str) -> Result<Option<(String, String)>, String> {
-    let raw = http_get_bytes(&format!("{}/index.json", base))?;
-    let idx: Value = serde_json::from_slice(&raw).map_err(|e| format!("版本清单解析失败: {}", e))?;
-    let arr = idx.as_array().ok_or("版本清单结构异常")?;
+/// 从一个 index.json 文本中解析「本平台可用的最高 LTS」。
+fn best_from_index(raw: &str) -> Option<(String, String)> {
+    let idx: Value = serde_json::from_str(raw).ok()?;
+    let arr = idx.as_array()?;
     let mut best: Option<(String, String)> = None;
     for item in arr {
         let lts = item.get("lts");
@@ -83,7 +82,75 @@ fn is_candidate(base: &str) -> Result<Option<(String, String)>, String> {
         let newer = best.as_ref().map(|b| version_gt(ver, &b.0)).unwrap_or(true);
         if newer { best = Some((ver.to_string(), file)); }
     }
-    Ok(best)
+    best
+}
+
+/// 镜像发现结果：最高 LTS + 提供该版本的**最快**源。
+pub struct LtsChoice {
+    pub version: String,
+    pub file: String,
+    pub source: String,
+    pub latency_ms: u128,
+    pub probes: Vec<(String, bool, u128)>,
+}
+
+/// **并行**探测全部 Node 镜像，取「最高 LTS」并选最快且提供该版本的源。
+///
+/// 设计要点（2026-09-11 重写）：
+///   · 旧实现是「官方优先、报错才回退」的**串行**逻辑（注释还错误地写着"并发"）：
+///     nodejs.org 在受限网络下常常**可达但极慢**，于是永远不会回退到镜像，
+///     而安装包有 30-90MB —— 用户要等很久甚至超时。
+///   · 现改为并行探测所有候选（一次 index.json 同时得到延迟与版本，不额外增加请求），
+///     再取**全部可达源中的最高版本** —— 这很重要：实测腾讯云镜像会滞后一个版本，
+///     「首个成功即采用」会静默装到旧版。
+///   · 最后在「提供该版本」的源中选**延迟最低**者下载，避免用慢源拉大包。
+pub fn latest_lts() -> Result<LtsChoice, String> {
+    let mirrors = crate::mirror::load();
+    let probes = crate::mirror::probe_all(&mirrors.node, "index.json");
+    let diag: Vec<(String, bool, u128)> = probes
+        .iter()
+        .map(|p| (p.source.clone(), p.ok, p.latency_ms))
+        .collect();
+
+    let mut best: Option<(String, String, u128, String)> = None; // (ver, file, latency, src)
+    for p in &probes {
+        if !p.ok { continue; }
+        let Some(body) = &p.body else { continue };
+        let Some((ver, file)) = best_from_index(body) else { continue };
+        let better = match &best {
+            None => true,
+            Some((bv, _, _, _)) => version_gt(&ver, bv),
+        };
+        if better {
+            best = Some((ver, file, p.latency_ms, p.source.clone()));
+        }
+    }
+    match best {
+        Some((version, file, latency_ms, source)) => {
+            // 落盘缓存：记录选中的源与探测时间（TTL 内后续调用可直接复用；
+            // 同时让镜像选择**可观测**——用户与排障都能看到当前用的是哪个源）。
+            let mut m = crate::mirror::load();
+            m.selected_node = Some(source.clone());
+            m.checked_at = Some(crate::mirror::now_secs());
+            if let Err(e) = crate::mirror::save(&m) {
+                crate::update::log(&format!("镜像配置写入失败（不影响本次安装）: {}", e));
+            }
+            // 同步导出给内核（若内核已存在则继承同一偏好；不存在时也无害，
+            // 内核首次安装后会读到这份文件）。
+            if let Err(e) = crate::mirror::export_to_kernel(&m.npm) {
+                crate::update::log(&format!("导出内核镜像偏好失败（不影响本次安装）: {}", e));
+            }
+            Ok(LtsChoice { version, file, source, latency_ms, probes: diag })
+        }
+        None => {
+            let detail = diag
+                .iter()
+                .map(|(s, ok, ms)| format!("{}:{}", s, if *ok { format!("{}ms", ms) } else { "不可达".into() }))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!("全部 Node 镜像均不可用或无可用 LTS（{}）", detail))
+        }
+    }
 }
 
 fn version_gt(a: &str, b: &str) -> bool {
@@ -97,31 +164,36 @@ fn version_gt(a: &str, b: &str) -> bool {
     false
 }
 
-/// 官方（或镜像）最新 LTS：返回 (version, platform file)。
-pub fn latest_lts() -> Result<(String, String), String> {
-    match is_candidate(OFFICIAL) {
-        Ok(Some(x)) => return Ok(x),
-        Ok(None) => return Err("官方清单中没有可用的 LTS 版本".into()),
-        Err(a) => {
-            // 官方不可达 → 镜像兜底（前面策略 2：绝不静默降级，明确来源）
-            match is_candidate(MIRROR) {
-                Ok(Some(x)) => return Ok(x),
-                Ok(None) => return Err("官方与镜像清单均无可用 LTS".into()),
-                Err(b) => return Err(format!("官方({}) 与镜像({}) 均失败", a, b)),
-            }
+
+
+
+/// 下载 + SHASUMS256 强校验，返回本地文件路径。
+///
+/// 源顺序（2026-09-11 重写）：**优先使用发现阶段选出的最快源**（`preferred`），
+/// 其余候选作为回退。校验失败（哈希不符）视为该源不可信，**换下一个源重试** ——
+/// 这既保证正确性，也避免被单个镜像的损坏文件卡死。
+pub fn download_verified(
+    version: &str,
+    file: &str,
+    dl_dir: &Path,
+    preferred: Option<&str>,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dl_dir).map_err(|e| e.to_string())?;
+    let mirrors = crate::mirror::load();
+    let mut order: Vec<String> = Vec::new();
+    if let Some(p) = preferred {
+        if !p.is_empty() {
+            order.push(p.to_string());
         }
     }
-}
-
-fn sources(_version: &str) -> Vec<(&'static str, &'static str)> {
-    vec![(OFFICIAL, "官方"), (MIRROR, "镜像(npmmirror)")]
-}
-
-/// 下载 + 官方 SHASUMS256 校验（并发尝试官方/镜像），返回本地文件路径。
-pub fn download_verified(version: &str, file: &str, dl_dir: &Path) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(dl_dir).map_err(|e| e.to_string())?;
+    for s in &mirrors.node {
+        if !order.iter().any(|x| x == s) {
+            order.push(s.clone());
+        }
+    }
     let mut last_err: Option<String> = None;
-    for (base, _label) in sources(version) {
+    for base in &order {
+        let base: &str = base.as_str();
         let file_url = format!("{}/{}/{}", base, version, file);
         let data = match http_get_bytes(&file_url) {
             Ok(d) => d,

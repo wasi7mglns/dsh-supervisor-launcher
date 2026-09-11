@@ -9,6 +9,8 @@
 
 mod core;
 mod env;
+// 镜像源适配（壳自持）：装机时无内核，三处下载都必须自带镜像能力。
+mod mirror;
 mod node;
 // 守卫服务定义（三平台）+ spawn 兜底：首启时壳是唯一在场组件，服务定义只能由壳建立。
 mod service;
@@ -84,7 +86,8 @@ async fn node_status(app: tauri::AppHandle) -> serde_json::Value {
     if need_latest {
         let handle = app.clone();
         std::thread::spawn(move || {
-            if let Ok((v, _f)) = node::latest_lts() {
+            if let Ok(c) = node::latest_lts() {
+                let v = c.version.clone();
                 let state = handle.state::<Mutex<RunState>>();
                 let mut s = state.lock().unwrap();
                 s.latest = Some(v.clone());
@@ -155,11 +158,21 @@ fn push_status(app: &tauri::AppHandle, status: String, progress: f32) {
 
 fn run_install(app: &tauri::AppHandle) -> Result<(String, String), String> {
     push_status(app, "获取官方最新 LTS 版本…".into(), 0.1);
-    let (version, file) = node::latest_lts()?;
+    let choice = node::latest_lts()?;
+    let version = choice.version.clone();
+    let file = choice.file.clone();
+    // 记录镜像选择（含延迟诊断），便于用户与排障
+    mirror::save(&mirror::Mirrors {
+        selected_node: Some(choice.source.clone()),
+        checked_at: Some(mirror::now_secs()),
+        ..mirror::load()
+    })
+    .ok();
+    push_status(app, format!("选用镜像 {}（{}ms）", choice.source, choice.latency_ms), 0.15);
     push_status(app, format!("官方最新 LTS: {}", version), 0.2);
     let dl_dir = env::supervisor_dir().join("dl");
     push_status(app, format!("下载 {}（约 30~50MB）…", file), 0.3);
-    let local = node::download_verified(&version, &file, &dl_dir)?;
+    let local = node::download_verified(&version, &file, &dl_dir, Some(choice.source.as_str()))?;
     push_status(app, "SHA256 校验通过，准备安装…".into(), 0.8);
     let node_path = node::install(&local)?;
     let node_path = node_path.display().to_string();
@@ -528,9 +541,13 @@ fn cli_plan() -> i32 {
         None => println!("node=missing"),
     }
     match node::latest_lts() {
-        Ok((v, f)) => {
-            println!("latest_lts={} file={}", v, f);
-            println!("node_outdated={}", node::outdated(sys.as_ref().map(|x| x.1.as_str()), &v));
+        Ok(c) => {
+            println!("latest_lts={} file={}", c.version, c.file);
+            println!("mirror_selected={}", c.source);
+            for (s, ok, ms) in &c.probes {
+                println!("mirror_probe={} ok={} latency_ms={}", s, ok, ms);
+            }
+            println!("node_outdated={}", node::outdated(sys.as_ref().map(|x| x.1.as_str()), &c.version));
             0
         }
         Err(e) => { eprintln!("latest_lts_error={}", e); 1 }
@@ -679,10 +696,97 @@ fn shell_updater(
     app: &tauri::AppHandle,
     timeout: std::time::Duration,
 ) -> Result<tauri_plugin_updater::Updater, String> {
-    app.updater_builder()
-        .timeout(timeout)
+    let mut builder = app.updater_builder().timeout(timeout);
+    // 端点运行时覆盖（2026-09-11）：Tauri 配置里写死的 endpoints 是编译期常量，
+    // 而不同网络环境下 CDN 可达性差异很大。此处用壳自持的镜像配置覆盖，
+    // 使用户（或壳自身测速结果）可以在**不重新编译**的前提下切换更新源。
+    let endpoints: Vec<tauri::Url> = crate::mirror::load()
+        .shell
+        .iter()
+        .filter_map(|s| tauri::Url::parse(s).ok())
+        .collect();
+    if !endpoints.is_empty() {
+        builder = builder
+            .endpoints(endpoints)
+            .map_err(|e| format!("更新端点配置无效: {}", e))?;
+    }
+    builder
         .build()
         .map_err(|e| format!("更新器不可用: {}", e))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 镜像源适配命令（引导页在**网络失败时**提供手动入口）
+//
+// 设计意图（2026-09-11）：壳装机时没有内核，面板（RegistryCard）此时不可用，
+// 用户若遇到镜像不可达将没有任何出口。故引导页必须在失败时给出可操作的输入框。
+// 平时不显示（避免干扰普通用户），仅失败态出现。
+// ═══════════════════════════════════════════════════════════════════
+
+/// 读取当前镜像配置 + 并行探测延迟（供引导页展示与选择）。
+#[tauri::command]
+async fn mirror_status() -> Result<serde_json::Value, String> {
+    let m = crate::mirror::load();
+    let node_probes = tauri::async_runtime::spawn_blocking(|| {
+        let m = crate::mirror::load();
+        crate::mirror::probe_all(&m.node, "index.json")
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let npm_probes = tauri::async_runtime::spawn_blocking(|| {
+        let m = crate::mirror::load();
+        crate::mirror::probe_all(&m.npm, "")
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let fmt = |v: Vec<crate::mirror::Probe>| {
+        v.into_iter()
+            .map(|p| serde_json::json!({ "source": p.source, "ok": p.ok, "latencyMs": p.latency_ms }))
+            .collect::<Vec<_>>()
+    };
+    Ok(serde_json::json!({
+        "ok": true,
+        "node": m.node,
+        "npm": m.npm,
+        "shell": m.shell,
+        "selectedNode": m.selected_node,
+        "selectedNpm": m.selected_npm,
+        "nodeProbes": fmt(node_probes),
+        "npmProbes": fmt(npm_probes),
+    }))
+}
+
+/// 保存用户自定义镜像（引导页失败时的自助出口）。
+/// 入参为 URL 列表；保存后使缓存失效，并在 npm 类型时立即导出给内核（若已安装）。
+#[tauri::command]
+fn mirror_set(kind: String, urls: Vec<String>) -> Result<serde_json::Value, String> {
+    let mut m = crate::mirror::load();
+    let list: Vec<String> = urls
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if list.is_empty() {
+        return Err("镜像列表不能为空".into());
+    }
+    for u in &list {
+        if !(u.starts_with("http://") || u.starts_with("https://")) {
+            return Err(format!("镜像地址必须以 http(s):// 开头：{}", u));
+        }
+    }
+    match kind.as_str() {
+        "node" => m.node = list.clone(),
+        "npm" => m.npm = list.clone(),
+        "shell" => m.shell = list.clone(),
+        _ => return Err(format!("未知镜像类型: {}（支持 node / npm / shell）", kind)),
+    }
+    m.checked_at = None; // 使缓存失效，下次重新测速
+    crate::mirror::save(&m)?;
+    if kind == "npm" {
+        let _ = crate::mirror::export_to_kernel(&list);
+    }
+    update::log(&format!("镜像配置已更新 {}: {}", kind, list.join(", ")));
+    Ok(serde_json::json!({ "ok": true, "kind": kind, "urls": list }))
 }
 
 /// 检查是否有壳更新。
@@ -860,7 +964,7 @@ fn main() {
         // app.restart()：更新安装后重启进入新版本（旧进程装、新进程跑）。
         .plugin(tauri_plugin_process::init())
         .manage(Mutex::new(RunState::default()))
-        .invoke_handler(tauri::generate_handler![node_status, core_status, core_plan, core_apply, guard_start, guard_ready, start_node_install, finish_boot, win_ctl, shell_identity, shell_update_check, shell_update_apply, shell_restart, shell_set_phase])
+        .invoke_handler(tauri::generate_handler![node_status, core_status, core_plan, core_apply, guard_start, guard_ready, start_node_install, finish_boot, win_ctl, shell_identity, shell_update_check, shell_update_apply, shell_restart, shell_set_phase, mirror_status, mirror_set])
         .setup(|app| {
             // 托盘直发本地 API 的端口：显式 DSH_SUPERVISOR_TRAY_PORT 优先，否则从用户 config.apiPort 解析
             let port: u16 = std::env::var("DSH_SUPERVISOR_TRAY_PORT")
@@ -884,7 +988,8 @@ fn main() {
             // （core_plan → core_apply → guard_start → guard_ready），杜绝两条互不知晓的流程竞争，
             // 以及「Rust 侧已尝试拉起但页面不知情」的假成功。
             std::thread::spawn(move || {
-                if let Ok((v, _f)) = node::latest_lts() {
+                if let Ok(c) = node::latest_lts() {
+                    let v = c.version.clone();
                     let state = handle.state::<Mutex<RunState>>();
                     let mut s = state.lock().unwrap();
                     s.latest = Some(v.clone());

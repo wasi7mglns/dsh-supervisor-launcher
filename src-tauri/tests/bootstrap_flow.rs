@@ -360,3 +360,77 @@ fn b17_package_root_resolution_is_form_agnostic() {
     assert!(bin.contains("path.join(ROOT, 'bin', 'dsh-supervisor')"), "B17 FAIL bin 目标未按包根解析");
     eprintln!("B17 PASS package root resolution form-agnostic");
 }
+
+/// B18：镜像适配必须由壳自持（装机时无内核，面板不可用）。
+#[test]
+fn b18_shell_owns_mirror_adaptation() {
+    let m = fs::read_to_string(manifest_dir().join("src").join("mirror.rs"))
+        .expect("B18 FAIL 缺少 src/mirror.rs（壳自持镜像模块）");
+    // 三类下载源预设齐备
+    assert!(m.contains("NODE_PRESETS"), "B18 FAIL 缺 Node 镜像预设");
+    assert!(m.contains("NPM_PRESETS"), "B18 FAIL 缺 npm 镜像预设");
+    assert!(m.contains("SHELL_PRESETS"), "B18 FAIL 缺壳自更新端点预设");
+    // 并行探测 + 缓存
+    assert!(m.contains("pub fn probe_all"), "B18 FAIL 缺并行探测");
+    assert!(m.contains("thread::scope"), "B18 FAIL 探测未并行（串行会被慢源拖死）");
+    assert!(m.contains("CACHE_TTL_SECS"), "B18 FAIL 缺测速缓存");
+    // 壳自持配置 + 导出给内核
+    assert!(m.contains("mirrors.json"), "B18 FAIL 缺壳自持配置文件");
+    assert!(m.contains("export_to_kernel"), "B18 FAIL 未导出偏好给内核（内核会重新盲选）");
+    assert!(m.contains("manual"), "B18 FAIL 未保护内核 manual 选择不被覆盖");
+    eprintln!("B18 PASS shell owns mirror adaptation");
+}
+
+/// B19：三条下载链路都必须接入镜像适配（不能只做一处）。
+#[test]
+fn b19_all_three_download_paths_use_mirrors() {
+    let node = fs::read_to_string(manifest_dir().join("src").join("node.rs")).expect("node.rs");
+    let core = fs::read_to_string(manifest_dir().join("src").join("core.rs")).expect("core.rs");
+    let main = main_rs();
+    // ① Node：并行探测 + 跨源取最高版本（镜像会滞后一版）
+    assert!(node.contains("crate::mirror::probe_all"), "B19 FAIL Node 未用并行探测");
+    assert!(node.contains("best_from_index"), "B19 FAIL Node 未跨源解析");
+    assert!(node.contains("preferred"), "B19 FAIL Node 下载未使用选中的最快源");
+    // ② 内核 npm：并行 + 壳配置优先
+    assert!(core.contains("crate::mirror::probe_all"), "B19 FAIL 内核 npm 未用并行探测");
+    assert!(core.contains("crate::mirror::load"), "B19 FAIL 内核 npm 未读壳镜像配置");
+    // ③ 壳自更新：运行时端点覆盖
+    assert!(main.contains(".endpoints(endpoints)"), "B19 FAIL 壳自更新端点未运行时覆盖");
+    assert!(main.contains("crate::mirror::load()"), "B19 FAIL 壳自更新未读镜像配置");
+    eprintln!("B19 PASS all three download paths use mirrors");
+}
+
+/// B20：引导页必须在网络失败时提供镜像自助入口（否则用户无任何出口）。
+#[test]
+fn b20_bootstrap_offers_mirror_fallback() {
+    let html = bootstrap_html();
+    assert!(html.contains("mirrorBox"), "B20 FAIL 引导页缺镜像设置容器");
+    assert!(html.contains("btnMirror"), "B20 FAIL 缺镜像入口按钮");
+    assert!(html.contains("mirrorNode"), "B20 FAIL 缺 Node 镜像输入");
+    assert!(html.contains("mirrorNpm"), "B20 FAIL 缺内核镜像输入");
+    assert!(html.contains("mirror_status"), "B20 FAIL 未接探测命令");
+    assert!(html.contains("mirror_set"), "B20 FAIL 未接保存命令");
+    // **仅失败时**出现（不干扰普通用户）：默认 display:none
+    assert!(
+        html.contains("id=\"mirrorBox\" style=\"display:none\""),
+        "B20 FAIL 镜像设置未默认隐藏（会干扰普通用户）"
+    );
+    // 失败态自动展开
+    assert!(html.contains("showMirror()"), "B20 FAIL 失败态未自动展开镜像设置");
+    eprintln!("B20 PASS bootstrap offers mirror fallback");
+}
+
+/// B21：不得再出现「串行先到」的注释与实现不一致。
+#[test]
+fn b21_no_serial_first_hit_comment() {
+    let node = fs::read_to_string(manifest_dir().join("src").join("node.rs")).expect("node.rs");
+    assert!(
+        !node.contains("并发尝试官方/镜像"),
+        "B21 FAIL 仍有「并发尝试」的失真注释（旧实现实为串行）"
+    );
+    assert!(
+        !node.contains("fn sources("),
+        "B21 FAIL 旧的串行 sources() 仍在"
+    );
+    eprintln!("B21 PASS no stale serial comment");
+}

@@ -112,24 +112,44 @@ pub fn semver_cmp(a: &str, b: &str) -> i32 {
     0
 }
 
-/// 镜像候选：优先内核 registry.json（mode/origins/manualOrigin），缺失用内建默认。
+/// 镜像候选集合（2026-09-11 重写）：**壳自持配置优先**，其次内核 registry.json，最后内建默认。
+///
+/// 为什么壳配置优先：装机时**没有内核**（registry.json 尚不存在），壳必须自带镜像能力；
+/// 而壳在引导阶段选出的最快源若能被内核继承，就不必让内核再盲选一次。
+/// 若内核已进入 manual 模式（用户在面板里手动锁定），则**尊重内核的选择**。
 pub fn registry_origins() -> Vec<String> {
     let path = crate::env::supervisor_dir().join("registry.json");
+    let mut kernel_manual: Option<String> = None;
+    let mut kernel_list: Option<Vec<String>> = None;
     if let Ok(s) = std::fs::read_to_string(&path) {
         if let Ok(v) = serde_json::from_str::<Value>(&s) {
             let mode = v.get("mode").and_then(|x| x.as_str()).unwrap_or("auto");
             if mode == "manual" {
                 if let Some(m) = v.get("manualOrigin").and_then(|x| x.as_str()) {
-                    if !m.is_empty() { return vec![m.to_string()]; }
+                    if !m.is_empty() { kernel_manual = Some(m.to_string()); }
                 }
             }
             if let Some(arr) = v.get("origins").and_then(|x| x.as_array()) {
                 let list: Vec<String> = arr.iter().filter_map(|x| x.as_str())
                     .map(|s| s.to_string()).filter(|s| !s.is_empty()).collect();
-                if !list.is_empty() { return list; }
+                if !list.is_empty() { kernel_list = Some(list); }
             }
         }
     }
+    // 1) 内核手动模式：最高优先（用户显式选择）
+    if let Some(m) = kernel_manual {
+        return vec![m];
+    }
+    // 2) 壳自持配置（引导阶段已测速选择）
+    let m = crate::mirror::load();
+    if !m.npm.is_empty() {
+        return m.npm;
+    }
+    // 3) 内核 registry.json 的 auto 列表
+    if let Some(l) = kernel_list {
+        return l;
+    }
+    // 4) 内建默认
     DEFAULT_ORIGINS.iter().map(|s| s.to_string()).collect()
 }
 
@@ -148,37 +168,59 @@ fn encode_pkg(pkg: &str) -> String {
     pkg.chars().map(|c| if c == '/' { "%2F".to_string() } else { c.to_string() }).collect()
 }
 
-/// 最新版本：逐镜像尝试，取包元数据里 dist-tags + versions 的**全量最高**。
+/// 最新版本：**并行**探测全部镜像，取全量最高版本，并选最快且提供该版本的源。
 /// 返回 (version, 命中镜像)。
+///
+/// 2026-09-11 重写：原实现是「串行、首个成功即返回」—— 既慢（慢源拖死整体），
+/// 又可能因某个镜像**元数据滞后**而选到旧版本（镜像同步存在延迟）。
+/// 现改为并行 + 跨源取最高，与 Node 侧策略一致。
 pub fn latest_version(pkg: &str) -> Result<(String, String), String> {
     if pkg.is_empty() { return Err("包名为空".into()); }
-    let mut last_err = String::from("无候选镜像");
-    for origin in registry_origins() {
-        let base = origin.trim_end_matches('/');
-        let url = format!("{}/{}", base, encode_pkg(pkg));
-        match http_json(&url, 12000) {
-            Ok(j) => {
-                let mut best: Option<String> = None;
-                let consider = |v: &str, best: &mut Option<String>| {
-                    if !is_valid_version(v) { return; }
-                    let better = best.as_deref().map(|b| semver_cmp(v, b) > 0).unwrap_or(true);
-                    if better { *best = Some(v.to_string()); }
-                };
-                if let Some(obj) = j.get("dist-tags").and_then(|x| x.as_object()) {
-                    for v in obj.values() { if let Some(s) = v.as_str() { consider(s, &mut best); } }
-                }
-                if let Some(obj) = j.get("versions").and_then(|x| x.as_object()) {
-                    for k in obj.keys() { consider(k, &mut best); }
-                }
-                match best {
-                    Some(b) => return Ok((b, origin.clone())),
-                    None => last_err = format!("{} 无可用版本", origin),
-                }
-            }
-            Err(e) => last_err = format!("{}: {}", origin, e),
+    let path = encode_pkg(pkg);
+    let origins = registry_origins();
+    let probes = crate::mirror::probe_all(&origins, &path);
+
+    // 跨全部可达源取最高版本；同版本时保留延迟最低者。
+    let mut best: Option<(String, u128, String)> = None; // (version, latency, source)
+    let mut reachable = 0usize;
+    for p in &probes {
+        if !p.ok { continue; }
+        reachable += 1;
+        let Some(body) = &p.body else { continue };
+        let Ok(j) = serde_json::from_str::<Value>(body) else { continue };
+        let mut local: Option<String> = None;
+        let mut consider = |v: &str| {
+            if !is_valid_version(v) { return; }
+            let better = local.as_deref().map(|b| semver_cmp(v, b) > 0).unwrap_or(true);
+            if better { local = Some(v.to_string()); }
+        };
+        if let Some(obj) = j.get("dist-tags").and_then(|x| x.as_object()) {
+            for v in obj.values() { if let Some(s) = v.as_str() { consider(s); } }
+        }
+        if let Some(obj) = j.get("versions").and_then(|x| x.as_object()) {
+            for k in obj.keys() { consider(k); }
+        }
+        let Some(v) = local else { continue };
+        let better = match &best {
+            None => true,
+            Some((bv, _, _)) => semver_cmp(&v, bv) > 0,
+        };
+        if better {
+            best = Some((v, p.latency_ms, p.source.clone()));
         }
     }
-    Err(format!("全部镜像不可用（{}）", last_err))
+
+    match best {
+        Some((version, _, source)) => Ok((version, source)),
+        None => {
+            let detail = probes
+                .iter()
+                .map(|p| format!("{}:{}", p.source, if p.ok { format!("{}ms", p.latency_ms) } else { "不可达".into() }))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!("全部镜像不可用或均无该包（可达 {} 个；{}）", reachable, detail))
+        }
+    }
 }
 
 /// 内核包目录（<pkg>/bin/<exe> → <pkg>）。
