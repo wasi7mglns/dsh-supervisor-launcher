@@ -335,51 +335,23 @@ fn spawn_worker(tx: Sender<Outcome>) {
 }
 
 /// 返回 (路径, 版本, 明确失败原因)。
+///
+/// == 关键结构改进：**边枚举边探测，且把最可能慢的来源放到最后** == (2026-09-11 三次修复) ==
+///
+/// 上一版的顺序是「先把**全部**候选枚举完，再逐个探测」。这有一个致命后果：
+/// **只要枚举阶段慢/卡（PATH 过滤要逐盘符调 GetDriveTypeW），
+/// 就连已经枚举好的廉价候选都永远试不到** —— 用户本可瞬间命中「已知安装落点」，
+/// 却因为 PATH 过滤卡住而完全失败。
+///
+/// 现改为**交错（interleaved）**：
+///   ① 记录路径  → 立即探测
+///   ② 已知落点  → 列一个、试一个
+///   ③ PATH 过滤 → **最后才做**（这是唯一需要逐盘符系统调用的阶段）
+///
+/// 于是「Node 装在标准位置」的绝大多数用户（含本项目的目标场景）
+/// **根本不会走到 PATH 过滤**，那个可疑的系统调用连一次都不会被调用。
+/// 这比「把它加进进度上报」更根本：**不上报不如不调用。**
 fn detect() -> (Option<PathBuf>, Option<String>, Option<String>) {
-    // ⚠ 规则一的核心体现：候选枚举本身**也要 stage**。
-    //   上一版把整段枚举放在 stage 之外，于是卡在枚举时 summary/stuck/trace 三项全空 ——
-    //   「卡住且不报错、也没有任何线索」正是由此而来。
-    let cands = enumerate_staged();
-
-    for (source, cand) in &cands {
-        let p = cand.to_string_lossy().to_string();
-        stage(&format!("探测候选 {}（{}）", source, p));
-        let t0 = Instant::now();
-        if !crate::env::is_usable_candidate(cand) {
-            finish(TraceEntry {
-                source: source.clone(),
-                path: p,
-                ms: t0.elapsed().as_millis(),
-                ok: false,
-                note: "不可用（不存在 / 应用别名存根 / 空文件）".to_string(),
-            });
-            continue;
-        }
-        match crate::env::node_version(cand) {
-            Some(v) => {
-                finish(TraceEntry {
-                    source: source.clone(),
-                    path: p,
-                    ms: t0.elapsed().as_millis(),
-                    ok: true,
-                    note: v.clone(),
-                });
-                return (Some(cand.clone()), Some(v), None);
-            }
-            None => finish(TraceEntry {
-                source: source.clone(),
-                path: p,
-                ms: t0.elapsed().as_millis(),
-                ok: false,
-                note: "无响应或不是有效 Node（已按上限终止）".to_string(),
-            }),
-        }
-    }
-    (None, None, None)
-}
-
-/// 枚举候选，**每一步都先 stage**（规则一）。
-fn enumerate_staged() -> Vec<(String, PathBuf)> {
     #[cfg(test)]
     if HANG_IN_ENUMERATE.load(std::sync::atomic::Ordering::Relaxed) {
         // 精确复刻线上故障：卡在枚举阶段。
@@ -389,39 +361,96 @@ fn enumerate_staged() -> Vec<(String, PathBuf)> {
         std::thread::sleep(Duration::from_secs(10));
     }
     let mut out: Vec<(String, PathBuf)> = Vec::new();
-    let push = |src: String, p: PathBuf, out: &mut Vec<(String, PathBuf)>| {
-        if !out.iter().any(|(_, e)| *e == p) {
-            out.push((src, p));
+    let add = |src: &str, p: PathBuf, out: &mut Vec<(String, PathBuf)>| -> bool {
+        if out.iter().any(|(_, e)| *e == p) {
+            return false;
         }
+        out.push((src.to_string(), p));
+        true
     };
 
-    // ⚠ 每个阶段之后都**增量更新摘要**：这样即使卡在后续阶段，
-    //   诊断串里的 env_candidates 也能显示「已枚举到哪一步、已收集多少个」，
-    //   而不是一片空白（上一版正是空白，导致无法判断是否连枚举都没开始）。
-
-    // ① 自己记录的路径（一次本地读；最廉价也最可信）
+    // ───── ① 自己记录的路径（一次本地读；最廉价也最可信）─────
     stage("① 读取 runtime.json 记录路径");
     if let Some(p) = crate::env::recorded_node_path() {
-        push("记录".to_string(), p, &mut out);
+        if add("记录", p.clone(), &mut out) {
+            if let Some(v) = try_probe("记录", &p) {
+                set_summary(summarize(&out));
+                return (Some(p), Some(v), None);
+            }
+        }
     }
-    set_summary(format!("{}（进行中：已完成 ①）", summarize(&out)));
+    set_summary(format!("{}（进行中：① 已试）", summarize(&out)));
 
-    // ② 已知安装落点（含版本管理器目录列举 —— 也会 read_dir，必须 stage）
-    for (src, p) in known_locations_staged() {
-        push(src, p, &mut out);
+    // ───── ② 已知安装落点（逐个：列一个、试一个）─────
+    stage("② 枚举已知安装落点");
+    for (src, p) in known_locations() {
+        if !add(&src, p.clone(), &mut out) {
+            continue;
+        }
+        set_summary(format!("{}（进行中：② 搜索中）", summarize(&out)));
+        if let Some(v) = try_probe(&src, &p) {
+            set_summary(summarize(&out));
+            return (Some(p), Some(v), None);
+        }
     }
-    set_summary(format!("{}（进行中：已完成 ①②）", summarize(&out)));
 
-    // ③ PATH（最后；且逐条 stage）
+    // ───── ③ PATH（最后：这是唯一需要逐盘符系统调用的阶段）─────
     let dirs = path_dirs_staged();
-    set_summary(format!("{}（进行中：PATH 已过滤 {} 条）", summarize(&out), dirs.len()));
+    let total = dirs.len();
+    set_summary(format!("{}（进行中：③ PATH 已过滤 {} 条）", summarize(&out), total));
     for (i, dir) in dirs.into_iter().enumerate() {
-        stage(&format!("③ 收集 PATH 候选 {}/{}", i + 1, out.len()));
-        push("PATH".to_string(), dir.join(crate::env::node_exe()), &mut out);
+        let cand = dir.join(crate::env::node_exe());
+        if !add("PATH", cand.clone(), &mut out) {
+            continue;
+        }
+        stage(&format!("③ 探测 PATH 候选 {}/{}", i + 1, total));
+        if let Some(v) = try_probe("PATH", &cand) {
+            set_summary(summarize(&out));
+            return (Some(cand), Some(v), None);
+        }
     }
 
     set_summary(summarize(&out));
-    out
+    (None, None, None)
+}
+
+/// 探测单个候选：stage → 可用性判定 → 执行取版本 → 落追踪。返回版本（成功时）。
+fn try_probe(source: &str, cand: &PathBuf) -> Option<String> {
+    let p = cand.to_string_lossy().to_string();
+    stage(&format!("探测候选 {}（{}）", source, p));
+    let t0 = Instant::now();
+    if !crate::env::is_usable_candidate(cand) {
+        finish(TraceEntry {
+            source: source.to_string(),
+            path: p,
+            ms: t0.elapsed().as_millis(),
+            ok: false,
+            note: "不可用（不存在 / 应用别名存根 / 空文件）".to_string(),
+        });
+        return None;
+    }
+    match crate::env::node_version(cand) {
+        Some(v) => {
+            finish(TraceEntry {
+                source: source.to_string(),
+                path: p,
+                ms: t0.elapsed().as_millis(),
+                ok: true,
+                note: v.clone(),
+            });
+            Some(v)
+        }
+        None => {
+            finish(TraceEntry {
+                source: source.to_string(),
+                path: p,
+                ms: t0.elapsed().as_millis(),
+                ok: false,
+                note: "无响应或不是有效 Node（已按上限终止）".to_string(),
+            });
+            None
+        }
+    }
 }
 
 fn summarize(c: &[(String, PathBuf)]) -> String {
@@ -431,12 +460,6 @@ fn summarize(c: &[(String, PathBuf)]) -> String {
     format!("候选 {} 个（记录 {} / 已知 {} / PATH {}）", c.len(), recorded, known, path)
 }
 
-/// 已知安装落点，逐个 stage（每个都可能触发 read_dir / stat）。
-fn known_locations_staged() -> Vec<(String, PathBuf)> {
-    stage("② 枚举已知安装落点");
-    let v = known_locations();
-    v
-}
 
 /// PATH 目录，逐条 stage 并做本地盘过滤（过滤本身也可能阻塞 —— 见 env.rs 的盘符缓存）。
 fn path_dirs_staged() -> Vec<PathBuf> {

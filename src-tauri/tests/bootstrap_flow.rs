@@ -781,14 +781,15 @@ fn b40_command_path_must_not_enumerate() {
 #[test]
 fn b47_every_blocking_phase_is_staged() {
     let p = fs::read_to_string(manifest_dir().join("src").join("nodeprobe.rs")).expect("nodeprobe.rs");
-    let enum_start = p.find("fn enumerate_staged()").expect("B47 FAIL 缺 enumerate_staged");
-    let enum_end = p.find("fn summarize(").expect("B47 FAIL 缺 summarize");
-    let body = &p[enum_start..enum_end];
-    for needle in ["recorded_node_path", "known_locations_staged", "path_dirs_staged"] {
+    let d_start = p.find("fn detect()").expect("B47 FAIL 缺 detect");
+    let d_end = p.find("/// 探测单个候选").expect("B47 FAIL 缺 try_probe");
+    let body = &p[d_start..d_end];
+
+    // 三处可能阻塞的调用，各自之前必须有 stage()
+    for needle in ["recorded_node_path", "known_locations()", "path_dirs_staged()"] {
         let at = body.find(needle).unwrap_or_else(|| panic!("B47 FAIL 未找到 {}", needle));
-        let before = &body[..at];
         assert!(
-            before.rfind("stage(").is_some(),
+            body[..at].rfind("stage(").is_some(),
             "B47 FAIL {} 之前没有 stage() —— 卡住时会没有任何线索",
             needle
         );
@@ -796,6 +797,31 @@ fn b47_every_blocking_phase_is_staged() {
     assert!(p.contains("HARD_DEADLINE_MS"), "B47 FAIL 缺硬上限（规则二）");
     assert!(p.contains("环境探测超过"), "B47 FAIL 硬上限未产出可读原因");
     eprintln!("B47 PASS every blocking phase is staged");
+}
+
+/// B48：**交错顺序** —— PATH 过滤（唯一需逐盘符系统调用的阶段）必须排在最后。
+///
+/// 为什么关键：若先枚举全部候选再探测，则「PATH 过滤慢/卡」会导致
+/// **连已枚举好的廉价候选都永远试不到** —— 用户本可瞬间命中已知安装落点却完全失败。
+/// 交错后，绝大多数用户（Node 在标准位置）根本不会走到 PATH 过滤。
+#[test]
+fn b48_path_scan_comes_last() {
+    let p = fs::read_to_string(manifest_dir().join("src").join("nodeprobe.rs")).expect("nodeprobe.rs");
+    let d_start = p.find("fn detect()").expect("B48 FAIL 缺 detect");
+    let d_end = p.find("/// 探测单个候选").expect("B48 FAIL 缺 try_probe");
+    let body = &p[d_start..d_end];
+    let i_recorded = body.find("recorded_node_path").expect("B48 FAIL 缺记录路径阶段");
+    let i_known = body.find("known_locations()").expect("B48 FAIL 缺已知落点阶段");
+    let i_path = body.find("path_dirs_staged()").expect("B48 FAIL 缺 PATH 阶段");
+    assert!(i_recorded < i_known, "B48 FAIL 记录路径应在已知落点之前");
+    assert!(i_known < i_path, "B48 FAIL 已知落点应在 PATH 过滤之前（否则会被 PATH 拖累）");
+    // 每个阶段都必须在探测后就地返回（交错，而非先收全再试）
+    let seg_known = &body[i_known..i_path];
+    assert!(
+        seg_known.contains("try_probe"),
+        "B48 FAIL 已知落点阶段没有就地探测（仍是先收全再试）"
+    );
+    eprintln!("B48 PASS path scan comes last");
 }
 
 /// B41：前端**轮询循环**必须有独立于被调方的心跳。
