@@ -26,6 +26,20 @@ fn bootstrap_html() -> String {
         .expect("read bootstrap.html")
 }
 
+/// 取某个函数的**函数体**（从 sig 到下一个顶层 function 或文件末尾）。
+///
+/// ⚠ 为什么不按固定字节长度截取：本仓含大量中文注释，1 汉字 = **3 字节**，
+///   故 `&h[i..i+900]` 实际只覆盖约 300 字符 —— 断言会因此误判（曾真实发生）。
+fn function_body(src: &str, sig: &str) -> String {
+    let start = match src.find(sig) { Some(v) => v, None => return String::new() };
+    let rest = &src[start..];
+    let next = rest[1..]
+        .find("\n  function ")
+        .map(|i| i + 1)
+        .unwrap_or(rest.len());
+    rest[..next].to_string()
+}
+
 fn main_rs() -> String {
     fs::read_to_string(manifest_dir().join("src").join("main.rs")).expect("read main.rs")
 }
@@ -944,9 +958,9 @@ fn b49_mirror_visible_regardless_of_node_state() {
     assert!(h.contains("startMirrorWarmup"), "B49 FAIL 缺镜像预热入口");
     assert!(h.contains("mirror_warmup"), "B49 FAIL 未调用 mirror_warmup");
     assert!(h.contains("mirror_cached"), "B49 FAIL 未读取镜像缓存");
-    // 预热必须在 boot 中启动（与步骤无关）
-    let boot = h.find("function boot()").expect("B49 FAIL 缺 boot");
-    let boot_body = &h[boot..(boot + 900).min(h.len())];
+    // 预热必须在 boot 中启动（与步骤无关）。
+    // ⚠ 用函数边界取体，不要用固定字节长度（中文注释 3 字节/字，会误判）。
+    let boot_body = function_body(&h, "function boot()");
     assert!(boot_body.contains("startMirrorWarmup()"), "B49 FAIL boot 未启动镜像预热");
     // 诊断串必须始终带镜像（含「预热中」这种明确状态，而非 none）
     assert!(h.contains("mirror_npm_best="), "B49 FAIL 诊断缺 mirror_npm_best");
@@ -989,4 +1003,82 @@ fn b52_npm_probe_uses_real_package() {
     // probe_all 必须把空 path 转成真实包名
     assert!(m.contains("if path.is_empty()"), "B52 FAIL probe_all 未处理空 path");
     eprintln!("B52 PASS npm probe uses real package");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// B53：**引导页 JS 必须语法正确** —— 本条来自一次真实事故（我造成的）。
+//
+// 事故：在 diagText() 里加字段时漏了一个逗号，导致整个 `<script>` 块语法错误。
+// 后果：**所有 JS 都不执行** → boot() 从不运行 → 页面永远停在 HTML 静态文案
+//   「正在检测系统环境…」→ 不报错、不推进、诊断三项全 none。
+// 排查代价极高：现象看起来像「探测卡住」，于是反复在 Rust 侧找根因（三轮都找错方向），
+//   而真正的问题是**前端一行 JS 没执行**。
+//
+// 更严重的是：我在提交前**确实跑了** `node --check`，但它失败了，
+//   而我没检查命令输出（`&&` 短路导致成功提示未打印）就继续往下走 —— 于是带着错误发布。
+//
+// 故加此门禁：**把 JS 语法检查变成自动化测试**，不依赖人的注意力。
+// ═══════════════════════════════════════════════════════════════════
+
+/// 提取 HTML 中全部 `<script>` 块的内联内容（跳过带 src 的外部引用）。
+fn inline_scripts(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(i) = rest.find("<script") {
+        let after = &rest[i..];
+        let open_end = match after.find('>') { Some(v) => v, None => break };
+        let tag = &after[..open_end];
+        let body_start = i + open_end + 1;
+        let close_rel = match rest[body_start..].find("</script>") { Some(v) => v, None => break };
+        if !tag.contains("src=") {
+            out.push(rest[body_start..body_start + close_rel].to_string());
+        }
+        rest = &rest[body_start + close_rel + "</script>".len()..];
+    }
+    out
+}
+
+/// 用 node --check 验证 JS 语法；node 不可用时明确 SKIP（不静默通过）。
+fn check_js_syntax(label: &str, js: &str) -> Result<(), String> {
+    let node = if cfg!(windows) { "node.exe" } else { "node" };
+    let dir = std::env::temp_dir().join(format!("dsh-js-check-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let file = dir.join(format!("{}.js", label.replace(|c: char| !c.is_alphanumeric(), "_")));
+    fs::write(&file, js).map_err(|e| format!("写入临时文件失败: {}", e))?;
+    let out = std::process::Command::new(node)
+        .arg("--check")
+        .arg(&file)
+        .output()
+        .map_err(|e| format!("无法运行 node（{}）: {}", node, e))?;
+    let _ = fs::remove_file(&file);
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).to_string())
+    }
+}
+
+#[test]
+fn b53_frontend_js_must_be_syntactically_valid() {
+    let root = manifest_dir().join("bootstrap");
+    let mut checked = 0;
+    for name in ["bootstrap.html", "shell.html"] {
+        let html = fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("B53 FAIL 读取 {} 失败: {}", name, e));
+        let scripts = inline_scripts(&html);
+        assert!(!scripts.is_empty(), "B53 FAIL {} 中未找到内联 <script>", name);
+        for (i, js) in scripts.iter().enumerate() {
+            match check_js_syntax(&format!("{}-{}", name, i), js) {
+                Ok(()) => checked += 1,
+                Err(e) => {
+                    // node 缺失时明确 SKIP（而非静默通过）——否则门禁形同虚设。
+                    if e.contains("无法运行 node") {
+                        eprintln!("B53 SKIP（本机无 node，无法校验 JS 语法）: {}", e.trim());
+                        return;
+                    }
+                    panic!("B53 FAIL {} 第 {} 个 <script> 语法错误:\n{}", name, i + 1, e);
+                }
+            }
+        }
+    }
+    eprintln!("B53 PASS frontend JS valid（校验 {} 个 script 块）", checked);
 }

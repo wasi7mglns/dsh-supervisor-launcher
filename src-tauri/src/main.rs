@@ -1273,6 +1273,25 @@ fn cli_service_plan() -> i32 {
     }
 }
 fn main() {
+    // 启动阶段诊断（**临时**，定位「卡在检测」用）：写入 stderr，任何平台可见。
+    // ══════════════════════════════════════════════════════════════════
+    // 启动里程碑日志（**常开**，落盘到 ~/.dsh/shell/shell.log）。
+    //
+    // 为什么必须是常开能力（真实教训）：引导页卡住时，`shell.log` 若只有
+    //   「壳启动」一行，就**无法区分**这两种截然不同的病因：
+    //     (a) Rust 侧 setup() 从未执行（插件/DBus 层失败）；
+    //     (b) setup() 正常、但前端 JS 从未执行（语法错误 / IPC 失败）。
+    //   两者的修复方向完全相反，而我为此**来回排查了三轮**。
+    //   现在这条轨迹是 always-on 的：打开 shell.log 一眼就能定位到哪一层。
+    //
+    // 成本：每次启动 6 行；shell.log 超过 1MB 自动滚动（见 update::log）。
+    // ══════════════════════════════════════════════════════════════════
+    macro_rules! bt {
+        ($($a:tt)*) => {
+            crate::update::log(&format!("[boot] {}", format!($($a)*)));
+        };
+    }
+    bt!("main enter");
     // 无头自检：镜像测速与选择（用户要求「镜像必须可见」的验证入口）。
     if std::env::args().any(|a| a == "--mirror-plan") {
         std::process::exit(cli_mirror_plan());
@@ -1301,6 +1320,7 @@ fn main() {
         println!("{}", shell_update_plan_text());
         std::process::exit(0);
     }
+    bt!("building app");
     tauri::Builder::default()
         // 单实例管控（2026-09）：同一 user 会话内只允许一个壳实例——重复启动第二实例时
         // 插件自动让新进程退出，回调里唤起既有主窗口（show+focus+导航面板），避免双壳/多壳并存。
@@ -1315,6 +1335,7 @@ fn main() {
         .manage(Mutex::new(RunState::default()))
         .invoke_handler(tauri::generate_handler![node_status, core_status, core_plan, core_apply, guard_start, guard_ready, start_node_install, finish_boot, win_ctl, shell_identity, shell_update_check, shell_update_apply, shell_restart, shell_set_phase, mirror_status, mirror_set, node_latest, mirror_warmup, mirror_cached])
         .setup(|app| {
+            bt!("setup enter");
             // 托盘直发本地 API 的端口：显式 DSH_SUPERVISOR_TRAY_PORT 优先，否则从用户 config.apiPort 解析
             let port: u16 = std::env::var("DSH_SUPERVISOR_TRAY_PORT")
                 .ok().and_then(|p| p.parse().ok()).unwrap_or_else(|| env::api_port());
@@ -1323,7 +1344,9 @@ fn main() {
             // 壳身份初始化（2026-09-11）：写 ~/.dsh/shell/identity.json + shell.log，
             // 并推进「更新护栏」状态（pendingVersion 是否生效 / attempt 计数 / 拉黑）。
             // 必须尽量早执行：即使后续任一环节失败，也留下可诊断的落盘痕迹。
+            bt!("init_identity...");
             let _ = update::init_identity(&app.package_info().version.to_string());
+            bt!("init_identity done");
 
             // 环境判定（2026-09 改）：Node 缺失或低于最低标准(>=22.12, DSH commander 硬门槛) → 引导页安装；
             // 达标（即使不是最新 LTS）→ 直接拉起守卫进入面板，不卡升级。初始 url 即 bootstrap.html。
@@ -1362,6 +1385,7 @@ fn main() {
                 }
             });
 
+            bt!("setup: building tray");
             // ── 托盘 ──
             let show_m = tauri::menu::MenuItem::with_id(app, "show", "显示控制面板", true, None::<&str>)?;
             let start = tauri::menu::MenuItem::with_id(app, "start", "启动 DSH", true, None::<&str>)?;
@@ -1444,4 +1468,5 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running dsh-supervisor-gui");
+    bt!("main exit (run returned)");
 }

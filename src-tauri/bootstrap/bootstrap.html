@@ -307,7 +307,7 @@
           ? (warmMirror.npmBest + '/' + warmMirror.npmLatencyMs + 'ms')
           : (lastMirror && lastMirror.mirror
               ? (lastMirror.mirror + '/' + lastMirror.latencyMs + 'ms')
-              : (warmTimer ? 'warming（预热中）' : 'none（预热未启动或全部不可达）')))
+              : (warmTimer ? 'warming（预热中）' : 'none（预热未启动或全部不可达）'))),
       'mirror_node_best=' + ((warmMirror && warmMirror.nodeBest) || 'none'),
       'mirror_npm_best=' + ((warmMirror && warmMirror.npmBest) || 'none'),
       'mirror_probes=' + (
@@ -720,6 +720,11 @@
   }
 
   function boot() {
+    // ⚠ 临时诊断（验证 iframe IPC）：把关键状态写到**顶层窗口标题**，
+    //   以便在无 GUI 交互的环境（xvfb + xdotool）中读取。
+    //   背景：shell.log 只有一行、identity.json 的 phase 停在 boot ——
+    //   说明引导页的 invoke **从未成功**，但无法区分「core 为 null」与「invoke 失败」。
+
     if (!core) return;
     hideFail();
     hideUpdChoice();

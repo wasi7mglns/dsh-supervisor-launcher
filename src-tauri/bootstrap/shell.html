@@ -86,6 +86,7 @@
     document.getElementById('dragRegion').addEventListener('mousedown', function () { wctl('drag'); });
     var panelUrl = null;
     var retried = 0;
+
     // 引导完成 → 内容区切到面板
     if (evt) {
       evt.listen('shell:goto-panel', function (e) {

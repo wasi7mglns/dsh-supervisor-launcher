@@ -6,7 +6,102 @@
 
 （下一版本待记）
 
-## [1.0.8]（2026-09-11）
+## [1.0.7]（2026-09-11）
+
+### 修复：引导页 JS 语法错误导致引导完全静默（本轮真正的根因）+ 把真机验证变成常规手段
+
+#### 一、决定性发现：一个逗号让整个引导页失效
+
+在 diagText() 里新增字段时**漏了一个逗号**：
+
+```js
+              : (warmTimer ? 'warming（预热中）' : 'none（预热未启动或全部不可达）')))   <- 缺逗号
+      'mirror_node_best=' + ...
+```
+
+**后果是整段其 script 语法错误 -> 所有 JS 都不执行 -> boot() 从不运行**，
+于是页面永远停在 HTML 里的静态文案「正在检测系统环境…」：
+
+- **不报错**（没有任何 JS 在执行，也就没人报错）；
+- **不推进**（boot() 未被调用）；
+- **诊断全 none**（diagText() 也没执行）；
+- Rust 侧日志只有「壳启动」一行（前端从未调用 shell_set_phase）。
+
+这个现象与「探测卡住」**表面完全一致**，但病因截然相反 —— 一个在前端一行 JS，
+一个在 Rust 探测逻辑。我因此在 Rust 侧来回排查了三轮。
+
+#### 二、更该反省的：我提交前明明跑了检查，却没看结果
+
+我在提交前执行了 node --check，它**失败了**，但命令用了 && 串联，
+失败导致后续「成功提示」未打印 —— 而**我没有核对输出就继续往下走**。
+
+教训：**「跑过检查」不等于「检查通过」。必须核对结果，且最好是自动化的。**
+故本次把 JS 语法检查固化为门禁 B53（见下）。
+
+#### 三、方法论的突破：用真实 GUI 验证，而不是只查源码
+
+此前我一直在「读代码 + 静态断言」的层面验证，而本轮改用**真实运行**：
+
+```bash
+Xvfb :95 -screen 0 1400x900x24 &
+dbus-run-session -- bash -c "HOME=$WORK DSH_BOOT_TRACE=1 ./dsh-supervisor-gui"
+# 然后读 $WORK/.dsh/shell/shell.log 看 phase 推进
+```
+
+修复前 shell.log 只有 1 行；修复后：
+
+```
+[boot] main enter
+[boot] building app
+[boot] setup enter
+[boot] init_identity done
+[boot] setup: building tray
+壳启动 v1.0.7
+阶段 -> env                <- 检测环境 OK
+阶段 -> shell-update       <- 桌面版本 OK
+阶段 -> kernel             <- 内核版本 OK
+阶段 -> guard              <- 守卫就绪 OK
+守卫服务定义: 已建立并启用 ~/.config/systemd/user/dsh-supervisor.service
+```
+
+**这才是「链路是否真的通」的可核对证据**，而不是我的判断。
+
+#### 四、把启动里程碑日志固化为常开能力（而非临时脚手架）
+
+shell.log 若只有「壳启动」一行，**无法区分**两种截然不同的病因：
+
+| 现象 | 病因 | 修复方向 |
+|---|---|---|
+| setup 从未执行 | Rust 侧插件/DBus 层失败 | 查插件初始化 |
+| setup 正常但前端无日志 | 前端 JS 未执行 / IPC 失败 | 查前端 |
+
+两者方向相反，而我为此来回三轮。现改为**常开**：
+main enter -> building app -> setup enter -> init_identity done -> building tray，
+每次启动 6 行（shell.log 超 1MB 自动滚动），打开日志一眼即可定位到**哪一层**。
+
+> 成本极低、收益极高：这是用一次真实事故换来的诊断能力。
+
+#### 五、新增门禁 B53：前端 JS 必须语法正确
+
+提取 HTML 全部内联 script，逐个跑 node --check；
+node 缺失时**明确 SKIP**（而非静默通过 —— 否则门禁形同虚设）。
+失败信息直接打印语法错误与行号，**不依赖人的注意力**。
+
+#### 六、版本号合并（用户要求）
+
+原计划分两次发布（1.0.7 / 1.0.8），但两者**均未发布**。
+按用户要求「不要为每个修复递增版本号」，已**合并为单一 1.0.7**：
+tauri.conf.json / Cargo.toml / Cargo.lock 三处一致，CHANGELOG 两段合并为一段。
+
+#### 验证（本轮全部用真实运行）
+
+- **真实 GUI（Xvfb + 全新 dbus session）**：引导链路完整推进至 guard，
+  **P0 服务定义真实建立**（systemctl --user unit 落盘），镜像选出 mirrors.huaweicloud.com；
+- 壳测试 **66 项全通过**（bootstrap_flow 52 + updater_artifacts 6 + 单元 8，含新增 B53）。
+
+
+# 本版合并了原计划分两次发布的修复（1.0.7 / 1.0.8）——
+# 两者均未发布，故合并为单一版本，避免无意义的版本号膨胀。
 
 ### 修复：镜像「一等公民」化 + 数据流审计（用户质疑驱动：能力没丢，可见性丢了）
 
@@ -114,8 +209,6 @@ npm  选中: https://registry.npmmirror.com (290 ms)
 
 - 壳测试 **65 项全通过**（bootstrap_flow 51 + updater_artifacts 6 + 单元 8）；
 - `--mirror-plan`：Node 10 源全可达、npm 6 源全可达，正确选出最快源。
-
-## [1.0.7]（2026-09-11）
 
 ### 修复：卡住的第三层根因 —— 候选枚举落在进度上报之外（诊断三项全空的真正原因）
 
