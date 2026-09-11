@@ -3,7 +3,7 @@
 //! == 为什么需要它（用户指正：「壳是乱的，没有架构」）==
 //!
 //! 改造前实测：平台分支 **43 处散落在 8 个文件**（`node.rs` 11 / `main.rs` 10 /
-//! `service.rs` 9 / `env.rs` 6 / `bounded.rs` 2 / `nodeprobe.rs` 2 / `update.rs` 2 / `core.rs` 1）。
+//! 原 `service.rs` 9 / `env.rs` 6 / `bounded.rs` 2 / `nodeprobe.rs` 2 / `update.rs` 2 / `core.rs` 1）。
 //! 加一个平台要翻 8 个文件；查一个平台 bug 要猜它在哪一层。
 //!
 //! 对照：内核（JS）同口径 67 处平台判断，其中 **60 处在 `platform/os/`（90%）** ——

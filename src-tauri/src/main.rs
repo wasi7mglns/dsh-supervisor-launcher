@@ -118,7 +118,7 @@ fn run_install(app: &tauri::AppHandle) -> Result<(String, String), String> {
 // ── 守卫服务的「启停」已迁入 platform 层（2026-09-11）──
 //
 // 此处原定义 start_guard_service / stop_guard_service（含 8 份 #[cfg]），
-// 与 service.rs 的「服务定义」（另 4 份 #[cfg]）分居两层 —— 同一概念的 per-OS
+// 与**原** service.rs 的「服务定义」（另 4 份 #[cfg]，该文件已并入本层）分居两层 —— 同一概念的 per-OS
 // 知识被切开，加一个平台要改两处**不同层**，且很容易只改一处。
 //
 // 现统一在 platform::service::ServiceControl：**定义与启停永远是同一个对象**。
