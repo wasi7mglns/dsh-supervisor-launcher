@@ -396,6 +396,22 @@
   }
 
   // 失败态：显示原因 + 重试 + 诊断（K7——失败不再死锁在引导页）
+  // 结构化错误 → 可读文本（2026-09-11）。
+  //
+  // 壳的 IPC 边界已改为返回 ShellError（`{kind, cause, hint, ...}`），
+  // 前端拿到的**不再是字符串**。本函数把两种形态统一成一句话：
+  //   · 字符串（内部/旧路径）→ 原样返回；
+  //   · 结构化对象 → 具体原因 + 后端给的**可操作建议**（`hint`）。
+  // 单独提出来是必要的：直接把对象拼进字符串会显示 `[object Object]`。
+  function errText(e) {
+    if (e === null || e === undefined) return '未知错误';
+    if (typeof e === 'string') return e;
+    if (e.kind) {
+      var detail = e.cause || e.stage || e.kind;
+      return e.hint ? (detail + '；' + e.hint) : detail;
+    }
+    return String(e.message || e);
+  }
   function fail(msg) {
     lastError = msg;
     status('启动未完成');
@@ -617,7 +633,7 @@
         }).catch(function (e) {
           if (settled) return;
           settled = true;
-          fail('环境检测异常：' + e);
+          fail('环境检测异常：' + errText(e));
           resolve(null);
         });
       }
@@ -758,7 +774,7 @@
       status('内核已是最新（v' + p.installed + '）' + (mt ? ' · 源 ' + mt : ''));
       coreTo = p.installed;
       return wait(300).then(stepCoreDone);
-    }).catch(function (e) { fail('内核版本检查失败：' + e); });
+    }).catch(function (e) { fail('内核版本检查失败：' + errText(e)); });
   }
 
   // 执行安装/升级/回退；成功返回 true，失败走 fail() 并返回 false
@@ -779,7 +795,7 @@
         fail('内核已安装 v' + r.version + '，但检测到的是 v' + (st.version || '未知') + '（安装前缀不一致）');
         return false;
       });
-    }).catch(function (e) { fail('内核安装异常：' + e); return false; });
+    }).catch(function (e) { fail('内核安装异常：' + errText(e)); return false; });
   }
 
   function stepCoreDone() {
@@ -804,7 +820,7 @@
       if (r && r.__error) return guardFailed('守卫启动异常：' + r.__error);
       if (!r || r.ok !== true) return guardFailed('守卫启动失败：' + ((r && r.error) || '未知'));
       return stepGuardReady(0);
-    }).catch(function (e) { return guardFailed('守卫启动异常：' + e); });
+    }).catch(function (e) { return guardFailed('守卫启动异常：' + errText(e)); });
   }
   function stepGuardReady(n) {
     if (n === 0) status('等待守卫就绪…');
@@ -829,7 +845,7 @@
         if (!r || r.ok !== true) { fail(msg + '；回退亦失败：' + ((r && r.error) || '未知')); return null; }
         coreTo = coreFrom; // 已回退：再次失败将直接进入失败态（不再循环回退）
         return withTimeout(core.invoke('guard_start'), GUARD_START_BUDGET_MS, '守卫启动超时').then(function () { return stepGuardReady(0); });
-      }).catch(function (e) { fail(msg + '；回退异常：' + e); return null; });
+      }).catch(function (e) { fail(msg + '；回退异常：' + errText(e)); return null; });
     }
     fail(msg);
     return null;
@@ -868,7 +884,7 @@
     // 镜像预热**与引导并行**（后台，不阻塞）：任何步骤都可展示当前镜像。
     startMirrorWarmup();
     // 从**环境检测**开始（本地快检查在前）；随后 Node → 桌面版本 → 内核 → 守卫 → 控制面板。
-    stepEnv().catch(function (e) { fail('引导异常：' + e); });
+    stepEnv().catch(function (e) { fail('引导异常：' + errText(e)); });
   }
 
   // 交互：桌面版本失败选择页（用户已确认的定案）
@@ -877,13 +893,13 @@
   $('btnUpdRetry').addEventListener('click', function () {
     hideUpdChoice();
     status('正在重试桌面版本更新…');
-    stepShellApply().catch(function (e) { showUpdChoice('重试异常：' + e); });
+    stepShellApply().catch(function (e) { showUpdChoice('重试异常：' + errText(e)); });
   });
   $('btnUpdSkip').addEventListener('click', function () {
     hideUpdChoice();
     status('已选择继续使用当前版本');
     try { if (core) core.invoke('shell_set_phase', { phase: 'shell-update-skipped' }); } catch (e) {}
-    stepCorePlan().catch(function (e) { fail('引导异常：' + e); });
+    stepCorePlan().catch(function (e) { fail('引导异常：' + errText(e)); });
   });
 
   // 交互：跳过（网络步骤的即时出口）

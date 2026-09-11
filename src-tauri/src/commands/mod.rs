@@ -15,6 +15,7 @@ use std::sync::Mutex;
 // 需要这些 trait 在作用域内 —— 不是「多余的 import」。
 use tauri::{Emitter, Manager};
 
+use crate::error::{ShellError, ShellResult};
 use crate::RunState;
 
 
@@ -134,7 +135,7 @@ pub async fn node_latest() -> serde_json::Value {
 /// 引导页走完所有检测步骤后调用：进入面板（go_panel —— emit 守卫 URL，壳框架 iframe 切换）。
 /// 由引导页 JS 在展示完整启动过程后触发，避免步骤一闪而过无感知。
 #[tauri::command]
-pub fn finish_boot(app: tauri::AppHandle) -> Result<(), String> {
+pub fn finish_boot(app: tauri::AppHandle) -> ShellResult<()> {
     crate::domain::windowing::go_panel(&app, false); // 引导完成：URL 变化即导航
     Ok(())
 }
@@ -148,7 +149,7 @@ pub fn finish_boot(app: tauri::AppHandle) -> Result<(), String> {
 ///
 /// 原则：**一次 panic 不应让整个应用的功能不可恢复地失效。**
 #[tauri::command]
-pub fn start_node_install(state: tauri::State<Mutex<RunState>>, app: tauri::AppHandle) -> Result<(), String> {
+pub fn start_node_install(state: tauri::State<Mutex<RunState>>, app: tauri::AppHandle) -> ShellResult<()> {
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
     if st.busy { return Ok(()); }
     st.busy = true;
@@ -228,11 +229,11 @@ pub async fn core_status(app: tauri::AppHandle) -> serde_json::Value {
 /// 内核版本规划（引导页决策输入）：本地已装版本 + 远端最高版本 + 动作(install/upgrade/none)。
 /// 网络调用放线程池，不阻塞 UI 线程。
 #[tauri::command]
-pub async fn core_plan(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+pub async fn core_plan(app: tauri::AppHandle) -> ShellResult<serde_json::Value> {
     let installed = crate::domain::coreloc::locate_core(&app).and_then(|b| crate::core::installed_version(&b));
     let pkg = crate::core::package_name()?;
     let latest = tauri::async_runtime::spawn_blocking(move || crate::core::latest_version(&pkg))
-        .await.map_err(|e| e.to_string())?;
+        .await.map_err(|e| ShellError::ipc(e.to_string()))?;
     Ok(crate::core::build_plan(installed, latest))
 }
 
@@ -241,7 +242,7 @@ pub async fn core_plan(app: tauri::AppHandle) -> Result<serde_json::Value, Strin
 ///   - 逐个镜像回退；
 ///   - 如实回传成败（含退出码/stderr）——供引导页做「升级失败→回退旧版」判断，绝不吞错。
 #[tauri::command]
-pub async fn core_apply(app: tauri::AppHandle, version: Option<String>) -> Result<serde_json::Value, String> {
+pub async fn core_apply(app: tauri::AppHandle, version: Option<String>) -> ShellResult<serde_json::Value> {
     let pkg = crate::core::package_name()?;
     let prefix = crate::domain::coreloc::locate_core(&app).and_then(|b| crate::core::global_prefix_for(&b));
     let origins = crate::core::registry_origins();
@@ -250,7 +251,7 @@ pub async fn core_apply(app: tauri::AppHandle, version: Option<String>) -> Resul
         _ => {
             let p = pkg.clone();
             let r = tauri::async_runtime::spawn_blocking(move || crate::core::latest_version(&p))
-                .await.map_err(|e| e.to_string())?;
+                .await.map_err(|e| ShellError::ipc(e.to_string()))?;
             match r {
                 Ok((v, _)) => v,
                 Err(e) => return Ok(serde_json::json!({"ok": false, "stage": "resolve", "error": e})),
@@ -269,7 +270,7 @@ pub async fn core_apply(app: tauri::AppHandle, version: Option<String>) -> Resul
             }
         }
         Err(last)
-    }).await.map_err(|e| e.to_string())?;
+    }).await.map_err(|e| ShellError::ipc(e.to_string()))?;
     Ok(match res {
         Ok((origin, out)) => serde_json::json!({
             "ok": true, "version": target, "origin": origin, "output": out,
@@ -281,7 +282,7 @@ pub async fn core_apply(app: tauri::AppHandle, version: Option<String>) -> Resul
 
 /// 引导页驱动：申请所有者启动守卫（唯一启停权威，见 crate::platform::service::start）。阻塞放线程池。
 #[tauri::command]
-pub async fn guard_start(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+pub async fn guard_start(app: tauri::AppHandle) -> ShellResult<serde_json::Value> {
     // ⚠ 必须有界（2026-09-11 架构修复）。
     //
     // 旧实现：`spawn_blocking(ensure_guard).await` —— **无超时**。
@@ -299,15 +300,17 @@ pub async fn guard_start(app: tauri::AppHandle) -> Result<serde_json::Value, Str
     let task = tauri::async_runtime::spawn_blocking(move || crate::domain::guardctl::ensure_guard(&a));
     let r = match tokio::time::timeout(GUARD_TOTAL_BUDGET, task).await {
         Ok(Ok(inner)) => inner,
-        Ok(Err(e)) => Err(format!("守卫启动任务异常: {}", e)),
+        Ok(Err(e)) => Err(format!("守卫启动任务异常: {}", e).into()),
         Err(_) => Err(format!(
             "守卫启动超时（{} 秒未完成）。可能原因：服务管理器无响应，或守卫进程无法启动。请用 dsh-supervisor-gui --service-plan 查看服务定义状态。",
             GUARD_TOTAL_BUDGET.as_secs()
-        )),
+        ).into()),
     };
     Ok(match r {
         Ok(()) => serde_json::json!({"ok": true}),
-        Err(e) => serde_json::json!({"ok": false, "error": e}),
+        // ⚠ 响应体里的 `error` 保持**字符串**：前端多处做 `'...' + e` 拼接，
+        //   若此处塞入结构化对象会显示成 [object Object]。
+        Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
     })
 }
 
@@ -336,19 +339,19 @@ pub async fn guard_ready() -> serde_json::Value {
 /// 前端 WindowTitlebar 按钮 → invoke("win_ctl", {action})：
 ///   "minimize" / "toggle-maximize" / "hide"（关闭按钮 = 隐藏到托盘，与 CloseRequested 语义一致）。
 #[tauri::command]
-pub fn win_ctl(app: tauri::AppHandle, action: String) -> Result<(), String> {
+pub fn win_ctl(app: tauri::AppHandle, action: String) -> ShellResult<()> {
     let win = app.get_webview_window("main").ok_or("主窗口不存在")?;
     match action.as_str() {
-        "minimize" => win.minimize().map_err(|e| e.to_string()),
+        "minimize" => win.minimize().map_err(|e| ShellError::ipc(e.to_string())),
         "toggle-maximize" => {
             if win.is_maximized().unwrap_or(false) {
-                win.unmaximize().map_err(|e| e.to_string())
+                win.unmaximize().map_err(|e| ShellError::ipc(e.to_string()))
             } else {
-                win.maximize().map_err(|e| e.to_string())
+                win.maximize().map_err(|e| ShellError::ipc(e.to_string()))
             }
         }
-        "maximize" => win.maximize().map_err(|e| e.to_string()),
-        "unmaximize" => win.unmaximize().map_err(|e| e.to_string()),
+        "maximize" => win.maximize().map_err(|e| ShellError::ipc(e.to_string())),
+        "unmaximize" => win.unmaximize().map_err(|e| ShellError::ipc(e.to_string())),
         "hide" => {
             let _ = win.hide();
             Ok(())
@@ -356,9 +359,9 @@ pub fn win_ctl(app: tauri::AppHandle, action: String) -> Result<(), String> {
         "drag" => {
             // 显式窗口拖动（Linux WebKitGTK drag-region 属性常不生效的可靠替代）：
             // 前端标题栏拖动区 mousedown → invoke win_ctl drag → 走 Rust start_dragging
-            win.start_dragging().map_err(|e| e.to_string())
+            win.start_dragging().map_err(|e| ShellError::ipc(e.to_string()))
         }
-        _ => Err(format!("不支持的窗口动作: {}（minimize/toggle-maximize/maximize/unmaximize/hide/drag）", action)),
+        _ => Err(format!("不支持的窗口动作: {}（minimize/toggle-maximize/maximize/unmaximize/hide/drag）", action).into()),
     }
 }
 
@@ -413,20 +416,20 @@ pub fn shell_set_phase(phase: String) {
 
 /// 读取当前镜像配置 + 并行探测延迟（供引导页展示与选择）。
 #[tauri::command]
-pub async fn mirror_status() -> Result<serde_json::Value, String> {
+pub async fn mirror_status() -> ShellResult<serde_json::Value> {
     let m = crate::mirror::load();
     let node_probes = tauri::async_runtime::spawn_blocking(|| {
         let m = crate::mirror::load();
         crate::mirror::probe_all(&m.node, "index.json")
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| ShellError::ipc(e.to_string()))?;
     let npm_probes = tauri::async_runtime::spawn_blocking(|| {
         let m = crate::mirror::load();
         crate::mirror::probe_all(&m.npm, "")
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| ShellError::ipc(e.to_string()))?;
     let fmt = |v: Vec<crate::mirror::Probe>| {
         v.into_iter()
             .map(|p| serde_json::json!({ "source": p.source, "ok": p.ok, "latencyMs": p.latency_ms }))
@@ -447,7 +450,7 @@ pub async fn mirror_status() -> Result<serde_json::Value, String> {
 /// 保存用户自定义镜像（引导页失败时的自助出口）。
 /// 入参为 URL 列表；保存后使缓存失效，并在 npm 类型时立即导出给内核（若已安装）。
 #[tauri::command]
-pub fn mirror_set(kind: String, urls: Vec<String>) -> Result<serde_json::Value, String> {
+pub fn mirror_set(kind: String, urls: Vec<String>) -> ShellResult<serde_json::Value> {
     let mut m = crate::mirror::load();
     let list: Vec<String> = urls
         .into_iter()
@@ -459,14 +462,14 @@ pub fn mirror_set(kind: String, urls: Vec<String>) -> Result<serde_json::Value, 
     }
     for u in &list {
         if !(u.starts_with("http://") || u.starts_with("https://")) {
-            return Err(format!("镜像地址必须以 http(s):// 开头：{}", u));
+            return Err(format!("镜像地址必须以 http(s):// 开头：{}", u).into());
         }
     }
     match kind.as_str() {
         "node" => m.node = list.clone(),
         "npm" => m.npm = list.clone(),
         "shell" => m.shell = list.clone(),
-        _ => return Err(format!("未知镜像类型: {}（支持 node / npm / shell）", kind)),
+        _ => return Err(format!("未知镜像类型: {}（支持 node / npm / shell）", kind).into()),
     }
     m.checked_at = None; // 使缓存失效，下次重新测速
     if kind == "npm" {
@@ -485,7 +488,7 @@ pub fn mirror_set(kind: String, urls: Vec<String>) -> Result<serde_json::Value, 
 /// 返回 { ok, available, current, latest, notes, skipped?, reason? }
 /// 语义：跳过的原因一律**不阻断启动**（有界失败即放行）。
 #[tauri::command]
-pub async fn shell_update_check(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+pub async fn shell_update_check(app: tauri::AppHandle) -> ShellResult<serde_json::Value> {
     let cur = app.package_info().version.to_string();
     let (should, reason) = crate::update::should_check(&cur);
     if !should {
@@ -542,7 +545,7 @@ pub async fn shell_update_check(app: tauri::AppHandle) -> Result<serde_json::Val
 /// 下载并安装更新（minisign 验签在插件内强制执行）。
 /// 成功后**不自动重启**——由引导页统一调用 shell_restart（便于先告知用户）。
 #[tauri::command]
-pub async fn shell_update_apply(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+pub async fn shell_update_apply(app: tauri::AppHandle) -> ShellResult<serde_json::Value> {
     crate::update::set_phase("shell-update-download");
     // 下载需要长超时；但 check 不能等那么久 → check 单独用 tokio 包短超时。
     let updater = crate::shell_updater(&app, SHELL_DOWNLOAD_TIMEOUT)?;
