@@ -1428,3 +1428,107 @@ fn g3_main_rs_stays_assembly_only() {
     assert!(cdir.join("mod.rs").is_file(), "G3 FAIL 缺少 src/commands/mod.rs");
     eprintln!("G3 PASS main.rs is assembly-only ({} lines)", n);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// G5：前端脚本必须**逐个**语法正确（不变量 F1）
+//
+// == 背景（一次真实的静默死亡）==
+//
+// `bootstrap.html` 的单个 `<script>` 缺一个逗号 → **整块语法错误** →
+// 该块内**所有** JS 都不执行 → 页面停在静态文案「正在检测系统环境…」，
+// 不报错、不推进、诊断串每一项都是 none。
+//
+// 教训：**「整页一个语法检查」不够** —— 必须逐块检查，
+// 才能定位到「哪一个块坏了」，也才能在拆分为多文件后继续有效。
+//
+// == 断言 ==
+//   G5-a  每个内联 <script> 块独立通过 `node --check`
+//   G5-b  F2：必须注册全局 onerror / unhandledrejection
+//   G5-c  F3：IPC 不可用时必须**明确报错**（不得静默停住）
+//   G5-d  需要 IPC 的页面存在可见的致命错误容器（错误能被人看见）
+// ═══════════════════════════════════════════════════════════════════════════
+#[test]
+fn g5_frontend_scripts_syntax_and_error_handling() {
+    use std::process::Command;
+
+    let pages = ["bootstrap.html", "shell.html"];
+    let mut checked = 0usize;
+    let mut all_inline = String::new();
+
+    for page in pages {
+        let path = manifest_dir().join("bootstrap").join(page);
+        let html = fs::read_to_string(&path).unwrap_or_else(|_| panic!("G5 FAIL 缺少 {}", page));
+
+        // 提取内联 script 块（跳过带 src 的）
+        let mut blocks: Vec<String> = Vec::new();
+        let mut rest = html.as_str();
+        while let Some(i) = rest.find("<script") {
+            let after = &rest[i..];
+            let Some(gt) = after.find('>') else { break };
+            let attrs = &after[..gt];
+            let body_start = i + gt + 1;
+            let Some(close) = rest[body_start..].find("</script>") else { break };
+            let body = &rest[body_start..body_start + close];
+            if !attrs.contains("src") {
+                blocks.push(body.to_string());
+            }
+            rest = &rest[body_start + close + "</script>".len()..];
+        }
+
+        for (n, b) in blocks.iter().enumerate() {
+            all_inline.push_str(b);
+            // 写临时文件做 node --check（无 node 时跳过，不让门禁在无 Node 环境假红）
+            let tmp = std::env::temp_dir().join(format!("g5-{}-{}.js", page, n));
+            if fs::write(&tmp, b).is_err() {
+                continue;
+            }
+            match Command::new("node").arg("--check").arg(&tmp).output() {
+                Ok(o) => {
+                    assert!(
+                        o.status.success(),
+                        "G5 FAIL {} 的内联 script #{} 语法错误（该块内所有 JS 都不会执行）：\n{}",
+                        page,
+                        n,
+                        String::from_utf8_lossy(&o.stderr)
+                    );
+                    checked += 1;
+                }
+                Err(_) => {
+                    // node 不可用：跳过语法检查，但**其余断言仍然执行**
+                    eprintln!("G5 SKIP {} #{} 语法检查（无 node）", page, n);
+                }
+            }
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+
+    assert!(checked > 0, "G5 FAIL 未检查到任何内联 script 块（提取逻辑可能失效）");
+
+    // G5-b F2：全局错误上报
+    assert!(
+        all_inline.contains("addEventListener(\"error\"")
+            || all_inline.contains("addEventListener('error'")
+            || all_inline.contains("window.onerror"),
+        "G5 FAIL 前端未注册全局 error 处理器（不变量 F2：静默死亡必须变成可见）"
+    );
+    assert!(
+        all_inline.contains("unhandledrejection"),
+        "G5 FAIL 前端未注册 unhandledrejection 处理器（不变量 F2）"
+    );
+
+    // G5-c F3：IPC 不可用时明确报错
+    assert!(
+        all_inline.contains("IPC 不可用") || all_inline.contains("__TAURI_INTERNALS__"),
+        "G5 FAIL 前端无 IPC 可用性自检（不变量 F3：不得静默停住）"
+    );
+
+    // G5-d 可见的错误容器
+    let bootstrap = fs::read_to_string(manifest_dir().join("bootstrap").join("bootstrap.html"))
+        .unwrap_or_default();
+    assert!(
+        bootstrap.contains("id=\"fatal\""),
+        "G5 FAIL bootstrap.html 缺少可见的致命错误容器（#fatal）—— 错误必须能被人看见"
+    );
+
+    eprintln!("G5 PASS {} inline script blocks checked, F2/F3 present", checked);
+}

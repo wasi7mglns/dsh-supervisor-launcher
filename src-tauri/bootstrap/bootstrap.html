@@ -113,6 +113,13 @@
 </style>
 </head>
 <body>
+  <!-- 致命错误横幅（不变量 F2/F3）：全局 onerror / unhandledrejection 与启动自检显示它。
+       默认隐藏；一旦显示即说明界面已无法继续，并给出可复制的具体原因。 -->
+  <div id="fatal" style="display:none;position:fixed;left:0;right:0;top:0;z-index:9999;
+       background:#7f1d1d;color:#fff;padding:10px 14px;font:13px/1.5 system-ui,sans-serif;
+       border-bottom:2px solid #dc2626">
+    <b>桌面壳遇到错误</b>：<span id="fatalText"></span>
+  </div>
   <div id="titlebar">
     <div class="tb-drag" id="dragRegion" data-tauri-drag-region="deep"></div>
     <div class="tb-btns">
@@ -223,6 +230,49 @@
   // ═══════════════════════════════════════════════════════════════════
   var core = (window.__TAURI__ && window.__TAURI__.core) || null;
   var evt = (window.__TAURI__ && window.__TAURI__.event) || null;
+
+  // 全局错误上报（2026-09-11，不变量 F2）
+  //
+  // 为什么必须有：本项目发生过一次静默死亡 ——
+  //   bootstrap.html 的 <script> 里缺一个逗号 → 整个块语法错误 →
+  //   所有 JS 都不执行 → 页面停在静态文案「正在检测系统环境…」，
+  //   不报错、不推进、诊断串每一项都是 none。用户与开发者都只能猜。
+  //
+  // 全局处理器把「静默」变成「可见」：
+  //   · 任何未捕获错误 / 未处理的 Promise 拒绝 → 显示一条可见横幅；
+  //   · 同时尽力经 shell_set_phase 落 shell.log（IPC 不可用则仅横幅）。
+  //
+  // 注意：本处理器自身必须在任何可能抛错的代码之前注册；
+  //   但它无法捕获「本 script 块的语法错误」（那会让整块不执行）；
+  //   语法错误由门禁 G5 拦截（逐文件 node --check）。
+  var fatalShown = false;
+  function showFatal(text) {
+    if (fatalShown) return;
+    fatalShown = true;
+    try {
+      var el = document.getElementById("fatal");
+      if (el) {
+        el.style.display = "block";
+        var t = document.getElementById("fatalText");
+        if (t) t.textContent = String(text);
+      }
+      if (core && core.invoke) {
+        try { core.invoke("shell_set_phase", { phase: "error" }); } catch (e) {}
+      }
+    } catch (e) {}
+  }
+  window.addEventListener("error", function (e) {
+    var where = (e && e.filename ? e.filename + ":" + e.lineno : "unknown");
+    showFatal("界面脚本错误（" + where + "）：" + ((e && e.message) || "unknown"));
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    var r = e && e.reason;
+    showFatal("未处理的异步错误：" + ((r && (r.message || r)) || "unknown"));
+  });
+  // 启动自检（不变量 F3）：IPC 不可用时必须明确报错，不得静默停住。
+  if (!core || !core.invoke) {
+    showFatal("Tauri IPC 不可用：本页面必须在主帧中加载（需要 IPC 的页面不能放在 iframe 内）。");
+  }
 
   // ── 窗口栏（窗口 decorations:false，拖动与按钮由页面提供）──
   (function () {
