@@ -152,11 +152,11 @@ ManagedRegistry.heartbeat(5000)                objects.js:289-324
 |---|---|---|---|
 | `config.json` | ✅ 内核 | ✅（`supervisor.js:735-750`）| ❌ |
 | `runtime.json` | ✅ 壳 | ❌ 直接 `fs::write`（`node.rs:387`）| ❌ |
-| `registry.json` | ⚠️ **壳写但只在手动改镜像时**（`main.rs:1079` 是**全仓唯一调用点**）| ✅（`mirror.rs:213` tmp+rename）| ❌ |
+| `registry.json` | ⚠️ **壳写，2 个调用点**（`node.rs:178` 于 `latest_lts()` 内 / `main.rs:1079` 于手动改镜像）—— 但**只写 `origins`**，不写 `catalog`/`probe` | ✅（`mirror.rs:213` tmp+rename）| ❌ |
 | `identity.json` | ✅ 壳 | ✅（`update.rs:write_json` tmp+rename）| ❌ |
 | `update-journal.json` | ✅ 内核 | ✅（`domains/shell/index.js:34-40`）| ❌ |
 
-→ **契约面存在的三个结构缺口**：① `registry.json` 基本没在跑；② 全部无 schema 版本；③ `runtime.json` 非原子写。
+→ **契约面的三个结构缺口**：① `registry.json` **内容不完整**（只有 `origins`，无 `catalog` 与 `probe` 规格 → 两侧仍会选到不同的源；且 `latest_lts()` 失败时不导出）；② 全部无 schema 版本；③ `runtime.json` 非原子写。
 
 ---
 
@@ -456,7 +456,7 @@ domain/contract/
 }
 ```
 
-### 18.2 投放时机（修「基本没在跑」）
+### 18.2 投放时机（补齐内容 + 补齐时机）
 
 ```
 壳启动              → 导出（契约缺失或 schema 过期时）
@@ -535,7 +535,7 @@ bootstrap/
 | # | 动作 | 验收 |
 |---|---|---|
 | D1 | 建 `domain/contract/`，`registry.json` 升 schema=2（含 catalog/selected/probe）| 内核实测能读 |
-| D2 | **壳启动即导出**（修「只在手动改镜像时导出」）| 全新 HOME 首启后文件存在 |
+| D2 | **壳启动即导出，且携带 `catalog` + `probe`**（现仅在 `latest_lts()` 成功时导出，且内容不全）| 全新 HOME 首启后文件存在且含三字段 |
 | D3 | 内核 `dist` 的 6 源副本 → **最小兜底**（2 源）；`config.js` 同理 | 内核侧副本 < 10 行 |
 | D4 | 内核按契约 `probe` 规格复测（修 O2 选源不一致）| 两侧选源一致（同机同刻）|
 | D5 | 内核 `env-catalog` 采用 **v22.12 门槛**（修 O4）| 面板不再谎报「环境就绪」|
@@ -618,3 +618,398 @@ bootstrap/
 3. **K1（daemon 路径全断）是本次审计最严重的发现**，且它**不在**任何既有测试覆盖内 —— 说明「测试绿」不等于「功能通」。
 4. 本次审计中，**子代理报告与我亲自复核的结论一致**（K1 已用 node 实测确认路径 MISS）。
 5. **未确认项**：壳在 macOS/Windows 上的真实运行行为（本机为 Linux，`--platform-matrix` 需三平台 CI 才能验证）；发行态 `build-launcher.sh` 之外的打包路径（`release-core.sh`）是否另有处理。
+
+---
+
+# 第七部分　迁移清单（逐项：从内核到壳）
+
+> 这是**可执行清单**：每项给出「内核侧位置与当前形态 → 壳侧目标位置与形态 → 内核侧改成什么 → 验收断言」。
+> 已逐行核对行号（2026-09-11）。
+
+## 26. 总览：真正要搬的东西只有 6 项
+
+| # | 项 | 方向 | 内核侧行数 | 壳侧目标 | 内核侧最终形态 |
+|---|---|---|---|---|---|
+| **M1** | npm 镜像目录（6 URL × **3 副本**）| 壳拥有 → 内核消费 | **约 20 行**（3 处）| `mirror.rs` 已有，补「导出全集」| 删除副本，留 **2 条最小兜底** |
+| **M2** | 镜像**探测方法**（选源不一致的根因）| 壳定义 → 内核照做 | `_probeRegistry` **7 行** | `mirror.rs:237-247` 已有 | 按契约 spec 探测 |
+| **M3** | 镜像**选择结果**（避免两侧各测一遍）| 壳投放 → 内核优先用 | `selectRegistry` 27 行（保留）| `warmup_async` 已有 | 优先读契约，过期才复测 |
+| **M4** | Node **最低门槛**（内核谎报就绪的根因）| 壳定义 → 内核采用 | `env-catalog.js` 判据 | `node.rs MIN_NODE` 已是权威 | 增加 requiredVersion 判定 |
+| **M5** | 版本**校验/比较语义**（实测 3 处分歧）| 规格共享（测试向量）| `VERSION_RE` + `semverCompare` | `core.rs` 已有 | 两侧跑同一向量 |
+| **M6** | **有界执行纪律**（反方向：内核向壳学）| 内核侧修 | `platform/exec.js` **零引用** | `bounded.rs` + **B32 门禁**（已达标）| 接入或删除 + 加门禁 |
+
+**其余全部留在内核**（约 18900 行）—— 判定依据见 §11.1。
+
+---
+
+## 27. M1　npm 镜像目录：删除内核的 3 份副本
+
+### 27.1 现状（三份逐字节相同）
+
+| 副本 | 位置 | 形态 | 行数 |
+|---|---|---|---|
+| ① 壳（**所有者**）| `mirror.rs` `NPM_PRESETS` | Rust 数组 | 已有 |
+| ② 内核 | `dist/index.js:68-75` `REGISTRY_PRESETS` | `[{label,origin}]` × 6 | 8 |
+| ③ 内核 | `platform/config.js:66-73` `registries` | `[string]` × 6 | 8 |
+
+### 27.2 迁移动作
+
+**壳侧（M1-a）**：`mirror.rs` 已是所有者，补「导出**全集**」（当前 `export_to_kernel(npm)` 只导出被选中的）：
+
+```rust
+// mirror.rs —— 扩展导出契约（当前只写 origins，现改为写全集 + 选择结果 + 探测规格）
+pub fn export_to_kernel(m: &Mirrors, selected: Option<&Probe>) -> Result<(), String> {
+    let v = serde_json::json!({
+        "schema": 2,
+        "writtenBy": format!("shell@{}", crate::env::shell_version()),
+        "writtenAt": now_secs(),
+        "mode": "auto",
+        "manualOrigin": m.npm.first().cloned().unwrap_or_default(),
+        "catalog": m.npm,                       // ← 新增：全集（内核读它，不再自带）
+        "selected": selected.map(|p| serde_json::json!({
+            "origin": p.source, "latencyMs": p.latency_ms, "checkedAt": now_secs(),
+        })),
+        "probe": {                              // ← 新增：探测规格（让内核给出同一答案）
+            "kind": "package-metadata",
+            "pathTemplate": npm_probe_path(),   // "@dsh-sup%2Fdsh-core-{platform}"
+            "timeoutMs": 6000,
+        },
+    });
+    /* 原子写（已有 tmp+rename 逻辑） */
+}
+```
+
+**内核侧（M1-b）**：`dist/index.js:68-75` 的 `REGISTRY_PRESETS` **删除**，`platform/config.js:66-73` 的 `registries` **删除**，改为：
+
+```js
+// platform/config.js —— 最小兜底（契约缺失/损坏时才用；不再是「一等来源」）
+//  为什么是 2 条而不是 6 条：目录归壳（M1），内核只需保证「契约缺失时也能跑」。
+//  官方源 + 国内最普及源，覆盖「能上网」与「中国网络」两种基本情形。
+registries: [
+  "https://registry.npmjs.org",
+  "https://registry.npmmirror.com",
+],
+```
+
+```js
+// dist/index.js —— 契约优先，兜底在后
+_registryOrigins() {
+  const fromContract = this._catalogFromContract();   // 读 ~/.dsh/supervisor/registry.json 的 catalog
+  if (fromContract.length) return fromContract;
+  const o = (this.registryConfig && this.registryConfig.origins) || [];
+  const list = o.filter((x) => typeof x === "string" && x.trim());
+  return list.length ? list : [...this.defaultRegistries];
+}
+```
+
+### 27.3 验收断言
+
+```js
+// 内核 test/platform-capability-audit-test.js 新增
+// A9-a：内核侧不得再持有完整 6 条镜像目录
+check("A9-a 内核无 6 条镜像硬编码", !/repo\.huaweicloud\.com\/repository\/npm/.test(configSrc) || fallbackOnly(configSrc));
+// A9-b：契约缺失时仍能运行（最小兜底存在）
+check("A9-b 最小兜底存在", /registry\.npmjs\.org/.test(configSrc));
+// A9-c：镜像源集合两侧一致（跨仓读壳的 mirror.rs）
+check("A9-c 两侧集合一致", sameSet(kernelCatalog(), shellNpmPresets()));
+```
+
+---
+
+## 28. M2　镜像探测方法：修「两侧选源不同」
+
+### 28.1 现状（实测差异）
+
+| 侧 | 方法 | 代码 |
+|---|---|---|
+| 内核 | `GET <origin>/-/ping` | `dist/index.js:127-133`（7 行）|
+| 壳 | `GET <origin>/<真实包名>` | `mirror.rs:237-247` `npm_probe_path` |
+
+**实测后果**（同机同刻、同一组 6 源）：
+
+| 镜像 | 内核 `/-/ping` | 壳 真实包 | 差 |
+|---|---|---|---|
+| `npmreg.proxy.ustclug.org` | 2613 ms | 389 ms | **6.7×** |
+| **选中** | `repo.huaweicloud.com` | `registry.npmmirror.com` | **不同** |
+
+→ 面板显示一个源、壳实际用另一个、内核下载又用一个。**这是「镜像设置不可信」的直接原因。**
+
+### 28.2 迁移动作
+
+**壳侧（M2-a）**：把探测规格写进契约（见 §27.2 的 `probe` 字段）。
+
+**内核侧（M2-b）**：`_probeRegistry` 改为**按契约 spec 探测**，无契约时退回 `/-/ping`：
+
+```js
+// dist/index.js —— 按契约的 probe 规格探测（与壳同法 → 同一答案）
+async _probeRegistry(origin) {
+  const spec = this._probeSpec();          // 来自契约；无契约时 { kind: "ping" }
+  const base = origin.replace(/\/+$/, "");
+  const timeout = spec.timeoutMs || 4000;
+  let url;
+  if (spec.kind === "package-metadata" && spec.pathTemplate) {
+    // 与壳完全一致的探测目标（含 {platform} 展开）
+    url = base + "/" + spec.pathTemplate.replace("{platform}", this._corePlatformTag());
+  } else {
+    url = base + "/-/ping";                // 兜底：契约缺失时的旧方法
+  }
+  const start = Date.now();
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeout) });
+    return { ok: res.ok, latencyMs: Date.now() - start, probe: spec.kind || "ping" };
+  } catch { return { ok: false, latencyMs: Date.now() - start, probe: spec.kind || "ping" }; }
+}
+```
+
+### 28.3 验收断言
+
+```js
+// A10：契约存在时，两侧探测 URL 必须一致
+const spec = contract.probe;
+check("A10 内核按契约 spec 探测", kernelProbeUrl(spec) === shellProbeUrl(spec));
+```
+
+---
+
+## 29. M3　镜像选择结果：避免两侧各测一遍
+
+### 29.1 迁移动作
+
+**壳侧（M3-a）**：`warmup_async` 已产出选择结果 → 写入契约 `selected`（见 §27.2）。
+
+**内核侧（M3-b）**：`selectRegistry`（`dist/index.js:143-169`，27 行）**保留**（F2：内核无壳时也要选源），但**优先用契约的 selected**：
+
+```js
+async selectRegistry(force) {
+  const rc = this.registryConfig || {};
+  if (rc.mode === "manual" && rc.manualOrigin) { /* 既有：手动固定优先 */ }
+  // ★ 新增：优先使用壳投放的选择结果（未过期 = TTL 内）
+  const fromShell = this._selectedFromContract();
+  if (!force && fromShell && (Date.now() - fromShell.checkedAt) < TTL) {
+    this.selectedRegistry = { origin: fromShell.origin, latencyMs: fromShell.latencyMs,
+                              checkedAt: fromShell.checkedAt, manual: false, source: "shell" };
+    return fromShell.origin;
+  }
+  /* 既有：自己复测（现在用契约的 probe spec —— 见 M2）*/
+}
+```
+
+**收益**：正常运行时不重复测速；契约过期时复测，且**方法一致**（M2）→ 结论一致。
+
+---
+
+## 30. M4　Node 最低门槛：修「面板谎报环境就绪」
+
+### 30.1 现状
+
+| 侧 | 判据 | 代码 |
+|---|---|---|
+| 壳 | `Node >= v22.12.0`（否则拒绝启动内核）| `node.rs MIN_NODE = "v22.12.0"` |
+| 内核 | `which node` 成功即「ok」 | `env-catalog.js:36` `probe: () => cachedWhichVersion("node")` |
+
+**后果**：装了 Node v18 时，面板显示「环境就绪 ✅」，而壳因门槛不满足**拒绝启动** → 用户看到「面板说没问题，但就是起不来」。
+
+### 30.2 迁移动作
+
+**壳侧（M4-a）**：把门槛写进 `runtime.json`（已由壳写、内核读的契约，见 §6）：
+
+```rust
+// node.rs record_runtime_meta —— 增加 minNode 字段
+let meta = serde_json::json!({
+    "nodeVersion": version,
+    "nodePath": node_path,
+    "installedAt": now_iso(),
+    "source": "official-lts",
+    "minNode": MIN_NODE,          // ← 新增："v22.12.0"
+});
+```
+
+**内核侧（M4-b）**：`env-catalog.js` 的 node/npm 条目增加 `requiredVersion` 判定：
+
+```js
+// env-catalog.js —— 采用壳的门槛（从 runtime.json 读 minNode，兜底 v22.12.0）
+const MIN_NODE_DEFAULT = "v22.12.0";
+node: {
+  label: "Node.js",
+  required: true,
+  probe: () => {
+    const v = cachedWhichVersion("node");
+    if (!v) return null;
+    const min = runtimeMeta().minNode || MIN_NODE_DEFAULT;   // 壳投放的门槛
+    return { version: v, meets: compareNodeVersion(v, min) >= 0, min };
+  },
+}
+// state 判定改为：meets ? "ok" : "outdated"（不再是「能 which 到就 ok」）
+```
+
+### 30.3 验收断言
+
+```js
+// A11：Node 版本低于门槛时，内核必须报 outdated（不得报 ok）
+check("A11 Node 门槛与壳一致", envCatalogWith("v18.0.0").items.node.state === "outdated");
+check("A11 门槛值来自壳契约", envCatalogWith("v18.0.0").items.node.detail.min === runtimeMeta().minNode);
+```
+
+---
+
+## 31. M5　版本语义：统一测试向量（跨语言唯一可行形式）
+
+### 31.1 现状（实测 3 处分歧）
+
+| 输入 | 壳 `is_valid_version` | 内核 `VERSION_RE` |
+|---|---|---|
+| `1.0.0+build5` | true | true |
+| `1.0.0+` | **true** | false |
+| `1.0.0+!!!` | **true** | false |
+| `1.0.0+あ` | **true** | false |
+
+根因：壳在验证前 `split("+")` **丢弃 build 段**（`core.rs:60`），内核**严格校验** build。
+
+### 31.2 迁移动作
+
+**不是移动代码**（Rust/JS 无法共享），而是建立**共享测试向量**：
+
+```json
+// 两份逐字节相同（壳仓 + 内核仓各一份，门禁校验一致）
+// shell-release/version-vectors.json  ←→  kernel shared/version-vectors.json
+{
+  "schema": 1,
+  "versionValidation": [
+    { "input": "1.0.0",         "valid": true  },
+    { "input": "1.02.3",        "valid": false },
+    { "input": "1.0.0-rc.1",    "valid": true  },
+    { "input": "1.0.0+build5",  "valid": true  },
+    { "input": "1.0.0+",        "valid": false },   // ← 必须统一为 false（对齐 semver）
+    { "input": "1.0.0+!!!",     "valid": false },
+    { "input": "1.0.0+あ",      "valid": false },
+    { "input": "1.0.0-",        "valid": false },
+    { "input": "1.0.0-rc..1",   "valid": false }
+  ],
+  "compare": [
+    { "a": "1.0.0",        "b": "1.0.0-rc.1", "expected": 1  },
+    { "a": "1.0.0-rc.2",   "b": "1.0.0-rc.10","expected": -1 },
+    { "a": "1.0.0+aaa",    "b": "1.0.0+bbb",  "expected": 0  },
+    { "a": "2.0.0",        "b": "10.0.0",     "expected": -1 }
+  ]
+}
+```
+
+**壳侧**：`core.rs` 的 `is_valid_version` 需修正为**严格校验 build 段**（对齐 semver），否则无法通过向量。
+
+### 31.3 验收断言
+
+```rust
+// 壳 tests/version-vectors.rs
+// 加载 version-vectors.json，逐条断言 is_valid_version / semver_cmp
+```
+```js
+// 内核 test/platform-capability-audit-test.js 新增 A12
+// 加载同一文件，逐条断言 VERSION_RE / semverCompare
+// 加门禁：两份向量文件必须逐字节相同
+```
+
+---
+
+## 32. M6　有界执行纪律（**反方向**：内核向壳学）
+
+### 32.1 现状对比
+
+| | 壳 | 内核 |
+|---|---|---|
+| 设施 | `bounded.rs`（191 行，临时文件重定向 + try_wait 轮询 + 超时 kill + `CREATE_NO_WINDOW`）| `platform/exec.js`（48 行，`execFileSync + timeout`）|
+| 使用 | `bounded::run` 21 处（main 9 / service 9 / node 3）| **0 处 require**（死代码）|
+| 裸调用 | **0**（B32 门禁强制）| **23 处无 timeout** |
+| 门禁 | ✅ B32 | ❌ 无 |
+
+**壳的 `bounded.rs` 更完整**（`execFileSync` 的 timeout 在管道写满时可能失效，需临时文件避免）。故此项**不是迁移到壳**，而是**内核补齐**。
+
+### 32.2 动作（全部在内核侧）
+
+| # | 动作 |
+|---|---|
+| M6-a | 内核 `platform/exec.js` → 借鉴壳的实现（临时文件重定向 + try_wait 轮询 + 超时 kill）|
+| M6-b | 把 23 处无 timeout 的 `execFileSync` 全部接入（`autostart.js` 11 / `native/manager.js` 4 / `settings-view.js` 4 / `service.js` 2 / `fs-utils.js` 1 / `token.js` 1）|
+| M6-c | 新增门禁 **G9**：源码中不得存在无 timeout 的 `execFileSync` |
+
+### 32.3 验收断言
+
+```js
+// 内核 test/platform-capability-audit-test.js 新增 A13 / 独立门禁
+check("A13 无 timeout 的 execFileSync 归零", countBareExec() === 0);
+check("A13 platform/exec.js 被实际引用", requireCount("platform/exec") > 0 || fileRemoved());
+```
+
+---
+
+## 33. 明确**不迁移**的清单（附理由）
+
+| 项 | 内核位置 | 不迁移的理由 |
+|---|---|---|
+| DSH 安装/升级/卸载 | `guard/native/manager.js`（678 行）| **F2**：内核在壳关闭时必须能自升级/装插件 |
+| 沙箱实例管理 | `domains/instance/index.js`（987 行）| **F2 + R4**：面板可脱离壳操作 |
+| 服务管理器（**实例** transient 单元）| `platform/os/service.js`（106 行）| 管的是 **DSH 实例**，与壳的守卫服务是**不同对象** |
+| 日志/事件 | `platform/log.js` / `logcore.js` / `loghub.js`（610 行）| `EventHub` 有**不变量**（单写者、seq 全局单调、跨重启续号）；**合并会破坏它**。应做**统一格式 + 统一读取视图** |
+| 端口注册表 | `guard/lifecycle/ports.js`（453 行）| **F2**：运行期端口仲裁；被 domains 多处复用 |
+| 受管对象目录 | `guard/lifecycle/objects.js`（353 行）| **F2**：应然持久是运行期事实源 |
+| 智能路由 | `domains/router/`（4774 行）| **F2**：纯运行期 |
+| 局域网反代 | `domains/relay/`（1444 行）| **F2**：纯运行期 |
+| HTTP 网关 | `api/`（1495 行）| **F4**：面板由内核托管 |
+| 守卫编排 | `supervisor.js`（1188 行）| **F2**：它就是守卫本体 |
+| 壳看护 | `domains/shell/watchdog.js`（224 行）| **F3**：壳不能自监督 |
+| 安装执行器（npm）| `dist/index.js` `runNpmInstall` | **F2 + R3**：提权需人在场，内核做不到；**执行各留，规格共享** |
+
+---
+
+## 34. 迁移后的形态对照（Before / After）
+
+### 34.1 镜像源（M1+M2+M3）
+
+```
+BEFORE（三份副本 + 两种探测法 + 各自缓存）
+  壳 mirror.rs  ──┐
+                  ├─ 各自 6 条 URL（逐字节相同）
+  内核 dist     ──┤     /-/ping        → 选 huaweicloud 75ms
+  内核 config   ──┘     真实包          → 选 npmmirror   57ms   ← 不一致
+  契约 registry.json 虽在 latest_lts()/手动改镜像时写，但**只含 origins**
+
+AFTER（壳拥有 + 内核消费 + 同一方法）
+  壳 mirror.rs（唯一所有者）
+      └─ 启动/改动/升级 → 导出 registry.json{schema:2, catalog, selected, probe}
+  内核 dist
+      ├─ 契约有 → 用 catalog + selected（不重复测速）
+      ├─ 契约过期 → 用 probe 规格复测（与壳同法 → 同答案）
+      └─ 契约缺失 → 2 条最小兜底 + 写事件
+```
+
+### 34.2 环境判定（M4）
+
+```
+BEFORE                          AFTER
+  壳：Node >= v22.12 才放行        壳：把 minNode 写进 runtime.json
+  内核：which node 成功即 ok       内核：读 minNode，低于即报 outdated
+  面板显示「环境就绪」            面板显示「Node v18 低于最低要求」
+  壳却拒绝启动内核 ❌             两侧结论一致 ✅
+```
+
+### 34.3 有界执行（M6）
+
+```
+BEFORE                                    AFTER
+  壳：bounded.rs + B32 门禁 ✅            壳：不变
+  内核：exec.js 零引用 + 23 处裸调用 ❌    内核：接入 exec.js + G9 门禁 ✅
+```
+
+---
+
+## 35. 本清单与执行批次的对应
+
+| 批次（§20）| 覆盖本清单 |
+|---|---|
+| 批 A（壳平台层）| — |
+| 批 B（壳分层）| — |
+| 批 C（错误模型）| — |
+| **批 D（契约层）** | **M1 / M2 / M3 / M4 / M5 全部** |
+| 批 E（前端 + 门禁）| — |
+| **批 F（内核缺陷）** | **M6** + K1–K10 |
+
+**关键点**：本清单的 6 项中，**5 项集中在批 D（契约层）**，1 项在批 F。
+即：**「把东西移到壳里」实际上就是「建立契约层 + 删除内核副本」这一件事**。
