@@ -434,3 +434,40 @@ fn b21_no_serial_first_hit_comment() {
     );
     eprintln!("B21 PASS no stale serial comment");
 }
+
+/// B22：镜像预设必须全部经真实验证（不得收录未验证的源）。
+#[test]
+fn b22_mirror_presets_are_verified() {
+    let m = fs::read_to_string(manifest_dir().join("src").join("mirror.rs")).expect("mirror.rs");
+    // Node：10 个（实测下载+SHA256 通过）
+    assert!(m.contains("pub const NODE_PRESETS: [&str; 10]"), "B22 FAIL Node 预设数量不符（应为已验证的 10 个）");
+    // npm：6 个（实测 tarball 下载通过）
+    assert!(m.contains("pub const NPM_PRESETS: [&str; 6]"), "B22 FAIL npm 预设数量不符（应为已验证的 6 个）");
+    // 壳自更新：仅 2 个（静态文件直链，实测只有 unpkg/jsdelivr 可用）
+    assert!(m.contains("pub const SHELL_PRESETS: [&str; 2]"), "B22 FAIL 壳端点数量不符");
+    // 被排除的源不得出现在预设里
+    for bad in ["mirrors.ustc.edu.cn/node\"", "mirrors.aliyun.com/npm\"", "mirrors.tuna.tsinghua.edu.cn/npm\""] {
+        assert!(!m.contains(bad), "B22 FAIL 收录了实测不可用的镜像: {}", bad);
+    }
+    // 必须记录验证方法与排除原因（防止后人盲目加源）
+    assert!(m.contains("SHA256 校验"), "B22 FAIL 未记录 Node 镜像的验证方法");
+    assert!(m.contains("已排除"), "B22 FAIL 未记录被排除的镜像");
+    eprintln!("B22 PASS mirror presets are verified");
+}
+
+/// B23：三处预设集合必须一致（壳 mirror.rs / 壳 core.rs / 内核 config）。
+#[test]
+fn b23_preset_sets_are_consistent() {
+    let core = fs::read_to_string(manifest_dir().join("src").join("core.rs")).expect("core.rs");
+    assert!(
+        core.contains("const DEFAULT_ORIGINS: [&str; 6]"),
+        "B23 FAIL 壳 core.rs 的 DEFAULT_ORIGINS 未同步到 6 个"
+    );
+    // 内核 config.js 也应含新增的两个源
+    let cfg_path = manifest_dir().join("..").join("..").join("src").join("platform").join("config.js");
+    let cfg = fs::read_to_string(&cfg_path).expect("config.js");
+    for needle in ["npmreg.proxy.ustclug.org", "r.cnpmjs.org"] {
+        assert!(cfg.contains(needle), "B23 FAIL 内核 config.registries 缺 {}", needle);
+    }
+    eprintln!("B23 PASS preset sets consistent");
+}

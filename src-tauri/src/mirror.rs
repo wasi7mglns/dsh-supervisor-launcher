@@ -28,24 +28,53 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// npm registry 预设（与内核 config.registries 同集合）。
-pub const NPM_PRESETS: [&str; 4] = [
+/// npm registry 预设（**全部经真实 tarball 下载验证**，2026-09-11）。
+///
+/// 验证方法：请求该源包元数据 → 取 dist.tarball → **真实下载** → 确认体积合理。
+/// 仅「元数据可读」不足以判定可用（部分镜像只代理元数据、不代理 tarball）。
+///
+/// 已排除（实测不可用）：
+///   · mirrors.aliyun.com/npm            —— 元数据不可用（非标准 registry 路径）
+///   · mirrors.tuna.tsinghua.edu.cn/npm  —— 同上
+pub const NPM_PRESETS: [&str; 6] = [
     "https://registry.npmmirror.com",
     "https://registry.npmjs.org",
-    "https://mirrors.cloud.tencent.com/npm",
     "https://repo.huaweicloud.com/repository/npm/",
+    "https://mirrors.cloud.tencent.com/npm",
+    "https://npmreg.proxy.ustclug.org",
+    "https://r.cnpmjs.org",
 ];
 
-/// Node 发行镜像预设。**每一项实测可用**（index.json + SHASUMS256 + 各平台产物齐备，
-/// 含 macOS 所需的 .pkg）。
-pub const NODE_PRESETS: [&str; 4] = [
+/// Node 发行镜像预设（**全部经真实下载 + SHA256 校验验证**，2026-09-11）。
+///
+/// 验证方法：对每个源，取它自己 index.json 里**最高的可用 LTS**，下载安装包，
+/// 并用该源 SHASUMS256.txt 的期望值做 SHA256 校验 —— 只有校验通过才算可用。
+/// 这比「URL 可达」严格得多：能过滤代理不完整、文件损坏、清单与文件不匹配的镜像。
+///
+/// ⚠ 各源同步进度不同（官方/npmmirror/华为/阿里/上海交大有最新 LTS；
+///   腾讯云/南京大学滞后一版；清华/北外/北大滞后数版）。这不影响使用 ——
+///   latest_lts() 会**跨全部可达源取最高版本**，再在提供该版本的源中选最快者；
+///   滞后源仍可作为回退。
+///
+/// 已排除（实测 SHA256 校验失败）：mirrors.ustc.edu.cn/node
+pub const NODE_PRESETS: [&str; 10] = [
     "https://nodejs.org/dist",
     "https://npmmirror.com/mirrors/node",
     "https://mirrors.huaweicloud.com/nodejs",
+    "https://mirrors.aliyun.com/nodejs-release",
+    "https://mirror.sjtu.edu.cn/nodejs-release",
     "https://mirrors.cloud.tencent.com/nodejs-release",
+    "https://mirror.nju.edu.cn/nodejs-release",
+    "https://mirrors.tuna.tsinghua.edu.cn/nodejs-release",
+    "https://mirrors.bfsu.edu.cn/nodejs-release",
+    "https://mirrors.pku.edu.cn/nodejs-release",
 ];
 
 /// 壳自更新清单预设（Tauri updater 的 endpoints；此处存完整清单 URL）。
+///
+/// ⚠ 仅 2 个可用（2026-09-11 实测）：Tauri updater 需要一个**静态 JSON 文件**直链，
+///   而多数 npm 镜像只提供 registry 元数据 API，不提供包内静态文件直链。
+///   实测排除：npmmirror /files/ 路径返回 403；npm 官方不提供静态文件服务。
 pub const SHELL_PRESETS: [&str; 2] = [
     "https://unpkg.com/@dsh-sup/shell-release@latest/shell-manifest.json",
     "https://cdn.jsdelivr.net/npm/@dsh-sup/shell-release@latest/shell-manifest.json",

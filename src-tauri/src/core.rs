@@ -17,11 +17,15 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// 内建默认镜像（与内核 config.registries 同集合；registry.json 缺失时的兜底）。
-const DEFAULT_ORIGINS: [&str; 4] = [
+// 与 mirror.rs 的 NPM_PRESETS / 内核 config.registries 保持同一集合。
+// 这只是在 mirror.rs 配置损坏时的最后兜底；正常路径由 mirror::load() 提供。
+const DEFAULT_ORIGINS: [&str; 6] = [
     "https://registry.npmmirror.com",
     "https://registry.npmjs.org",
-    "https://mirrors.cloud.tencent.com/npm",
     "https://repo.huaweicloud.com/repository/npm/",
+    "https://mirrors.cloud.tencent.com/npm",
+    "https://npmreg.proxy.ustclug.org",
+    "https://r.cnpmjs.org",
 ];
 
 /// 平台 → npm 子包名（唯一真源；错误提示/安装/查询共用，杜绝散落硬编码）。
