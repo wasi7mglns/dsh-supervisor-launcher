@@ -345,7 +345,6 @@
     });
   }
 
-  // ── 步骤 1：环境检测 ──
   // ── 步骤 0：环境检测（**第一步**：本地、快、确定）──
   function stepEnv() {
     setStep(0);
@@ -362,6 +361,15 @@
       if (!st.installed) {
         setStep(1);
         status('未检测到 Node.js · 正在补全运行环境…');
+        return core.invoke('start_node_install').then(function () { return stepNodeWait(); });
+      }
+      // ⚠ 必须校验**最低门槛**（2026-09-11 修复）：
+      //   后端一直回传 minOk（DSH 要求 Node >= v22.12），但前端从未使用 ——
+      //   于是用户机器上装了旧版 Node（如 v18）时流程照常放行，
+      //   直到内核真正启动才失败，错误现象离根因很远、极难排查。
+      if (st.minOk === false) {
+        setStep(1);
+        status('Node.js ' + st.installed + ' 低于最低要求（' + (st.minRequired || 'v22.12') + '）· 正在升级…');
         return core.invoke('start_node_install').then(function () { return stepNodeWait(); });
       }
       nodeVer = st.installed;

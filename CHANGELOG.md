@@ -6,6 +6,107 @@
 
 以下修复**已完成代码与测试，尚未构建/发布**（按用户要求：先逐项确认后再构建）。
 
+### 修复：守卫服务定义从未被建立 —— 全新机器上流程必然断裂（架构级，用户质疑驱动）
+
+#### 问题（本次审计最严重的发现）
+
+**旧设计的死锁**：壳只**启动**服务（`systemctl --user start` / `launchctl kickstart` /
+`schtasks /Run`），把「服务定义的建立」留给内核的「所有者」语义。该设计在**首次安装**场景下必然失败：
+
+1. 首次启动时**唯一的在场组件是壳** —— 内核此时可能尚未安装；
+2. 内核的 `install` 子命令**不会被任何环节自动调用**（壳只执行 `npm install -g`）；
+3. 且 npm 发行包**不含** `systemd/`、`desktop/` 模板（发布 `files` 字段未包含），
+   即便调用 `install` 也会打印「跳过系统服务部署」后直接返回；
+4. 于是服务定义从未建立 → 壳的 start 必然失败 → 引导卡在「守卫就绪」。
+
+**实测证据**：
+- 已发布 npm 包内 `package/systemd/` 与 `package/desktop/` 均为 **0 个文件**，无 `postinstall`；
+- 在干净 HOME 下实跑内核 `install`：打印「未找到 systemd 模板…跳过系统服务部署」后返回，
+  之后 `~/.config/systemd/user/` 为空；
+- 壳仓**全部历史**中：写 systemd unit（`WantedBy`/`ExecStart`）**0 个提交**、写 LaunchAgent
+  （`RunAtLoad`）**0 个提交**、写 schtasks（`/Create`）**0 个提交** → **不是回归，是从未通过**。
+  本机能跑只是因为曾从**源码仓**手工跑过一次 `install`。
+
+**Windows 另有一层错位**：`DSH-Supervisor` 计划任务指向的是 **GUI 壳**，而壳的
+`start_guard_service()` 执行 `schtasks /Run /TN DSH-Supervisor` —— 于是「启动守卫」实际只是
+再开一次壳（被单实例插件折回焦点），**守卫永远不会被启动**。
+
+#### 修复
+
+**新增 `src/service.rs`**：壳自持三平台服务定义（幂等，已存在则跳过）。
+理由是结构性的 —— 壳是首启时唯一在场的组件，服务定义必须在任何东西启动守卫之前存在。
+
+| 平台 | 建立方式 | 说明 |
+|---|---|---|
+| Linux | 写 `~/.config/systemd/user/dsh-supervisor.service` | **模板内嵌**（不再依赖外部文件）→ `daemon-reload` + `enable` + `enable-linger` |
+| macOS | 写 `~/Library/LaunchAgents/com.dsh.supervisor.plist` | `RunAtLoad` + `KeepAlive` → `launchctl bootstrap` |
+| Windows | 创建计划任务 `DSH-Supervisor` | 指向**守卫守护进程**；用包装 `.cmd` 规避 `/TR` 引号转义地狱 |
+
+**`ensure_guard` 重写为三段**：建立定义 → 请求服务管理器启动（等 30s）→
+**spawn 兜底**（服务管理器不可用时直接拉起守护进程，再等 60s）。
+
+spawn 兜底需**放宽**原设计约束「壳绝不直接 spawn 守卫」：该约束的理由是避免产生游离于
+服务管理器的第二实例，但它不能凌驾于**可用性**之上 —— 容器、无 user systemd session、
+`launchctl` 被策略拦截、`schtasks` 被组策略禁止等场景下服务管理器根本无法使用，
+无兜底则用户被永久挡在门外。第二实例风险由「spawn 前已确认端口不存活 + 以端口就绪为唯一成功判据」规避。
+
+**Windows 任务名职责分离**（内核侧 `autostart.js` 同步修改）：
+
+```
+DSH-Supervisor          -> 守卫守护进程（壳建立；壳的 /Run 指向它）
+DSH-Supervisor-GUI      -> 登录时打开桌面壳（面板 autostart 开关管理）
+DSH-Supervisor-Watchdog -> 每 5 分钟保活（崩溃自拉）
+```
+
+关闭 autostart 时**不删除**守卫任务（它是服务定义），只 `/DISABLE` 其开机自启语义。
+
+### 修复：macOS 上「运行环境」自动安装必然失败（格式不匹配）
+- **根因**：`platform_file()` 下载 `node-v<ver>-darwin-<arch>.tar.gz`（tarball），
+  却交给 `installer -pkg` 执行 —— 格式不匹配，必然失败。
+- **修复**：改用官方 **`.pkg`**（`node-v<ver>.pkg`，实测通用包，arm64/x64 通用）。
+  已验证官方可达（HTTP 200）且 `SHASUMS256.txt` 含其条目。
+  （注：npmmirror 镜像的 SHASUMS 不含 `.pkg` 条目，故 macOS 实际依赖官方源；官方为主源，可接受。）
+
+### 修复：Node 安装包下载超时过小（30-90 MB 却只给 60 秒）
+- `ureq` 的 `timeout()` 覆盖**整次调用**（含响应体读取），而安装包体积：
+  Linux 30.4 MB / Windows 31.7 MB / **macOS .pkg 89.4 MB**。
+- 原值 60 秒在网络稍慢时必然超时，表现为「看似网络问题」实为超时配置过小。
+- 修复：提到 **15 分钟**。
+
+### 修复：Node 最低门槛被计算却从未生效
+- 后端一直回传 `minOk`（DSH 要求 Node >= v22.12），但**前端从未使用** ——
+  用户装了旧版 Node（如 v18）时流程照常放行，直到内核真正启动才失败，现象离根因很远。
+- 修复：前端消费 `minOk`，不达标即触发升级；并回传 `minRequired` 供提示显示（避免前端硬编码漂移）。
+
+### 修复：npm 发行态的包根解析 off-by-one
+- `bin/dsh-supervisor` 会被 esbuild 打成 `core.cjs` 的 178 字节 launcher `require` 执行，
+  此时 `__dirname` = **包根**（core.cjs 旁），而旧实现硬写 `path.join(__dirname, "..")` →
+  指向**包外**：systemd/desktop 模板路径错位、`BIN_PATH` 指向不存在的文件。
+  （干净 HOME 实测：`~/.local/bin/dsh-supervisor -> <pkg>/dsh-supervisor`，该文件不存在。）
+- 修复：从 `__dirname` 逐级向上找含 `package.json` 的目录作为包根，两种形态均正确；
+  `bin` 目标改为 `path.join(ROOT, "bin", "dsh-supervisor")`。
+
+### 修复：内核 --version 探测无界（与「检测环境卡死」同类）
+- `core::installed_version()` 用 `Command::output()` **无限阻塞**，且 `locate_core` 会对
+  **每个候选**都调用一次 → 任一候选不可执行（损坏 shim / 被安全软件拦截 / 架构不符）即永久卡住。
+- 修复：复用既有的有界执行器（10 秒上限）。
+
+### 修复：Windows .cmd 垫片导致 --prefix 丢失
+- npm 全局垫片位于 `%APPDATA%\npm\dsh-supervisor.cmd`，路径**不含 `node_modules` 段**，
+  故 `global_prefix_for` 返回 None → `install_version` 丢失 `--prefix`，
+  可能装到 npm 默认前缀而非内核当前所在前缀（旧内核遮蔽新内核）。
+- 修复：① `global_prefix_for` 增加「父目录含 `node_modules` 即前缀」的兜底；
+  ② `locate_core_candidates` 优先加入包内真实脚本路径，使版本读取与前缀推导都正常。
+
+### 回归防护
+`tests/bootstrap_flow.rs` 增至 **17 断言**，新增：
+- B13 壳必须自持三平台服务定义（且模板内嵌）+ spawn 兜底；
+- B14 macOS 安装格式必须与 `installer -pkg` 匹配（`.pkg`）；
+- B15 下载超时必须足够大（禁止 60 秒）；
+- B16 前端必须消费 Node 最低门槛；
+- B17 包根解析必须形态无关。
+
+
 ### 修复：卡在「检测环境」不动（Windows 真机，1.0.3 仍复现）
 
 **根因（两层叠加）**：

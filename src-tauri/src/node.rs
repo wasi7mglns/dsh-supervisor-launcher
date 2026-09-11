@@ -7,9 +7,16 @@ use std::process::Command;
 const OFFICIAL: &str = "https://nodejs.org/dist";
 const MIRROR: &str = "https://npmmirror.com/mirrors/node";
 
+/// 整个请求的时间上限。
+///
+/// ⚠ 必须足够大（2026-09-11 修复）：ureq 的 timeout 覆盖**整次调用**（含响应体读取），
+///   而 Node 安装包体积为 30-90 MB（macOS .pkg 实测 89.4 MB）。原值 60 秒在网络稍慢时
+///   必然超时 —— 表现为「运行环境」步骤失败且看似网络问题，实为超时配置过小。
+const HTTP_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
     let resp = ureq::get(url)
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(HTTP_TOTAL_TIMEOUT)
         .call()
         .map_err(|e| format!("下载失败 {}: {}", url, e))?;
     let mut buf = Vec::new();
@@ -39,7 +46,17 @@ fn platform_file(version: &str) -> Option<String> {
     #[cfg(target_os = "linux")]
     { Some(format!("node-v{}-linux-{}.tar.xz", version, arch)) }
     #[cfg(target_os = "macos")]
-    { Some(format!("node-v{}-darwin-{}.tar.gz", version, arch)) }
+    {
+        // ⚠ macOS 必须用官方 **.pkg**（2026-09-11 修复）：
+        //   原实现下载 `node-v<ver>-darwin-<arch>.tar.gz`（tarball），却交给
+        //   `installer -pkg` 执行 —— 格式不匹配，**必然安装失败**。
+        //   官方提供的是通用 .pkg（`node-v<ver>.pkg`，arm64/x64 通用，见 index.json
+        //   的 files 条目标签 `osx-*-tar` 仅表示 tarball 存在，与本路径无关）。
+        //   选择 .pkg 而非 tarball 的原因：它带**签名与安装位置语义**，
+        //   可用一次系统授权装到 /usr/local，与其它平台行为一致。
+        let _ = arch;
+        Some(format!("node-v{}.pkg", version))
+    }
     #[cfg(target_os = "windows")]
     { Some(format!("node-v{}-x64.msi", version)) }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

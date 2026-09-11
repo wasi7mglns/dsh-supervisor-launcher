@@ -10,6 +10,8 @@
 mod core;
 mod env;
 mod node;
+// 守卫服务定义（三平台）+ spawn 兜底：首启时壳是唯一在场组件，服务定义只能由壳建立。
+mod service;
 // 桌面壳自更新 + 落盘日志 + 身份上报（2026-09-11）
 mod update;
 
@@ -69,6 +71,8 @@ async fn node_status(app: tauri::AppHandle) -> serde_json::Value {
         o["installed"] = serde_json::json!(installed);
         // DSH 最低门槛判定（>=22.12）：引导页据此决定是否需装 Node，outdated 仅展示不再阻塞
         o["minOk"] = serde_json::json!(node::meets_minimum(installed.as_deref()));
+        // 一并回传最低要求，供前端在提示里显示（避免前端硬编码版本号而漂移）
+        o["minRequired"] = serde_json::json!(node::MIN_NODE);
         if let Some(latest) = &st.latest {
             o["outdated"] = serde_json::json!(node::outdated(installed.as_deref(), latest));
         }
@@ -194,8 +198,18 @@ fn locate_core_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
     #[cfg(windows)]
     {
         if let Ok(appdata) = std::env::var("APPDATA") {
+            let npm_root = PathBuf::from(&appdata).join("npm");
             for name in core_exe_names().iter().copied() {
-                add(PathBuf::from(&appdata).join("npm").join(name), &mut out);
+                // npm 生成的 .cmd 垫片（在 npm 根目录下）
+                add(npm_root.join(name), &mut out);
+            }
+            // 真实包内脚本（2026-09-11 补充）：
+            //   .cmd 垫片无法被 package_dir_of 解析（父目录不是 bin/），
+            //   且执行它取版本在部分环境下会失败。直接给出包内真实路径优先命中，
+            //   既能正确读 package.json 取版本，也能让 global_prefix_for 正常推导前缀。
+            if let Ok(pkg) = core::package_name() {
+                let real = npm_root.join("node_modules").join(&pkg).join("bin").join("dsh-supervisor");
+                add(real, &mut out);
             }
         }
     }
@@ -445,17 +459,56 @@ fn shutdown_all(port: u16) {
 fn ensure_guard(app: &tauri::AppHandle) -> Result<(), String> {
     let port = env::api_port();
     if is_alive(port) { return Ok(()); }
-    let _ = locate_core(app).ok_or_else(|| match core::package_name() {
+
+    let guard = locate_core(app).ok_or_else(|| match core::package_name() {
         Ok(p) => format!("未检测到内核。请先安装：npm i -g {}", p),
         Err(e) => format!("未检测到内核：{}", e),
     })?;
-    start_guard_service()?;
-    // 等面板就绪（最多 30s）
-    for _ in 0..60 {
-        if is_alive(port) { return Ok(()); }
+
+    // ① 建立服务定义（**首次安装的关键一步**）。
+    //    旧实现直接跳到 start，而首启时服务定义根本不存在 -> 必然失败 -> 卡在「守卫就绪」。
+    //    这一步是幂等的：已存在则直接返回。
+    match service::ensure_defined(&guard) {
+        Ok(desc) => update::log(&format!("守卫服务定义: {}", desc)),
+        Err(e) => update::log(&format!("守卫服务定义失败（稍后走 spawn 兜底）: {}", e)),
+    }
+
+    // ② 请求服务管理器启动（正常路径：由 systemd/launchd/schtasks 托管，具备开机自启与崩溃自拉）
+    let started = start_guard_service();
+    if let Err(e) = &started {
+        update::log(&format!("服务管理器启动失败: {}", e));
+    }
+    if wait_alive(port, 60) { return Ok(()); }
+
+    // ③ 兜底：直接拉起守护进程。
+    //    服务管理器不可用的场景真实存在（容器/无 user session/策略拦截），
+    //    此时若不给兜底，用户将被永久挡在门外。
+    update::log("服务管理器未能在 30s 内拉起守卫，改用直接 spawn 兜底");
+    match service::spawn_daemon(&guard) {
+        Ok(pid) => update::log(&format!("兜底 spawn 守卫 pid={}", pid)),
+        Err(e) => {
+            return Err(format!(
+                "守卫启动失败：服务管理器错误({}) 且直接拉起也失败({})",
+                started.err().unwrap_or_else(|| "无".into()),
+                e
+            ));
+        }
+    }
+    if wait_alive(port, 120) { return Ok(()); }
+
+    Err(format!(
+        "守卫启动超时（服务管理器与直接拉起均未就绪）。服务管理器错误：{}",
+        started.err().unwrap_or_else(|| "无".into())
+    ))
+}
+
+/// 轮询等待端口存活（每 tick 500ms）。
+fn wait_alive(port: u16, ticks: u32) -> bool {
+    for _ in 0..ticks {
+        if is_alive(port) { return true; }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    Err("守卫启动超时（30s 内面板未就绪）".into())
+    false
 }
 
 fn is_alive(port: u16) -> bool {

@@ -281,3 +281,82 @@ fn b12_no_stale_desktop_update_wording() {
     }
     eprintln!("B12 PASS no stale desktop-update wording");
 }
+
+/// B13：服务定义必须由壳建立（P0 死锁修复）。
+/// 首启时壳是唯一在场组件；若壳只 start 不 create，全新机器上守卫永远起不来。
+#[test]
+fn b13_shell_owns_service_definition() {
+    let svc = fs::read_to_string(manifest_dir().join("src").join("service.rs"))
+        .expect("B13 FAIL 缺少 src/service.rs（服务定义模块）");
+    for needle in [
+        "dsh-supervisor.service",            // Linux systemd unit
+        "com.dsh.supervisor.plist",          // macOS LaunchAgent
+        "DSH-Supervisor",                    // Windows 计划任务
+        "pub fn ensure_defined",             // 建立入口
+        "pub fn spawn_daemon",               // spawn 兜底
+    ] {
+        assert!(svc.contains(needle), "B13 FAIL service.rs 缺少关键项: {}", needle);
+    }
+    // 模板必须**内嵌**（外部文件在 npm 包内不存在，正是旧实现静默跳过的根因）
+    assert!(svc.contains("WantedBy=default.target"), "B13 FAIL systemd 模板未内嵌");
+    assert!(svc.contains("RunAtLoad"), "B13 FAIL LaunchAgent plist 未内嵌");
+
+    let m = main_rs();
+    assert!(m.contains("mod service;"), "B13 FAIL main.rs 未引入 service 模块");
+    assert!(m.contains("service::ensure_defined"), "B13 FAIL ensure_guard 未建立服务定义");
+    assert!(m.contains("service::spawn_daemon"), "B13 FAIL 缺少 spawn 兜底调用");
+    eprintln!("B13 PASS shell owns 3-platform service definition + spawn fallback");
+}
+
+/// B14：macOS Node 安装格式必须与安装命令匹配（.pkg）。
+/// 旧实现下载 .tar.gz 却交给 `installer -pkg` —— 格式不匹配，必然失败。
+#[test]
+fn b14_macos_node_installer_format_matches() {
+    let n = fs::read_to_string(manifest_dir().join("src").join("node.rs")).expect("read node.rs");
+    assert!(n.contains("node-v{}.pkg"), "B14 FAIL macOS 未改用官方 .pkg（安装命令要求 .pkg）");
+    assert!(
+        !n.contains("node-v{}-darwin-{}.tar.gz"),
+        "B14 FAIL 仍下载 .tar.gz 却交给 installer -pkg（格式不匹配）"
+    );
+    assert!(n.contains("installer -pkg"), "B14 FAIL 未找到 installer -pkg 调用");
+    eprintln!("B14 PASS macOS uses .pkg consistent with installer -pkg");
+}
+
+/// B15：Node 安装包下载超时必须足够大（产物 30-90MB；ureq 的 timeout 覆盖整次调用）。
+#[test]
+fn b15_download_timeout_is_generous_enough() {
+    let n = fs::read_to_string(manifest_dir().join("src").join("node.rs")).expect("read node.rs");
+    assert!(n.contains("HTTP_TOTAL_TIMEOUT"), "B15 FAIL 缺少下载超时常量");
+    assert!(
+        !n.contains("from_secs(60)"),
+        "B15 FAIL 仍存在 60 秒总超时（30-90MB 安装包必然超时）"
+    );
+    assert!(n.contains("from_secs(15 * 60)"), "B15 FAIL 超时未放宽到 15 分钟");
+    eprintln!("B15 PASS download timeout generous");
+}
+
+/// B16：Node 最低门槛必须被前端消费（后端算了但前端忽略 = 静默放行旧版 Node）。
+#[test]
+fn b16_min_node_gate_is_enforced_in_frontend() {
+    let html = bootstrap_html();
+    assert!(html.contains("st.minOk === false"), "B16 FAIL 前端未校验 Node 最低门槛");
+    assert!(html.contains("minRequired"), "B16 FAIL 前端未使用后端回传的最低要求");
+    let m = main_rs();
+    assert!(m.contains("minRequired"), "B16 FAIL 后端未回传 minRequired");
+    eprintln!("B16 PASS min-node gate enforced");
+}
+
+/// B17：npm 形态的包根解析必须正确（launcher 后 __dirname 是包根，
+/// 旧实现 path.join(__dirname, ..) 指向包外，导致模板与 bin 路径错位）。
+#[test]
+fn b17_package_root_resolution_is_form_agnostic() {
+    let bin = fs::read_to_string(manifest_dir().join("..").join("..").join("bin").join("dsh-supervisor"))
+        .expect("read bin/dsh-supervisor");
+    assert!(bin.contains("findPackageRoot"), "B17 FAIL 未按 package.json 定位包根");
+    assert!(
+        !bin.contains("const ROOT = path.join(__dirname, '..')"),
+        "B17 FAIL 仍用 __dirname/.. 硬推包根（发行态会指向包外）"
+    );
+    assert!(bin.contains("path.join(ROOT, 'bin', 'dsh-supervisor')"), "B17 FAIL bin 目标未按包根解析");
+    eprintln!("B17 PASS package root resolution form-agnostic");
+}

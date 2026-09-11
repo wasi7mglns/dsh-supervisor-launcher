@@ -199,10 +199,21 @@ pub fn installed_version(bin: &Path) -> Option<String> {
             }
         }
     }
-    let out = std::process::Command::new(bin).arg("--version").output().ok()?;
-    if !out.status.success() { return None; }
-    parse_version_output(&String::from_utf8_lossy(&out.stdout))
+    // 兜底：执行 --version。
+    // ⚠ 必须有界（2026-09-11 修复，与「检测环境卡死」同一类缺陷）：
+    //   原实现用 Command::output() **无限阻塞**，且 locate_core 会对**每个候选**都调用一次；
+    //   一旦某个候选不可执行（损坏的 shim、被安全软件拦截、架构不符），
+    //   引导页就会永久停在「正在检查内核版本」。
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("--version");
+    match run_command_bounded(cmd, VERSION_PROBE_TIMEOUT) {
+        Ok(o) if o.success => parse_version_output(&o.stdout),
+        _ => None,
+    }
 }
+
+/// 内核 `--version` 探测的时间上限。
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 从 --version 输出解析版本（形如 "dsh-supervisor v0.1.2-BETA.7"）。
 pub fn parse_version_output(s: &str) -> Option<String> {
@@ -226,6 +237,16 @@ pub fn global_prefix_for(bin: &Path) -> Option<PathBuf> {
             for c in &comps[..cut] { p.push(c.as_os_str()); }
             if p.as_os_str().is_empty() { return None; }
             return Some(p);
+        }
+    }
+    // Windows npm 垫片兜底（2026-09-11 修复）：
+    //   路径形如 `%APPDATA%\npm\dsh-supervisor.cmd` —— **不含 node_modules 段**，
+    //   故上面的循环返回 None，进而 install_version 丢失 --prefix，
+    //   可能装到 npm 默认前缀而非内核当前所在前缀（旧内核遮蔽新内核）。
+    //   判据：该目录直接含 node_modules 时，它本身就是 npm 全局前缀。
+    if let Some(dir) = bin.parent() {
+        if dir.join("node_modules").is_dir() {
+            return Some(dir.to_path_buf());
         }
     }
     None
