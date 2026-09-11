@@ -54,12 +54,20 @@ function walk(dir) {
   return out;
 }
 
-function findArtifacts(bundleDir, installer) {
+function findArtifacts(bundleDir, installer, version) {
   const pats = ARTIFACT_PATTERNS[installer] || [];
   const all = walk(bundleDir).filter((f) => !/\.sig$/.test(f));
   const hits = all.filter((f) => pats.some((re) => re.test(path.basename(f))));
-  const withSig = hits.filter((f) => fs.existsSync(f + '.sig'));
-  return (withSig.length ? withSig : hits).map((f) => ({ file: f, sig: f + '.sig' }));
+  // ⚠ 必须按**版本**过滤（2026-09-11 修复）：bundle 目录会累积历史版本安装包，
+  //   不过滤会把旧版本一并打进发布包（体积膨胀 + 语义混乱，且清单与包内容不一致）。
+  //   CI 每次全新 workspace 故只产一个版本，但本地开发/重跑会命中此问题（实测 1.0.1 与 1.0.2 同目录）。
+  const versionHits = version ? hits.filter((f) => path.basename(f).includes(version)) : hits;
+  const picked = versionHits.length ? versionHits : hits;
+  if (version && versionHits.length && versionHits.length < hits.length) {
+    console.log('   已按版本过滤：' + versionHits.length + '/' + hits.length + ' 个产物匹配 ' + version);
+  }
+  const withSig = picked.filter((f) => fs.existsSync(f + '.sig'));
+  return (withSig.length ? withSig : picked).map((f) => ({ file: f, sig: f + '.sig' }));
 }
 
 function main() {
@@ -78,7 +86,7 @@ function main() {
   fs.rmSync(stage, { recursive: true, force: true });
   fs.mkdirSync(path.join(stage, 'artifact'), { recursive: true });
 
-  const arts = findArtifacts(bundleDir, meta.installer);
+  const arts = findArtifacts(bundleDir, meta.installer, ver);
   if (!arts.length) { console.error('未在 ' + bundleDir + ' 找到 ' + meta.installer + ' 产物'); process.exit(1); }
 
   const entries = [];
