@@ -1,0 +1,620 @@
+# 桌面壳 ↔ 内核：完整架构理解与一次性执行方案
+
+> 2026-09-11 · 基于**全量代码阅读**（内核 80 文件 / 19354 行 + 壳 Rust 9 文件 / 4385 行 + 前端 2 文件 + 测试与文档）。
+> 本文件取代此前的分阶段提案，给出**一次性目标态**。
+> 所有结论均带 `文件:行号` 证据；未核实的一律标「未确认」。
+
+---
+
+# 第一部分　系统全貌
+
+## 1. 三个进程，两种角色
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  ① 桌面壳 dsh-supervisor-gui（Tauri + Rust，4385 行）              │
+│     · 角色：**安装器 + 显示框**（供给层）                           │
+│     · 引导：探测环境 → 装 Node → 装内核 → 定义守卫服务 → 启守卫     │
+│     · 常驻：托盘；关窗=隐藏，「退出管家」=停全部服务链              │
+│     · 壳进程崩了会怎样 → 由 ③ 的「壳看护」拉起（2026-09-11 新增）   │
+└──────────────┬──────────────────────────────────────────────────────┘
+               │ ① 装 ②（npm 全局包）  ② 启动/停止 ③（服务管理器）
+               │ ③ 读 config.json     ④ 把 webview 指向 ② 的面板
+               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  ② 守卫 dsh-supervisor daemon（纯 JS，0 依赖，19354 行）            │
+│     · 角色：**系统服务 + 面板后端**（运行期层）                     │
+│     · 无头运行：systemd Restart=always / launchd KeepAlive /       │
+│                schtasks；Linux 经 linger 在**用户注销后仍活**       │
+│     · 托管面板：http://127.0.0.1:<apiPort>/（浏览器可直开）         │
+│     · 保活 ③、装/升级 DSH 与插件、智能路由、局域网反代              │
+│     · 壳看护：壳崩溃时把它拉起来（三平台一套机制）                  │
+└──────────────┬──────────────────────────────────────────────────────┘
+               │ 保活 / 监督 / 重启
+               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  ③ DeepSeek Harness（DSH，第三方，node dsh web）                    │
+│     · 被监管目标（原生单例 + 多个 sandbox 实例）                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**关键推论（决定了后面全部归属判定）**：
+
+| # | 事实 | 证据 | 推论 |
+|---|---|---|---|
+| **F1** | 用户装壳时，**内核还不存在** | 产品形态（空壳） | 装内核之前/期间需要的能力，**必须在壳** |
+| **F2** | 内核是**系统服务**，壳关窗它照跑 | `service.rs` 三平台服务定义 + linger | 运行期需要的能力，**必须在核** |
+| **F3** | 内核可在**无图形会话**时运行 | `service.rs:96` `loginctl enable-linger`；注释「未登录也保持用户服务」 | 内核**不得**依赖壳/GUI 在场 |
+| **F4** | 面板由**内核** HTTP 托管，壳只是 webview 框 | `api/index.js:40-56` `resolveUiDir()`；README「浏览器可直接打开」 | 面板功能不得依赖壳在场 |
+| **F5** | 壳与内核**语言不同**（Rust / JS） | 工程事实 | 「抽到壳里」只能：整体搬迁 / 壳定义+内核消费产物 / 统一规格+测试向量 |
+
+## 2. 生命周期所有权矩阵（2026-09-11 定案）
+
+| 对象 | 生命周期所有者 | 启动 | 停止 | 重启权威 |
+|---|---|---|---|---|
+| **桌面壳** | 桌面会话（登录 autostart） | XDG `.desktop` / LaunchAgent / schtasks | 用户关窗（隐藏）/ 托盘退出 | **守卫看护**（崩溃时）|
+| **守卫** | **服务管理器**（唯一） | 壳请求 `systemctl --user start` / `launchctl` / `schtasks /Run` | 壳请求（退出握手后） | 服务管理器（`Restart=always` 等）|
+| 原生 DSH | **守卫** | 守卫 spawn（进程组） | `stopProcess` | 守卫（desired+guardian）|
+| 沙箱实例 | **守卫** | `systemd-run`（Linux 专有） | `systemctl stop` | 守卫监督 |
+| router/lan daemon | **守卫** | `DaemonLifecycle` spawn | `.stop()` | 守卫监督 |
+
+**铁律**：每个进程**有且只有一个**生命周期所有者；非所有者只能「请求所有者」。
+
+## 3. 引导时序（壳的六步 + 内核的介入点）
+
+```
+阶段                 执行者   调用                              产物
+─────────────────────────────────────────────────────────────────────────────
+1 检测环境           壳       nodeprobe::status                候选枚举 + 版本
+2 运行环境           壳       node::install（pkexec/msiexec）  官方 Node LTS
+                                                        → 壳写 runtime.json
+3 桌面版本           壳       Tauri updater + minisign         壳自更新
+4 内核版本           壳       core::latest_version → install   npm 装内核
+                                                        ← 内核被装上
+5 守卫就绪           壳       service::ensure_defined + start  服务定义 + 启动
+                      内核     （被服务管理器拉起）              API 就绪
+                      壳       guard_ready（轮询 /healthz）      握手
+6 控制面板           壳       window → shell.html → iframe      指向内核面板
+                      内核     托管 supervisor.html + assets
+```
+
+**第 4 步前的全部能力属于壳（F1）；第 5 步后的全部能力属于内核（F2）。**
+
+---
+
+# 第二部分　内核架构（实测）
+
+## 4. 分层与真实依赖
+
+```
+bin/dsh-supervisor（651 行，宿主+CLI）
+        ↓
+src/supervisor.js（1188 行，组合根/唯一状态宿主）
+   ├─ api/index.js（328 行，HTTP 网关：信任门卫→域分派→静态）
+   │     └─ api/<9 域>（仅 owns()+handle(ctx)，**零跨域依赖**，干净的依赖倒置）
+   ├─ guard/（5042 行，守卫自身：生命周期/监督/端口/原生）
+   ├─ domains/（8453 行，业务：instance/router/relay/plugin/dist/shell）
+   └─ platform/（3141 行，基础 + os 平台抽象层）
+```
+
+**实测的平台分支分布（同口径：`process.platform` + `isLinux/isMac/isWindows`）**：
+
+| 位置 | 处数 |
+|---|---|
+| `platform/os/` 内 | **60**（90%）|
+| `platform/os/` 外 | **7** —— `domains/relay/frpmgr.js` 4 / `guard/supervisor/settings-view.js` 2 / `supervisor.js` 1 |
+
+→ **内核有平台抽象层，且集中度好。** 这是壳缺失而内核已有的东西。
+
+## 5. 监督循环（三层 + 事件旁路）
+
+```
+单一定时器 setInterval(probeIntervalMs=5s)     supervisor.js:457-463（_heartbeatBusy 防重入）
+        ↓
+ManagedRegistry.heartbeat(5000)                objects.js:289-324
+        ↓  遍历受管对象，按 tickEvery 节流
+  ├─ dsh            tickEvery=1  → _dshSuperviseOnce → _dshConverge（唯一状态机）
+  ├─ sandbox-instance tickEvery=1 → InstanceManager.supervise
+  ├─ router-daemon  tickEvery=6（≈30s）→ DaemonLifecycle.classify/ensure
+  └─ lan-daemon     tickEvery=6（≈30s）→ 同上
+
+旁路：setDesired/requestRestart → 立即 tick()（_ticking 防并发）
+    退避不是独立定时器，而是 converge 内的 backoffDue/restartDue 时间闸
+独立定时器：自更新检查（20s 首查 + 1h 周期）、壳看护（20s）
+```
+
+**注意（结构债）**：存在**两套并行生命周期状态源**，靠三个手工镜像函数对账：
+
+| 状态源 | 文件 | phase 词表 |
+|---|---|---|
+| `LifecycleManager` | `guard/lifecycle/managed.js:19` | stopped/starting/running/draining/degraded |
+| `ManagedRegistry` | `guard/lifecycle/objects.js:23` | + installing/backoff/failed/restarting |
+
+对账函数：`supervise-view.js:52` `_syncDshLifecycleView` / `control-view.js:583` `_syncRouterLifecycleView` / `control-view.js:606` `_syncInstancesLifecycleView`。
+
+## 6. 跨仓契约面（全清单）
+
+| 契约 | 类型 | 方向 | 格式/语义 |
+|---|---|---|---|
+| `~/.dsh/supervisor/config.json` | 文件 | 内核写 / **壳读** | `apiPort`、`closeAction`(hide\|exit)、`apiAccessKey`、`shellWatchdog`…（**壳读内核配置的唯一入口**：`env.rs:229 config_json()`，一律真 JSON 解析，禁字符串扫描）|
+| `~/.dsh/supervisor/runtime.json` | 文件 | **壳写** / 内核读 | `{nodeVersion,nodePath,installedAt,source}`（`node.rs:378`；`settings-view.js:40` 读）|
+| `~/.dsh/supervisor/registry.json` | 文件 | **壳写** / 内核读 | 镜像源 `{mode,origins,manualOrigin}`（`mirror.rs:191 export_to_kernel`；`supervisor.js:192` 读）|
+| `~/.dsh/shell/identity.json` | 文件 | **壳写** / 内核读 | `{version,phase,pid,exe,attempt,pinned,…}`（`update.rs:187`；`domains/shell/index.js:45` 读）|
+| `~/.dsh/shell/update-journal.json` | 文件 | **内核写** / 壳读 | 更新账本 pending/confirmed/pinned（`domains/shell/index.js:50`）|
+| 守卫服务定义 | 文件 | **壳写** / 服务管理器读 | systemd unit / LaunchAgent plist / schtasks（`service.rs:72-203`）|
+| 面板 HTTP API | HTTP | 内核提供 / 壳与浏览器消费 | **71 精确 + 14 前缀**（`api/surface.js`）；信任三层（socket 身份 → Origin 端口 → 可选 access key）|
+| 壳健康上报 | HTTP | 壳 → 内核 | `POST /shell/health`（`phase=ready` 即更新确认信号）|
+| 守卫握手 | HTTP | 壳 → 内核 | `GET /healthz`、`GET /session/status`、`POST /session/stop` |
+
+**逐项核实结果**：
+
+| 契约 | 单写入方？ | 原子写？ | schema？ |
+|---|---|---|---|
+| `config.json` | ✅ 内核 | ✅（`supervisor.js:735-750`）| ❌ |
+| `runtime.json` | ✅ 壳 | ❌ 直接 `fs::write`（`node.rs:387`）| ❌ |
+| `registry.json` | ⚠️ **壳写但只在手动改镜像时**（`main.rs:1079` 是**全仓唯一调用点**）| ✅（`mirror.rs:213` tmp+rename）| ❌ |
+| `identity.json` | ✅ 壳 | ✅（`update.rs:write_json` tmp+rename）| ❌ |
+| `update-journal.json` | ✅ 内核 | ✅（`domains/shell/index.js:34-40`）| ❌ |
+
+→ **契约面存在的三个结构缺口**：① `registry.json` 基本没在跑；② 全部无 schema 版本；③ `runtime.json` 非原子写。
+
+---
+
+# 第三部分　桌面壳架构（实测）
+
+## 7. 逻辑架构（现状）
+
+```
+壳 = 引导状态机  +  窗口/托盘  +  与内核的 HTTP/文件对话
+
+引导状态机（bootstrap.html 单块 760 行 JS）：
+  stepEnv()          → 轮询 node_status（900ms 预算，前端 15s withTimeout）
+  afterEnv()         → Node 缺/过低 → probeMirrorThen → start_node_install
+  stepShellUpdate()  → shell_update_check / apply（Tauri updater + minisign）
+  stepCorePlan()     → core_plan → core_apply
+  stepGuardReady()   → guard_start → guard_ready 轮询
+  stepPanel()        → finish_boot → window.location.replace(shell.html)
+
+窗口/托盘（main.rs + shell.html）：
+  decorations:false → 自绘标题栏（min/max/hide + 显式拖动）
+  CloseRequested → closeAction==exit ? shutdown_all()+exit(0) : hide()+prevent_close()
+  托盘左键 → show_main；右键 → 菜单（显示/启动/停止/重启/退出）
+```
+
+**IPC 形态（全部经 `main.rs` 的 20 个 `#[tauri::command]`）**：
+
+| 命令 | 行 | 体量 | 职责 |
+|---|---|---|---|
+| `node_status` | 73 | 47 | 环境探测（异步，900ms 预算）|
+| `mirror_warmup` / `mirror_cached` | 125/132 | 5/17 | 镜像预热（后台）+ 读缓存（无 I/O）|
+| `node_latest` | 151 | 17 | 官方最新 LTS（网络）|
+| `start_node_install` | 186 | 39 | 装 Node |
+| `core_status`/`core_plan`/`core_apply` | 369/394/407 | 22/8/38 | 内核版本治理 |
+| `guard_start`/`guard_ready` | 447/484 | 30/14 | 守卫启停与握手 |
+| `win_ctl` | 502 | 26 | 窗口动作 |
+| `shell_identity`/`shell_set_phase`/`shell_panel_url` | 960/971/820 | 9/4/8 | 壳身份与阶段 |
+| `mirror_status`/`mirror_set` | 1020/1054 | 31/30 | 镜像设置 |
+| `shell_update_check`/`shell_update_apply` | 1088/1145 | 54/77 | 壳自更新 |
+| `shell_restart`/`finish_boot` | 1224/172 | 6/5 | 重启/完成 |
+
+**无头自检入口（4 个，任何平台可跑）**：`--env-plan` / `--mirror-plan` / `--node-plan` / `--core-plan` / `--service-plan`。
+
+## 8. 工程现状：脆弱性量化
+
+| 指标 | 实测 | 对照（内核）| 判断 |
+|---|---|---|---|
+| 平台分支 | **43 处 / 8 文件** | 67 处 / 60 在 `platform/os/`（90%）| ❌ **壳零平台层** |
+| 分支明细 | `node.rs` 11 / `main.rs` 10 / `service.rs` 9 / `env.rs` 6 / `bounded` 2 / `nodeprobe` 2 / `update` 2 / `core` 1 | — | ❌ 加平台翻 8 文件 |
+| `main.rs` | **1487 行**（20 命令 487 行 + 4 CLI + 平台服务控制 + 业务）| `supervisor.js` 1188 行但已拆 6 mixin | ❌ 单体，无分层 |
+| 错误类型 | `Result<_, String>` **42 处** / Error 枚举 **0** | 内核 `{ok:false,error,code?}` 对象 | ❌ 前端只能字符串匹配 |
+| 前端 | `bootstrap.html` **760 行单块 JS** | 内核 `ui-react/` 有构建与模块化 | ❌ 一处语法错全页死（已真实发生）|
+| **有界执行** | `bounded.rs` + **B32 门禁**（禁裸 `.output()`）| `platform/exec.js` **零引用** + 23 处无 timeout | ✅ **壳优于内核**（罕见）|
+| 文档 | 10 份，`Contract`/`不变量`/`平台矩阵` 出现 **0** 次 | `ARCHITECTURE-CONTRACT-phase0.md` 等 | ❌ 无规范 |
+| 测试 | `cargo test` **68 项**（B1–B55 + V1–V6 + 单元）| 47 文件 / 991 断言 | ✅ 基础健康 |
+
+**结论：壳不是「一塌糊涂」，是「缺一层抽象（platform/）＋ 缺一层分层（commands/domain）＋ 缺规范文档＋ 缺把规范变门禁」。**
+
+## 9. 壳的真实缺陷（本次审计确证）
+
+| # | 缺陷 | 证据 | 后果 |
+|---|---|---|---|
+| **S1** | 分层违规：`service.rs` 管**定义**、`main.rs:543-614` 管**启停** | 同一概念分居两层，各 4 份 `#[cfg]` | 加平台要改两处不同层 |
+| **S2** | `main.rs` 混装 IPC + 平台 + 业务 | 1487 行 / 20 命令 | 无法单测、无法替换 |
+| **S3** | 错误全靠字符串 | 42 处 `Result<_, String>` | 前端按文案猜、无法程序化分支 |
+| **S4** | 前端单块 760 行 | `bootstrap.html` 实测 1 个内联 script | 一处语法错全页不执行（2026-09-11 已发生一次）|
+| **S5** | 平台分支无归属 | 43 处散落 8 文件 | 加平台/查平台 bug 成本高 |
+
+---
+
+# 第四部分　抽取审计（内核 → 壳）
+
+## 10. 判据（由 F1–F5 推出，非偏好）
+
+```
+能力 X 的归属判定：
+  X 在「装内核之前/期间」需要？          → 壳（F1）
+  X 在「无 GUI/无壳」时仍需工作？         → 核（F2/F3）
+  两侧都需要，但只是「同一份事实/规格」？ → 壳拥有定义，内核消费产物（F5-②）
+  两侧都需要，且是「同一套行为语义」？    → 统一规格 + 测试向量（F5-③）
+  只有一侧需要？                         → 留在那侧，不做无意义搬迁
+```
+
+## 11. 逐项判定
+
+### 11.1 内核**运行期专有** → 留内核（约 18900 / 19354 行，97.6%）
+
+| 分域 | 行数 | 归属依据 |
+|---|---|---|
+| `guard/`（21 文件）| 5042 | F2/F3：守卫在无壳时运行 |
+| `domains/router`（14 文件）| 4774 | F2：纯运行期（路由/配额/供应商）|
+| `domains/relay`（4 文件）| 1444 | F2：反代/公网暴露 |
+| `domains/plugin`（2 文件）| 1281 | F2+F4：面板与运行期都要 |
+| `domains/instance`（1 文件）| 987 | F2+F4：实例生命周期 |
+| `domains/shell`（2 文件）| 507 | **F3**：壳崩溃时壳不存在，只有抗重启的守卫能救它 |
+| `domains/dist`（2 文件）| 548 | F2：内核自升级/装插件要走 npm |
+| `api/`（13 文件）| 1495 | F4：面板由内核托管 |
+| `platform/` 基础（非 os）| 约 1400 | F2：日志/事件/token/tasks/config |
+| `supervisor.js` + `bin/` | 1839 | F2：编排与宿主 |
+
+### 11.2 真正的重叠 → 需统一
+
+| # | 重叠 | 壳侧 | 内核侧 | 判定 |
+|---|---|---|---|---|
+| **O1** | **npm 镜像目录** | `mirror.rs` NPM_PRESETS **6** | `dist/index.js` REGISTRY_PRESETS **6** + `config.js` registries **6** | 🔴 **逐字节相同的 3 份** → **壳拥有，内核消费产物** |
+| **O2** | **镜像探测方法** | 真实包元数据 `@dsh-sup/dsh-core-<plat>` | `/-/ping` | 🔴 **方法不同 → 结论不同**（实测 ustclug 2613ms vs 389ms；内核选 huaweicloud、壳选 npmmirror）|
+| **O3** | **npm 安装执行** | `core.rs`（含三平台提权）| `dist/index.js runNpmInstall`（不提权）| 🟡 **执行各留**（提权需人在场，内核做不到）；**规格共享** |
+| **O4** | **环境探测** | `nodeprobe.rs` 639 + `env.rs` 272（含**最低门槛 v22.12**）| `env-catalog.js` 83（只 `which --version`）| 🟡 **规格必须统一**：内核现会谎报「环境就绪」 |
+| **O5** | **平台原语** | `bounded.rs` 191（有界执行）| `platform/exec.js` 48（**零引用**）| 🟡 **规格 + 测试向量**；且内核有 23 处无 timeout 的 `execFileSync` |
+| **O6** | **版本校验/比较** | `core.rs is_valid_version` / `semver_cmp` | `dist VERSION_RE` / `semverCompare` | 🟡 **测试向量**（实测 3 处分歧：`1.0.0+`、`1.0.0+!!!`、`1.0.0+あ`）|
+| **O7** | **自启/服务定义** | `service.rs` 258（三平台定义）| `autostart.js` 354（开关 + GUI 自启）| ✅ **已定案**（所有权矩阵）|
+
+### 11.3 **不做**的事（诚实说明）
+
+| 不做 | 理由 |
+|---|---|
+| 把 DSH/插件安装移到壳 | F2：内核在壳关闭时必须能自升级/装插件 |
+| 把 `platform/os/service.js` 移到壳 | 它管 **DSH 实例**的 systemd transient 单元，与守卫服务是**不同对象** |
+| 合并日志 | 内核 `EventHub` 是有**不变量**的子系统（单写者、seq 全局单调、跨重启续号）；合并会破坏它。应做**统一格式 + 统一读取视图** |
+| 把壳看护移到壳 | 壳不能自监督（F3）；已由守卫承载 |
+| 追求「代码量减少」| 待统一的仅**内核侧约 420 行副本**（占 2%）。真实收益是**「同一问题只有一个答案」** |
+
+## 12. 内核的真实缺陷（本次审计确证，与壳重叠无关）
+
+| # | 缺陷 | 证据 | 后果 |
+|---|---|---|---|
+| **K1** | **daemon 脚本路径全断**（§7.6 拆分后未更新）| `control-view.js:216-220` `path.join(__dirname,'..')` + `'src/domains/.../daemon.js'` → 实际解析为 `src/guard/src/domains/...`（**node 实测 MISS**）；`registry-view.js:185/195` 同一错误 | `_daemonLifecycle` 恒 `null` → **守卫永远无法自起 router/lan daemon**；`lanDaemon=true` 直接返回「脚本缺失」。**发行态更甚**：`build-launcher.sh` 只发 `bin/core.cjs/ui-react`，连修对路径也无 `src/`。**测试绕过**（`daemon-lifecycle-test.js:24` 直接 new、`lan-daemon-test.js:93` 自行 spawn）|
+| **K2** | **`platform/exec.js` 是死代码** | 全仓 **0 处 require**；而 23 处 `execFileSync` **无 timeout**（`autostart.js` 11 / `native/manager.js` 4 / `settings-view.js` 4 / `service.js` 2 / `fs-utils.js` 1 / `token.js` 1）| 该文件自称「同步 exec 的**唯一入口**」，实际无人使用 → systemctl/schtasks/npm 无响应时**无界挂起**。与 macOS 假注释**同一失效模式** |
+| **K3** | 双生命周期状态源 | `lifecycle/managed.js:19` 与 `lifecycle/objects.js:23` 各存 desired/phase，靠 3 个手工镜像函数对账 | 易漂移；phase 词表实际有 4 套 |
+| **K4** | `ManagedLifecycle.start` 忽略回调 `ok:false` | `managed.js:113-118` 不看 `r.ok` | `/lifecycle/status` 谎报成功 |
+| **K5** | 影子决策未建模 `_crashHalted` | `converge-view.js:29-35/67-72` | G3 切换门槛永久不可达，日志持续刷 diff |
+| **K6** | `originAllowed` 只比端口不校验 host | `api/index.js:118-128`；`identity.js:7-8` 声称有 Host 校验但**实现不存在** | DNS-rebinding CSRF 可驱动全部写接口 |
+| **K7** | `ports.js:46` 用 `process.env.HOME \|\| '/tmp'` | 同上 | Windows 无 HOME → 端口注册表写 `/tmp`（错误位置）|
+| **K8** | 平台命令泄漏到业务层 | `settings-view.js:100`（systemd 专属）、`:323/327`（`ip` 命令）、`native/manager.js:165-170/646-651`（裸 `node`/`npm`）| macOS/Windows 上局域网面板 URL 为空、npm 调用失败 |
+| **K9** | 版本解析正则错误 | `settings-view.js:228` `/dsh-supervisor v([^s]+)/` —— `[^s]` 应为 `[^\s]` | 自更新 verified 判定被污染 |
+| **K10** | 卸载失败仍删 manifest | `native/manager.js:657-665` | 残留无法清理 |
+
+---
+
+# 第五部分　目标架构（一次性目标态）
+
+## 13. 壳的逻辑架构
+
+```
+┌─ 引导状态机（显式，可测）────────────────────────────────────────────┐
+│  Step 枚举：Env → Node → ShellUpdate → Kernel → Guard → Panel        │
+│  每步契约：{ id, budgetMs, run(ctx) → StepResult, onFail(action) }   │
+│  StepResult = { ok } | { ok:false, reason, retryable, hint }         │
+│  引擎负责：超时、重试、进度上报、错误归类 —— 步骤只关心自己           │
+└──────────────────────────────────────────────────────────────────────┘
+                                    │
+┌─ 窗口/托盘 ───────────────────────┼──────────────────────────────────┐
+│  自绘标题栏 · 关闭语义（hide/exit）· 托盘菜单 · 面板导航             │
+└──────────────────────────────────────────────────────────────────────┘
+                                    │
+┌─ 与内核对话 ──────────────────────┼──────────────────────────────────┐
+│  HTTP：/healthz /session/* /shell/* /env/* /dist/*（经 contract/）   │
+│  文件：写 registry.json / identity.json / runtime.json（经 contract/）│
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+## 14. 壳的工程架构（目标目录结构）
+
+```
+src-tauri/src/
+├── main.rs                    # 仅组装 + 入口（目标 ≤ 150 行）
+│
+├── commands/                  # ① IPC 边界层（20 个 #[tauri::command]）
+│   ├── mod.rs  env.rs  node.rs  core.rs  mirror.rs  shell.rs  window.rs
+│   └── 【禁】业务逻辑 · 平台判断 · 直接 Command 调用
+│
+├── domain/                    # ② 业务层（平台无关）
+│   ├── boot/                  #    Step 枚举 + 引导引擎（取代 760 行前端状态机）
+│   ├── probe/                 #    nodeprobe 拆分：候选枚举 / 版本 / PATH
+│   ├── provision/             #    Node 安装 + 内核安装（供给）
+│   ├── mirror/                #    镜像目录 + 选择 + **契约投放**
+│   ├── update/                #    壳自更新 + 护栏账本
+│   └── contract/              #    与内核的契约（schema 校验 + 原子读写）
+│
+├── platform/                  # ③ 平台适配层 —— **全仓唯一平台分支所在地**
+│   ├── mod.rs                 #    trait Platform / trait ServiceControl
+│   ├── linux.rs  macos.rs  windows.rs  unsupported.rs
+│   └── 【目标】43 处分支从 8 文件收拢到此
+│
+├── infra/                     # ④ 原语
+│   ├── bounded.rs             #    有界执行（既有，保留 B32 门禁）
+│   ├── fs.rs  net.rs  proc.rs
+│
+└── error.rs                   # 结构化 ShellError
+```
+
+**依赖方向（硬约束，单向）**：
+
+```
+commands ──▶ domain ──▶ platform ──▶ infra
+                │                    ▲
+                └────────────────────┘
+（infra 不得依赖 domain；platform 不得依赖 commands）
+```
+
+## 15. 平台适配层（把 43 处收拢成 1 个契约）
+
+```rust
+// platform/mod.rs
+/// 平台能力契约。**每个能力要么实现，要么显式 Unsupported**（不得静默成功）。
+pub trait Platform: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    // ── Node 制品与安装（F1：这是壳的独有职责）──
+    fn node_artifact(&self, version: &str) -> Option<NodeArtifact>;  // tar.xz / pkg / msi
+    fn install_node(&self, a: &Path) -> Result<InstallReport, ShellError>;  // 含提权
+    fn core_platform_tag(&self) -> &'static str;   // linux-x64 / darwin-arm64 / win-x64
+
+    // ── 探测 ──
+    fn path_dirs(&self) -> Vec<PathBuf>;
+    fn known_node_locations(&self) -> Vec<PathBuf>;
+    fn is_local_fixed_dir(&self, d: &Path) -> bool;   // Windows 排除网络盘/可移动盘
+
+    // ── 服务（**定义 + 启停同一对象** —— 修掉 S1 分层违规）──
+    fn service(&self) -> &dyn ServiceControl;
+
+    // ── 能力声明（供契约与诊断）──
+    fn capabilities(&self) -> PlatformCapabilities;
+}
+
+pub trait ServiceControl: Send + Sync {
+    fn definition_path(&self) -> PathBuf;
+    fn ensure_defined(&self, guard: &Path) -> Result<String, ShellError>;
+    fn start(&self) -> Result<(), ShellError>;
+    fn stop(&self) -> Result<(), ShellError>;
+    fn spawn_daemon(&self, guard: &Path) -> Result<u32, ShellError>;
+}
+```
+
+## 16. 结构化错误（替代 42 处 `Result<_, String>`）
+
+```rust
+// error.rs
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ShellError {
+    Probe   { stage: String, cause: String, elapsed_ms: u128 },  // 必须带阶段与耗时
+    Network { url: String, cause: String },
+    Install { platform: String, cause: String },
+    Service { action: String, cause: String },
+    Contract{ file: String, cause: String },   // 与内核的边界
+    Ipc     { cause: String },
+    Unsupported { capability: String, platform: String },  // 替代静默成功
+}
+```
+
+前端按 `kind` 给**不同的可操作建议**，而不是显示一句可能判错的话。
+
+## 17. 跨平台规范（矩阵即断言）
+
+| 能力 | Linux | macOS | Windows | 实现位 |
+|---|---|---|---|---|
+| 环境探针（候选/版本/PATH）| ✅ | ✅ | ✅ | `domain/probe` |
+| Node 制品解析 | ✅ `tar.xz` | ✅ `pkg` | ✅ `msi` | `platform/*::node_artifact` |
+| Node 安装（提权）| ✅ `pkexec` | ✅ `osascript` | ✅ `msiexec` | `platform/*::install_node` |
+| 镜像测速与选择 | ✅ | ✅ | ✅ | `domain/mirror` |
+| 内核安装/升级 | ✅ | ✅ | ✅ | `domain/provision` |
+| 服务定义（守卫）| ✅ systemd | ✅ LaunchAgent | ✅ schtasks | `platform/*::ServiceControl` |
+| 服务启停 | ✅ `systemctl --user` | ✅ `launchctl` | ✅ `schtasks` | 同上 |
+| 提权通道探测 | ✅ | ✅（恒有）| ✅ | `platform/*::has_privilege_channel` |
+| 壳自更新 | ✅ deb/rpm | ✅ app | ✅ exe/msi | `domain/update` |
+| 壳崩溃自愈 | ✅ 守卫看护 | ✅ 守卫看护 | ✅ 守卫看护 | 内核 `domains/shell/watchdog` |
+| 壳开机自启 | ✅ XDG | ✅ LaunchAgent gui | ✅ schtasks GUI | `platform/os/autostart`（内核）|
+
+**不变量 P1**：每格必须是「实现」或「显式 Unsupported」。
+
+## 18. 契约层（与内核的唯一耦合面）
+
+```
+domain/contract/
+  ├── schema.rs     契约版本常量 + 校验（每个契约带 schema）
+  ├── mirror.rs     写 ~/.dsh/supervisor/registry.json（**壳是唯一写入方**）
+  ├── identity.rs   写 ~/.dsh/shell/identity.json
+  └── runtime.rs    写 ~/.dsh/supervisor/runtime.json（改为原子写）
+```
+
+### 18.1 `registry.json` 升级（消费者内核已就位）
+
+```jsonc
+{
+  "schema": 2,                          // 新增：契约版本
+  "writtenBy": "shell@1.0.9",           // 新增：谁写的
+  "writtenAt": 1789147076,
+  "mode": "auto",                       // 既有
+  "manualOrigin": "https://registry.npmmirror.com",
+  "catalog": [ "…" ],                   // 新增：全集（此前只有被选中的）
+  "selected": { "origin": "…", "latencyMs": 57, "checkedAt": 1789147070 },
+  "probe": {                            // 新增：探测规格 → 两侧同一答案（修 O2）
+    "kind": "package-metadata",
+    "pathTemplate": "@dsh-sup%2Fdsh-core-{platform}",
+    "timeoutMs": 6000
+  }
+}
+```
+
+### 18.2 投放时机（修「基本没在跑」）
+
+```
+壳启动              → 导出（契约缺失或 schema 过期时）
+用户改镜像设置       → 导出（既有）
+壳版本升级后         → 导出（含 schema 迁移）
+内核读取             → 优先契约；缺失/损坏/schema 不匹配 → 最小兜底 + 写事件
+内核复测（过期）     → **按契约的 probe 规格**执行 → 与壳同法
+```
+
+### 18.3 契约不变量
+
+| # | 不变量 |
+|---|---|
+| **C1** | 每个契约文件**只有一个写入方**（双写必然漂移 —— macOS plist 已发生过）|
+| **C2** | 内核在契约缺失时**必须能降级运行** |
+| **C3** | 契约带 `schema`，不匹配时**明确拒绝**并记录 |
+| **C4** | 写入**原子**（tmp+rename），读取**容忍缺失** |
+| **C5** | 壳**启动必导出** |
+| **C6** | 两侧对同一问题的判定**必须给同一答案** |
+
+## 19. 前端架构（消除单点死亡）
+
+```
+bootstrap/
+  ├── bootstrap.html          # 骨架 + 各模块 <script>
+  ├── shell.html              # 壳框架
+  └── js/
+      ├── 00-runtime.js       #   IPC 获取 + withTimeout + **全局 onerror**
+      ├── 10-ui.js            #   状态/步骤/失败页/诊断串
+      ├── 20-env.js  30-node.js  40-mirror.js
+      └── 50-shell-update.js  60-kernel.js  70-guard.js
+```
+
+| # | 不变量 |
+|---|---|
+| **F1** | 每个 JS 文件**独立语法检查**（每文件一个断言）|
+| **F2** | 全局 `window.onerror` + `unhandledrejection` → 上报落 `shell.log` |
+| **F3** | 启动自检：IPC 不可用时**明确报错**，不得静默停住 |
+| **F4** | 需要 IPC 的页面必须是**主帧**（既有 B54）|
+
+---
+
+# 第六部分　一次性执行方案
+
+> **不分阶段交付**：以下 5 批工作在**一次改造**中完成，可在同一 PR/同一版本内交付。
+> 批内有序（有依赖），批间无发布节点。
+
+## 20. 执行批次
+
+### 批 A　壳的平台层（修 S5 + S1）
+
+| # | 动作 | 验收 |
+|---|---|---|
+| A1 | 建 `platform/{mod,linux,macos,windows,unsupported}.rs`，定义 `Platform` + `ServiceControl` | 编译通过 |
+| A2 | 把 **43 处平台分支**搬入 `platform/`（**搬位置不改逻辑**）| 门禁 **G1** 绿 |
+| A3 | 把 `service.rs` 的 `ensure_defined` 与 `main.rs` 的 `start/stop_guard_service` **合并进 `ServiceControl`** | 门禁 **G2** 绿 |
+| A4 | 平台能力矩阵自检 `--platform-matrix` | 三平台输出与 §17 一致 |
+
+### 批 B　壳的分层（修 S2）
+
+| # | 动作 | 验收 |
+|---|---|---|
+| B1 | `main.rs` 拆出 `commands/`（20 个命令按域分文件）| `main.rs` ≤ 150 行 |
+| B2 | 业务抽到 `domain/`（probe/provision/mirror/update）| 门禁 **G3**（命令体 ≤ 40 行）|
+| B3 | `bounded.rs` → `infra/bounded.rs`；新增 `infra/{fs,net,proc}.rs` | B32 门禁保持绿 |
+
+### 批 C　错误模型（修 S3）
+
+| # | 动作 | 验收 |
+|---|---|---|
+| C1 | 引入 `error.rs::ShellError` | 42 处 `Result<_, String>` 归零 |
+| C2 | IPC 边界改为结构化错误；前端按 `kind` 出建议 | 诊断页显示 kind 而非裸字符串 |
+
+### 批 D　契约层（修 O1/O2/O4/O6 + C1–C6）
+
+| # | 动作 | 验收 |
+|---|---|---|
+| D1 | 建 `domain/contract/`，`registry.json` 升 schema=2（含 catalog/selected/probe）| 内核实测能读 |
+| D2 | **壳启动即导出**（修「只在手动改镜像时导出」）| 全新 HOME 首启后文件存在 |
+| D3 | 内核 `dist` 的 6 源副本 → **最小兜底**（2 源）；`config.js` 同理 | 内核侧副本 < 10 行 |
+| D4 | 内核按契约 `probe` 规格复测（修 O2 选源不一致）| 两侧选源一致（同机同刻）|
+| D5 | 内核 `env-catalog` 采用 **v22.12 门槛**（修 O4）| 面板不再谎报「环境就绪」|
+| D6 | `shared/version-vectors.json` + 两侧测试（修 O6）| 3 处历史分歧被覆盖 |
+
+### 批 E　前端 + 门禁（修 S4 + 建立规范强制）
+
+| # | 动作 | 验收 |
+|---|---|---|
+| E1 | `bootstrap.html` 760 行 → 8 个 JS 模块 | 门禁 **G5**（每文件独立语法）|
+| E2 | 全局 `onerror`/`unhandledrejection` → `shell.log` | 人为抛错能在日志看到 |
+| E3 | 落 **G1–G8** 全部门禁 | `cargo test` 含 8 组新断言 |
+
+### 批 F　内核侧缺陷（修 K1–K10）
+
+| # | 动作 | 验收 |
+|---|---|---|
+| F1 | **K1**：修 daemon 脚本路径（`control-view.js:216` / `registry-view.js:185/195`）| 门禁：路径必须 `existsSync` 为真 |
+| F2 | **K1 发行态**：`build-launcher.sh` 打包 `src/` 或让 daemon 内联/改用同进程 | 发行包内路径可达 |
+| F3 | **K2**：`platform/exec.js` 接入全部 `execFileSync`（或删除并统一到 `bounded` 等价物）+ 加「禁裸 exec」门禁 | 无 timeout 的 `execFileSync` 归零 |
+| F4 | K6：`originAllowed` 增加 host 校验（补上 `identity.js` 声称的 Host 闸）| 新增 rebinding 测试 |
+| F5 | K7/K8/K9/K10：`ports.js` HOME 兜底 / 平台命令下沉 / 正则修正 / manifest 保留 | 逐条断言 |
+| F6 | K3/K4/K5：生命周期双源收敛、`start` 尊重 `ok:false`、影子建模 `crashHalted` | `/lifecycle/status` 不再谎报 |
+
+## 21. 门禁清单（规范的可执行化）
+
+| # | 门禁 | 类型 |
+|---|---|---|
+| **G1** | 平台分支只在 `platform/` 内 | ✅ 会失败 |
+| **G2** | `commands/` 内零 `Command`、零 `#[cfg]` | ✅ |
+| **G3** | `main.rs` ≤ 150 行；命令体 ≤ 40 行 | ✅ |
+| **G4** | 每能力 × 每平台 = 实现 或 `Unsupported` | ✅ |
+| **G5** | 每个前端 JS 独立语法正确 | ✅ |
+| **G6** | 契约带 `schema`；壳启动必导出 | ✅ |
+| **G7** | 阻塞调用经 `infra::bounded` | ✅（B32 扩展）|
+| **G8** | 注释引用的**仓内路径必须存在** | ✅（新增；已发现 30+ 悬空）|
+| **G9** | 内核：无 timeout 的 `execFileSync` 归零 | ✅（新增）|
+| **G10** | 内核：脚本路径引用必须 `existsSync` | ✅（新增；直接防 K1 复发）|
+
+## 22. 验收标准（何时算「标准壳工程」）
+
+```
+1. cargo test 全绿，且含 G1–G8；内核 npm test 全绿，且含 G9–G10
+2. 三平台 CI 各跑 --platform-matrix，输出与 §17 一致
+3. main.rs ≤ 150 行；commands/ 内零 #[cfg]、零 Command
+4. 前端 8 个 JS 模块各自语法门禁；删任一模块不影响其余模块加载与报错
+5. 契约 schema=2 + 壳启动导出；内核实测读到并按其 probe 规格复测，两侧选源一致
+6. §17 矩阵每格可指出对应测试名
+7. §18.3 六条契约不变量、§19 四条前端不变量，各有断言
+```
+
+## 23. 风险与回滚
+
+| 风险 | 缓解 |
+|---|---|
+| 43 处平台分支搬移引入回归 | 纯搬位置不改逻辑；既有 68 项测试 + 新增 G1/G2 双保险 |
+| `main.rs` 拆分引入运行期 `ReferenceError` | 命令按域分文件、每文件独立编译单元；`cargo check` 即暴露 |
+| 前端拆 8 模块引入加载顺序问题 | 模块间只经 `00-runtime.js` 暴露的全局 API；E2E（Xvfb 真跑）验证 |
+| 契约 schema=2 与旧内核不兼容 | 内核侧**先就位**消费逻辑（向后兼容读旧格式），再切壳的写入 |
+| 内核 F1/F2 路径修复影响 daemon 启动 | 修复后 `--service-plan` 与真实 daemon 启动双验证 |
+
+**回滚粒度**：批 A–F 各自独立提交，单批可 revert；契约批（D）因两仓同时改，需两仓同版本回滚。
+
+---
+
+## 24. 本方案与前序文档的关系
+
+| 文档 | 关系 |
+|---|---|
+| `DESIGN-BOUNDARY.md` | 本文件的**抽取审计**部分（判据与逐项判定的展开版）|
+| `DESIGN-SHELL-ARCHITECTURE.md` | 本文件的**壳目标架构**部分（分层/平台层/错误/契约/门禁的展开版）|
+| 内核 `PLATFORM-CAPABILITY-MATRIX.md` | §17 矩阵的内核侧权威版（14 项 × 3 平台）|
+| 内核 `AUDIT-CROSS-PLATFORM.md` | 跨平台审计历史（§五.a 含 2026-09-11 复核更正）|
+| 本文件 `DESIGN-COMPLETE.md` | **总纲**：系统全貌 + 双侧审计 + 抽取决策 + 目标架构 + 一次性执行方案 |
+
+## 25. 诚实说明
+
+1. **内核约 97.6% 不需要动**。真实重叠仅约 420 行副本 —— 本方案的价值在**消除不一致**与**建立规范**，不在减少行数。
+2. **壳在「有界执行」这一维度优于内核**（有 B32 门禁；内核的 `exec.js` 是死代码）。方案中 F3 是**内核向壳学**，不是反向。
+3. **K1（daemon 路径全断）是本次审计最严重的发现**，且它**不在**任何既有测试覆盖内 —— 说明「测试绿」不等于「功能通」。
+4. 本次审计中，**子代理报告与我亲自复核的结论一致**（K1 已用 node 实测确认路径 MISS）。
+5. **未确认项**：壳在 macOS/Windows 上的真实运行行为（本机为 Linux，`--platform-matrix` 需三平台 CI 才能验证）；发行态 `build-launcher.sh` 之外的打包路径（`release-core.sh`）是否另有处理。

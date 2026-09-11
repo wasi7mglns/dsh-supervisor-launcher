@@ -50,7 +50,8 @@ systemd user unit → dsh-supervisor（守卫内核，闭源）→ dsh web (127.
 
 | 文档 | 性质 | 说明 |
 |---|---|---|
-| [DESIGN-SHELL-ARCHITECTURE.md](docs/DESIGN-SHELL-ARCHITECTURE.md) | **规范（权威）** | 壳工程架构：分层 / 平台适配层 / 错误模型 / 契约层 / 前端隔离 / 门禁 G1–G8 / 不变量总表 |
+| [DESIGN-COMPLETE.md](docs/DESIGN-COMPLETE.md) | **总纲（权威）** | 全量代码审计后的完整架构理解 + 抽取决策 + 目标架构 + **一次性执行方案**（含双侧缺陷清单 K1–K10 / S1–S5）|
+| [DESIGN-SHELL-ARCHITECTURE.md](docs/DESIGN-SHELL-ARCHITECTURE.md) | **规范（权威）** | 壳工程架构：分层 / 平台适配层 / 错误模型 / 契约层 / 前端隔离 / 门禁 G1–G10 / 不变量总表 |
 | [DESIGN-BOUNDARY.md](docs/DESIGN-BOUNDARY.md) | **规范（权威）** | 内核↔壳职责边界与抽取审计：判据 R1–R4、重叠面 O1–O6、抽取决策 D1–D6、合作契约 C1–C4 |
 | [SHELL-EXECUTION-PLAN.md](docs/SHELL-EXECUTION-PLAN.md) | 计划 | 稳定与热更新完整执行方案 |
 | [SHELL-BOOTSTRAP-REMEDIATION.md](docs/SHELL-BOOTSTRAP-REMEDIATION.md) | **规范** | 引导逻辑修复方案（强制更新 + 失败回退）· 跨平台；含 K10/K11 的**设计决策与边界** |
