@@ -10,7 +10,7 @@
 mod core;
 mod env;
 mod node;
-// 桌面壳自更新（门 0）+ 落盘日志 + 身份上报（2026-09-11）
+// 桌面壳自更新 + 落盘日志 + 身份上报（2026-09-11）
 mod update;
 
 use std::net::{TcpStream, ToSocketAddrs};
@@ -551,7 +551,7 @@ fn get_session_state(port: u16) -> Option<String> {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 桌面壳自更新（门 0）命令（2026-09-11）
+// 桌面壳自更新命令（2026-09-11）
 //
 // 三平台**同一代码路径**：检查 → 下载 → minisign 验签 → 平台安装 → 重启。
 // 平台差异（Linux pkexec dpkg -i / macOS .app 替换 / Windows NSIS passive）
@@ -594,7 +594,29 @@ fn shell_set_phase(phase: String) {
     update::set_phase(&phase);
 }
 
-/// 门 0：检查是否有壳更新。
+// ── 超时预算（防「无超时网络请求 → 引导页永久卡住」）──
+// 事故背景（2026-09-11 Windows 真机实测）：用户装完桌面壳后，引导第一步就是壳更新，
+// 而 `check()` 在无超时的情况下遇到网络不可达**永不返回** → 前端 Promise 既不 resolve
+// 也不 reject → `.catch` 不触发 → 永久卡在「正在检查桌面更新」，用户无法进入产品。
+// 故：check 必须短超时（快速失败），下载必须长超时（大安装包 + 慢网），且外层再加 tokio
+// 兜底（reqwest 的 request timeout 不保证覆盖 DNS 等阶段）。
+const SHELL_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const SHELL_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// 构造带超时的更新器。
+/// ⚠ 该超时是 reqwest 的**整个请求**超时：check 用短超时；下载必须用长超时，
+///   否则大安装包会在传输中途被切断。
+fn shell_updater(
+    app: &tauri::AppHandle,
+    timeout: std::time::Duration,
+) -> Result<tauri_plugin_updater::Updater, String> {
+    app.updater_builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("更新器不可用: {}", e))
+}
+
+/// 检查是否有壳更新。
 /// 返回 { ok, available, current, latest, notes, skipped?, reason? }
 /// 语义：跳过的原因一律**不阻断启动**（有界失败即放行）。
 #[tauri::command]
@@ -602,24 +624,34 @@ async fn shell_update_check(app: tauri::AppHandle) -> Result<serde_json::Value, 
     let cur = app.package_info().version.to_string();
     let (should, reason) = update::should_check(&cur);
     if !should {
-        update::log(&format!("门0 跳过：{}", reason));
+        update::log(&format!("桌面更新跳过：{}", reason));
         return Ok(serde_json::json!({
             "ok": true, "available": false, "skipped": true, "reason": reason, "current": cur
         }));
     }
     update::set_phase("shell-update-check");
-    let updater = match app.updater() {
+    let updater = match shell_updater(&app, SHELL_CHECK_TIMEOUT) {
         Ok(u) => u,
-        Err(e) => {
-            let msg = format!("更新器不可用: {}", e);
-            update::log(&format!("门0 检查失败：{}", msg));
+        Err(msg) => {
+            update::log(&format!("桌面更新检查失败：{}", msg));
             return Ok(serde_json::json!({ "ok": false, "available": false, "error": msg, "current": cur }));
         }
     };
-    match updater.check().await {
-        Ok(Some(u)) => {
+    // 双保险：reqwest 的 request timeout 不保证覆盖所有阶段（如 DNS），外层再包一层 tokio 超时。
+    let checked = tokio::time::timeout(
+        SHELL_CHECK_TIMEOUT + std::time::Duration::from_secs(5),
+        updater.check(),
+    )
+    .await;
+    match checked {
+        Err(_) => {
+            let msg = format!("检查超时（{} 秒无响应，可能网络不可达）", SHELL_CHECK_TIMEOUT.as_secs());
+            update::log("桌面更新检查超时（网络不可达？）");
+            Ok(serde_json::json!({ "ok": false, "available": false, "error": msg, "current": cur }))
+        }
+        Ok(Ok(Some(u))) => {
             let latest = u.version.clone();
-            update::log(&format!("门0 发现新版本 {}（当前 {}）", latest, cur));
+            update::log(&format!("桌面更新发现新版本 {}（当前 {}）", latest, cur));
             Ok(serde_json::json!({
                 "ok": true,
                 "available": true,
@@ -629,46 +661,96 @@ async fn shell_update_check(app: tauri::AppHandle) -> Result<serde_json::Value, 
                 "date": u.date.map(|d| d.to_string()).unwrap_or_default(),
             }))
         }
-        Ok(None) => {
-            update::log(&format!("门0 已是最新（{}）", cur));
+        Ok(Ok(None)) => {
+            update::log(&format!("桌面更新已是最新（{}）", cur));
             Ok(serde_json::json!({ "ok": true, "available": false, "current": cur }))
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             // 网络失败/清单不可达/验签失败 → 一律「失败放行」，由引导页决定是否重试
             let msg = format!("{}", e);
-            update::log(&format!("门0 检查失败：{}", msg));
+            update::log(&format!("桌面更新检查失败：{}", msg));
             Ok(serde_json::json!({ "ok": false, "available": false, "error": msg, "current": cur }))
         }
     }
 }
 
-/// 门 0：下载并安装更新（minisign 验签在插件内强制执行）。
+/// 下载并安装更新（minisign 验签在插件内强制执行）。
 /// 成功后**不自动重启**——由引导页统一调用 shell_restart（便于先告知用户）。
 #[tauri::command]
 async fn shell_update_apply(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     update::set_phase("shell-update-download");
-    let updater = app.updater().map_err(|e| format!("更新器不可用: {}", e))?;
-    let found = updater.check().await.map_err(|e| format!("检查失败: {}", e))?;
+    // 下载需要长超时；但 check 不能等那么久 → check 单独用 tokio 包短超时。
+    let updater = shell_updater(&app, SHELL_DOWNLOAD_TIMEOUT)?;
+    let found = match tokio::time::timeout(SHELL_CHECK_TIMEOUT, updater.check()).await {
+        Err(_) => {
+            return Ok(serde_json::json!({ "ok": false, "error": "检查超时（可能网络不可达）" }));
+        }
+        Ok(Err(e)) => {
+            return Ok(serde_json::json!({ "ok": false, "error": format!("检查失败: {}", e) }));
+        }
+        Ok(Ok(f)) => f,
+    };
     let Some(u) = found else {
         return Ok(serde_json::json!({ "ok": true, "upToDate": true }));
     };
     let target = u.version.clone();
-    update::log(&format!("门0 开始下载安装 {}", target));
-    u.download_and_install(
-        |chunk, total| {
-            let _ = (chunk, total);
-        },
-        || {},
-    )
-    .await
-    .map_err(|e| {
-        let msg = format!("{}", e);
-        update::log(&format!("门0 安装失败：{}", msg));
-        msg
-    })?;
-    // 记录待生效版本：重启后若版本匹配即视为成功（否则累计失败次数并拉黑）
+
+    // ⚠ mark_pending 必须在 install **之前**（2026-09-11 修复）。
+    //   Windows 上 install 会 ShellExecuteW 启动安装程序后立即 std::process::exit(0)，
+    //   其后的任何代码都不会执行 —— 原先把它放在 download_and_install 之后，
+    //   导致 Windows 的护栏账本**永远拿不到 pendingVersion**，
+    //   「更新成功确认 / 连续失败拉黑」机制在 Windows 上完全失效。
     update::mark_pending(&target);
-    update::log(&format!("门0 安装完成 {}", target));
+    update::log(&format!("桌面更新开始下载 {}", target));
+
+    // 下载：用**进度事件**驱动前端进度条。
+    // （此前进度回调体是空的 `let _ = (chunk, total);` → 用户无法区分「正在下载」与
+    //   「卡死」；4MB+ 安装包在慢网下长时间零反馈，Windows 真机实测体验极差。）
+    // 注意：插件的 on_chunk 回调给的是**本块大小**（增量），故此处自行累加。
+    let mut got: u64 = 0;
+    let dl = tokio::time::timeout(
+        SHELL_DOWNLOAD_TIMEOUT,
+        u.download(
+            |chunk, total| {
+                got += chunk as u64;
+                let _ = app.emit(
+                    "shell_update_progress",
+                    serde_json::json!({ "downloaded": got, "total": total }),
+                );
+            },
+            || {},
+        ),
+    )
+    .await;
+    let bytes = match dl {
+        Err(_) => {
+            let msg = format!("下载超时（{} 分钟未完成）", SHELL_DOWNLOAD_TIMEOUT.as_secs() / 60);
+            update::log(&format!("桌面更新{}", msg));
+            return Ok(serde_json::json!({ "ok": false, "error": msg }));
+        }
+        Ok(Err(e)) => {
+            let msg = format!("下载失败: {}", e);
+            update::log(&format!("桌面更新{}", msg));
+            return Ok(serde_json::json!({ "ok": false, "error": msg }));
+        }
+        Ok(Ok(b)) => b,
+    };
+
+    let total = bytes.len() as u64;
+    let _ = app.emit(
+        "shell_update_progress",
+        serde_json::json!({ "downloaded": total, "total": total, "installing": true }),
+    );
+    update::log(&format!("桌面更新下载完成（{} 字节），开始安装 {}", total, target));
+
+    // ⚠ Windows：install 启动安装程序后 std::process::exit(0)，**不会返回**；
+    //   Linux/macOS：返回后由引导页调用 shell_restart 重启进入新版本。
+    if let Err(e) = u.install(bytes) {
+        let msg = format!("安装失败: {}", e);
+        update::log(&format!("桌面更新{}", msg));
+        return Ok(serde_json::json!({ "ok": false, "error": msg }));
+    }
+    update::log(&format!("桌面更新安装完成 {}", target));
     Ok(serde_json::json!({ "ok": true, "installed": target }))
 }
 
@@ -676,7 +758,7 @@ async fn shell_update_apply(app: tauri::AppHandle) -> Result<serde_json::Value, 
 #[tauri::command]
 fn shell_restart(app: tauri::AppHandle) {
     update::set_phase("restarting");
-    update::log("门0 重启以应用更新");
+    update::log("桌面更新重启以应用新版本");
     app.restart();
 }
 
@@ -690,7 +772,7 @@ fn main() {
         println!("{}", core::plan_text());
         std::process::exit(0);
     }
-    // 无头自检：壳自更新能力（门 0 基线）——发布后冒烟验证 + CI 门禁，无需 GUI。
+    // 无头自检：壳自更新能力基线——发布后冒烟验证 + CI 门禁，无需 GUI。
     // 输出身份/安装形态/是否可自更新/护栏状态；同时**实际写一次** identity.json 与 shell.log，
     // 以验证落盘链路可用（这是「壳零日志、无法诊断」问题的结构性修复）。
     if std::env::args().any(|a| a == "--shell-update-plan") {
@@ -703,7 +785,7 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main(app);
         }))
-        // 壳自更新插件（门 0）：强制 minisign 验签；平台安装语义内部处理。
+        // 壳自更新插件：强制 minisign 验签；平台安装语义内部处理。
         // 未配置 pubkey 时插件仍可注册（check 会失败并返回错误，由引导页按「失败放行」处理）。
         .plugin(tauri_plugin_updater::Builder::new().build())
         // app.restart()：更新安装后重启进入新版本（旧进程装、新进程跑）。

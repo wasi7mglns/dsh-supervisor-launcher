@@ -1,4 +1,4 @@
-//! 桌面壳自更新（门 0）+ 可观测性基座（2026-09-11）
+//! 桌面壳自更新 + 可观测性基座（2026-09-11）
 //!
 //! 设计要点（与《发布与更新机制总纲》《跨平台构建与自更新方案》一致）：
 //!
@@ -218,7 +218,7 @@ pub fn mark_pending(version: &str) {
     log(&format!("已安装 {}，待重启生效", version));
 }
 
-/// 门 0 前置判定：是否**应当**尝试检查更新。返回 (should_check, reason)。
+/// 前置判定：是否**应当**尝试检查更新。返回 (should_check, reason)。
 pub fn should_check(version: &str) -> (bool, String) {
     let g = Guard::load();
     if !self_update_capable() {

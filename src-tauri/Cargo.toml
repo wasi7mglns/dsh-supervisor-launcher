@@ -1,6 +1,6 @@
 [package]
 name = "dsh-supervisor-gui"
-version = "1.0.1"
+version = "1.0.2"
 description = "DSH lifecycle guard desktop shell (env bootstrap + panel)"
 edition = "2021"
 
@@ -22,6 +22,11 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 # app.restart()：更新安装后重启进入新版本（旧进程装、新进程跑）。
 tauri-plugin-process = "2"
+# tokio：为更新器提供**超时**能力（tauri 本身已依赖 tokio，故不新增下载）。
+# 为什么必需：tauri-plugin-updater 的 Config（tauri.conf.json）**没有 timeout 字段**，
+# 只能在 Builder 上设；而 reqwest 默认**无总超时** —— 网络不可达/丢包时 `check()`
+# 既不返回也不报错，引导页会永久停在「正在检查桌面更新」。Windows 真机实测即卡死于此。
+tokio = { version = "1", features = ["time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", default-features = false, features = ["tls"] }
