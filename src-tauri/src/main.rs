@@ -49,13 +49,35 @@ fn log(state: &RunState) -> serde_json::Value {
 }
 
 #[tauri::command]
-fn node_status(state: tauri::State<Mutex<RunState>>, app: tauri::AppHandle) -> serde_json::Value {
+async fn node_status(app: tauri::AppHandle) -> serde_json::Value {
+    // ⚠ 必须是 async（2026-09-11 修复）：同步命令由 Tauri 在**主线程**执行，
+    //   而本函数要跑一次「真实探针」（执行 node --version）。Windows 上探测可能很慢，
+    //   同步执行会把主线程/UI 一起拖住。改为 async 并把阻塞部分丢给阻塞线程池。
+    //   （探针本身在 env 层已有 8 秒硬上限，两层保证引导页不会永久卡住。）
     // 每次查询都做一次真实探针（PATH 变化会即时反映）
-    let sys = env::probe_system_node();
-    let st = state.lock().unwrap();
-    let installed = st.installed.clone().or_else(|| sys.as_ref().map(|x| x.1.clone()));
+    let sys = tauri::async_runtime::spawn_blocking(env::probe_system_node)
+        .await
+        .ok()
+        .flatten();
+
+    // 先取快照并释放锁，再决定是否补拉最新版（避免把锁带进线程）
+    let (mut o, need_latest) = {
+        let state = app.state::<Mutex<RunState>>();
+        let st = state.lock().unwrap();
+        let installed = st.installed.clone().or_else(|| sys.as_ref().map(|x| x.1.clone()));
+        let mut o = log(&st);
+        o["installed"] = serde_json::json!(installed);
+        // DSH 最低门槛判定（>=22.12）：引导页据此决定是否需装 Node，outdated 仅展示不再阻塞
+        o["minOk"] = serde_json::json!(node::meets_minimum(installed.as_deref()));
+        if let Some(latest) = &st.latest {
+            o["outdated"] = serde_json::json!(node::outdated(installed.as_deref(), latest));
+        }
+        let need = st.latest.is_none() && !st.busy;
+        (o, need)
+    };
+
     // 后台未拉过最新版时，启动线程补一次
-    if st.latest.is_none() && !st.busy {
+    if need_latest {
         let handle = app.clone();
         std::thread::spawn(move || {
             if let Ok((v, _f)) = node::latest_lts() {
@@ -66,13 +88,7 @@ fn node_status(state: tauri::State<Mutex<RunState>>, app: tauri::AppHandle) -> s
             }
         });
     }
-    let mut o = log(&st);
-    o["installed"] = serde_json::json!(installed);
-    // DSH 最低门槛判定（>=22.12）：引导页据此决定是否需装 Node，outdated 仅展示不再阻塞
-    o["minOk"] = serde_json::json!(node::meets_minimum(installed.as_deref()));
-    if let Some(latest) = &st.latest {
-        o["outdated"] = serde_json::json!(node::outdated(installed.as_deref(), latest));
-    }
+    let _ = &mut o;
     o
 }
 
@@ -825,7 +841,7 @@ fn main() {
             });
 
             // ── 托盘 ──
-            let show_m = tauri::menu::MenuItem::with_id(app, "show", "显示面板", true, None::<&str>)?;
+            let show_m = tauri::menu::MenuItem::with_id(app, "show", "显示控制面板", true, None::<&str>)?;
             let start = tauri::menu::MenuItem::with_id(app, "start", "启动 DSH", true, None::<&str>)?;
             let stop = tauri::menu::MenuItem::with_id(app, "stop", "停止 DSH", true, None::<&str>)?;
             let restart = tauri::menu::MenuItem::with_id(app, "restart", "重启一次", true, None::<&str>)?;
@@ -836,7 +852,13 @@ fn main() {
                 .icon(app.default_window_icon().expect("no default icon").clone())
                 .tooltip("dsh-supervisor")
                 .menu(&menu)
-                .show_menu_on_left_click(true)
+                // 左键=显示窗口 / 右键=弹出菜单（Windows·Linux 惯例）。
+                // ⚠ 原为 true（左键也弹菜单），叠加下方 on_tray_icon_event 不区分按键，
+                //   导致右键时既弹菜单又调用 show_main() 抢焦点 → 菜单被顶掉，
+                //   用户感知为「右键不好用」（2026-09-11 Windows 真机实测）。
+                // 注：上游文档明确 Linux 不支持该开关（菜单由桌面环境决定）——
+                //     故 Linux 上左键可能仍显示菜单，属平台限制，非本仓可控。
+                .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| {
                     match event.id.as_ref() {
                         "show" => show_main(app),
@@ -854,7 +876,16 @@ fn main() {
                     }
                 })
                 .on_tray_icon_event(|tray, event| {
-                    if let tauri::tray::TrayIconEvent::Click { .. } = event {
+                    // ⚠ 必须区分按键与状态（2026-09-11 修复）：
+                    //   原实现匹配 `Click { .. }`（任意键、任意状态）→ **右键**也会 show_main，
+                    //   把刚要弹出的右键菜单顶掉/抢走焦点。现只响应「左键 + 抬起」，
+                    //   右键交由系统弹出 .menu() 设置的菜单。
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
                         show_main(tray.app_handle());
                     }
                 })

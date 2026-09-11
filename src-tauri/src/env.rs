@@ -1,33 +1,105 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+/// Node 版本探测的时间上限。
+///
+/// ⚠ 为什么必须有（2026-09-11 用户 Windows 真机事故：引导卡在「检测系统环境」）：
+///   Windows 的 PATH 默认包含 `%LOCALAPPDATA%\Microsoft\WindowsApps`，其中的 `node.exe`
+///   是**应用执行别名存根**（AppExecLink 重解析点，指向 Microsoft Store），并非真实 Node。
+///   原实现 `find_in_path` 用 `is_file()` 判定即选中它，而 `Command::output()` 无超时 ——
+///   执行该存根会尝试唤起 Store 并**永不返回**，引导页从此永久停住。
+const NODE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 整个 PATH 扫描的全局上限：即使 PATH 里有多个坏候选，也不会把启动拖成分钟级。
+const NODE_PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(20);
 
 pub fn node_exe() -> &'static str {
     if cfg!(windows) { "node.exe" } else { "node" }
+}
+
+/// 候选是否可用：过滤 Windows 上的应用执行别名存根与空文件。
+/// （别名存根不是可执行程序，执行它会挂起或唤起 Store；0 字节文件同理不可用。）
+fn is_usable_candidate(cand: &Path) -> bool {
+    if !cand.is_file() { return false; }
+    #[cfg(target_os = "windows")]
+    {
+        let low = cand.to_string_lossy().to_ascii_lowercase();
+        if low.contains("\\windowsapps\\") { return false; }
+        if std::fs::metadata(cand).map(|m| m.len() == 0).unwrap_or(true) { return false; }
+    }
+    true
 }
 
 pub fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let cand = dir.join(name);
-        if cand.is_file() { return Some(cand); }
+        if is_usable_candidate(&cand) { return Some(cand); }
     }
     None
 }
 
+/// 有界执行 `<node> --version`。
+/// 超时/失败一律返回 None（视为「不可用」），**绝不阻塞调用方** ——
+/// 这是「引导页不会因某个坏的可执行文件而永久卡住」的根本保证。
 pub fn node_version(node: &Path) -> Option<String> {
-    let out = Command::new(node).arg("--version").output().ok()?;
-    if out.status.success() {
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !s.is_empty() { return Some(s); }
+    use std::process::Stdio;
+    let mut child = Command::new(node)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if start.elapsed() >= NODE_PROBE_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() { return None; }
+    let mut s = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        let _ = out.read_to_string(&mut s);
     }
-    None
+    let s = s.trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// 系统 PATH 中的 Node：缺失返回 None。
+///
+/// ⚠ 必须**遍历全部候选**而非取第一个：PATH 靠前的候选可能是不可用的存根，
+///   若直接返回它就会掩盖后面真正可用的 Node 安装。
 pub fn probe_system_node() -> Option<(PathBuf, String)> {
-    let exe = find_in_path(node_exe())?;
-    let v = node_version(&exe)?;
-    Some((exe, v))
+    let started = Instant::now();
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if started.elapsed() >= NODE_PROBE_TOTAL_BUDGET { break; }
+            let cand = dir.join(node_exe());
+            if !is_usable_candidate(&cand) { continue; }
+            if let Some(v) = node_version(&cand) { return Some((cand, v)); }
+        }
+    }
+    // PATH 未命中 → 官方安装的标准落点（同样走有界探测）
+    if let Some(p) = known_install_node_path() {
+        if let Some(v) = node_version(&p) { return Some((p, v)); }
+    }
+    None
 }
 
 /// 安装后已知候选路径（官方安装的标准落点）。

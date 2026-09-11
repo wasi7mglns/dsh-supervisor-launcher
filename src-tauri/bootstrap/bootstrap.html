@@ -7,7 +7,7 @@
 <style>
   /* ============================================================
    * dsh-supervisor 引导页（健壮版）
-   * 职责单一：检测环境 → 补全 Node → 内核版本治理（强制更新+失败回退）→ 守卫就绪 → 进面板。
+   * 职责单一：检测环境 → 补全 Node → 内核版本治理（强制更新+失败回退）→ 守卫就绪 → 进控制面板。
    * 关键原则：每步真实成败；失败可重试、可诊断；**绝不假成功**。
    * ============================================================ */
   :root {
@@ -87,7 +87,7 @@
       <div class="startup-logo" id="logo" aria-hidden="true"><span class="startup-logo-image"></span></div>
       <div class="startup-name">DSH-SUP</div>
       <div class="startup-status" id="status">正在检测环境…</div>
-      <!-- 步骤顺序（2026-09-11 重构）：检测环境 → 运行环境 → 桌面更新 → 内核版本 → 守卫就绪 → 进入面板。
+      <!-- 步骤顺序（2026-09-11 重构）：检测环境 → 运行环境 → 桌面版本 → 内核版本 → 守卫就绪 → 进入控制面板。
            纠正此前的设计错误：曾把「桌面壳自更新」当作第一步（旧称「门 0」），理由是新壳才可能带有
            新的 Node/内核安装要求。该理由不成立：
              · 环境检测与 Node 探测都是**本地**判定，不依赖壳版本；
@@ -100,17 +100,17 @@
         <span class="step-arrow">›</span>
         <span class="step" id="st-node"><span class="dot"></span>运行环境</span>
         <span class="step-arrow">›</span>
-        <span class="step" id="st-shell"><span class="dot"></span>桌面更新</span>
+        <span class="step" id="st-shell"><span class="dot"></span>桌面版本</span>
         <span class="step-arrow">›</span>
         <span class="step" id="st-core"><span class="dot"></span>内核版本</span>
         <span class="step-arrow">›</span>
         <span class="step" id="st-guard"><span class="dot"></span>守卫就绪</span>
         <span class="step-arrow">›</span>
-        <span class="step" id="st-panel"><span class="dot"></span>进入面板</span>
+        <span class="step" id="st-panel"><span class="dot"></span>进入控制面板</span>
       </div>
       <div class="progress" id="prog" style="display:none"><div class="progress-bar" id="progBar"></div></div>
       <div class="skipwrap" id="skipWrap" style="display:none">
-        <button id="btnSkipShell">跳过桌面更新，直接启动</button>
+        <button id="btnSkipShell">跳过桌面版本检查，直接启动</button>
       </div>
       <div class="fail" id="fail" style="display:none">
         <div class="fail-msg" id="failMsg"></div>
@@ -119,12 +119,12 @@
           <button id="btnDiag" class="ghost">复制诊断</button>
         </div>
       </div>
-      <!-- 桌面更新失败选择页（用户定案 2026-09-11）：
+      <!-- 桌面版本失败选择页（用户定案 2026-09-11）：
            失败**不静默放行**，给出【重试】【继续使用当前版本】；
            其中【继续】必须始终可用——这是「有界失败即放行」的用户可见形式，
            保证极端情况下用户仍能进入产品（绝不把用户永久挡在门外）。 -->
       <div class="choice" id="updChoice" style="display:none">
-        <div class="choice-title">桌面壳更新未完成</div>
+        <div class="choice-title">桌面版本更新未完成</div>
         <div class="choice-msg" id="updMsg"></div>
         <div class="choice-meta" id="updMeta"></div>
         <div class="choice-actions">
@@ -142,7 +142,7 @@
   var evt = (window.__TAURI__ && window.__TAURI__.event)
     || (window.parent && window.parent.__TAURI__ && window.parent.__TAURI__.event) || null;
   var $ = function (id) { return document.getElementById(id); };
-  // 步骤顺序（2026-09-11 重构）：环境 → Node → 桌面更新 → 内核 → 守卫 → 面板。
+  // 步骤顺序（2026-09-11 重构）：环境 → Node → 桌面版本 → 内核 → 守卫 → 控制面板。
   // 设计纠正：旧顺序把「桌面壳自更新」放在第一步（旧称「门 0」），基于一个不成立的前提
   //（「新壳才可能带有新的 Node/内核安装要求」）—— 环境检测与 Node 探测都是本地判定，
   // 与壳版本无关；且用户刚装完壳，壳本就是最新。把最慢最不可靠的网络步骤放在首位，
@@ -155,7 +155,7 @@
   var lastPlan = null;     // 最近一次 core_plan（诊断用）
   var lastError = null;
   var shellId = null;      // 壳身份（版本/安装形态/自更新能力/attempt）
-  var updPlan = null;      // 最近一次桌面更新检查结果（诊断用）
+  var updPlan = null;      // 最近一次桌面版本检查结果（诊断用）
 
   function setStep(i, detail) {
     if (i > cur) cur = i;
@@ -192,6 +192,9 @@
   var SHELL_DOWNLOAD_BUDGET_MS = 300000; // 下载前 5 分钟若毫无进展即判定失败（下载本身可更长）
   // 内核步骤同样受网络支配（registry 查询 + npm install），必须同样有界。
   // Rust 侧 http_json 有单请求超时、npm install 现有 15 分钟上限；这里是前端兜底。
+  // 环境探测同样可能卡住（探针要执行 node --version；Windows 上 PATH 可能含不可用的存根）。
+  // Rust 侧已有 5 秒/候选 + 20 秒全局上限；这里是前端最后一道兜底。
+  var ENV_PROBE_BUDGET_MS = 45000;
   var CORE_PLAN_BUDGET_MS = 90000;      // 多镜像回退查询
   var CORE_APPLY_BUDGET_MS = 1020000;   // 17 分钟（Rust 侧 npm install 上限 15 分钟）
   function withTimeout(promise, ms, onTimeoutMsg) {
@@ -240,7 +243,7 @@
     ].join(' | ');
   }
 
-  // 桌面更新失败选择页（用户定案 2026-09-11）：失败**不静默放行**，给出【重试】【继续】；
+  // 桌面版本失败选择页（用户定案 2026-09-11）：失败**不静默放行**，给出【重试】【继续】；
   // 【继续】必须始终可用——这是「有界失败即放行」的用户可见形式。
   function hideUpdChoice() { $('updChoice').style.display = 'none'; }
   function showUpdChoice(reason) {
@@ -253,14 +256,14 @@
     $('updChoice').style.display = '';
   }
 
-  // ── 步骤 2：桌面壳更新（**在环境就绪之后**，不再是第一步）──
+  // ── 步骤 2：桌面版本（**在环境就绪之后**，不再是第一步）──
   // 语义：**尽力更新，失败即放行**。原因一律落盘（identity.json / shell.log）。
   // 三平台同一路径：check → download → minisign 验签 → 平台安装 → 重启。
   function stepShellUpdate() {
     var idx = 2; // st-shell 在新顺序中的位置
     setStep(idx);
     phase('shell-update');
-    status('正在检查桌面更新…');
+    status('正在检查桌面版本…');
     showSkip(function () { skipShellUpdate('用户跳过'); });
     // 双保险：JS 侧超时 + Rust 侧超时，确保任何情况都有结论
     return withTimeout(core.invoke('shell_identity'), 8000, '读取壳身份超时').then(function (id) {
@@ -269,26 +272,26 @@
     }).then(function (r) {
       if (r && r.__timeout) {
         hideSkip();
-        status('桌面更新检查超时，继续启动');
+        status('桌面版本检查超时，继续启动');
         return wait(600).then(stepCorePlan);
       }
       if (r && r.__error) {
         hideSkip();
-        status('桌面更新检查异常，继续启动');
+        status('桌面版本检查异常，继续启动');
         return wait(600).then(stepCorePlan);
       }
       updPlan = r || {};
       // 情形 A：跳过（不可自更新 / 已拉黑 / 达阈值）→ 放行，不打扰用户
       if (r && r.skipped) {
         hideSkip();
-        status('已跳过桌面更新（' + (r.reason || '') + '）');
+        status('已跳过桌面版本检查（' + (r.reason || '') + '）');
         return wait(600).then(stepCorePlan);
       }
       // 情形 B：无更新 → 放行
       if (r && r.available !== true) {
         hideSkip();
         if (r && r.ok === false) {
-          status('桌面更新检查失败，继续启动：' + (r.error || '未知'));
+          status('桌面版本检查失败，继续启动：' + (r.error || '未知'));
           return wait(900).then(stepCorePlan);
         }
         status('桌面壳已是最新（' + ((shellId && shellId.version) || '?') + '）');
@@ -302,14 +305,14 @@
   function skipShellUpdate(why) {
     hideSkip();
     hideProgress();
-    status('已跳过桌面更新（' + why + '），继续启动');
+    status('已跳过桌面版本检查（' + why + '），继续启动');
     try { if (core) core.invoke('shell_set_phase', { phase: 'shell-update-skipped' }); } catch (e) {}
     return wait(500).then(stepCorePlan);
   }
 
   function stepShellApply() {
     var target = (updPlan && updPlan.latest) || '';
-    status('发现新版本 ' + target + ' · 正在下载…');
+    status('发现桌面新版本 ' + target + ' · 正在下载…');
     showProgress(0);
     // 下载期间持续显示进度；外层超时保证「零进展」时能失败放行而非永久等待。
     return withTimeout(
@@ -324,16 +327,16 @@
         return null;
       }
       if (r.__error) {
-        showUpdChoice('更新调用异常：' + r.__error);
+        showUpdChoice('桌面版本调用异常：' + r.__error);
         return null;
       }
       if (r.ok !== true) {
-        showUpdChoice('更新安装失败：' + (r.error || '未知'));
+        showUpdChoice('桌面版本更新失败：' + (r.error || '未知'));
         return null; // 停在此页，等用户选择（重试 / 继续）
       }
       hideSkip();
       if (r.upToDate) { return stepCorePlan(); }
-      status('更新已安装（' + (r.installed || target) + '）· 正在重启…');
+      status('桌面新版本已安装（' + (r.installed || target) + '）· 正在重启…');
       return wait(800).then(function () {
         // 重启进入新版本；旧进程装、新进程跑。重启后 version == pendingVersion → 视为成功。
         // 注：Windows 上安装器会由插件直接结束本进程，通常不会走到这里。
@@ -348,7 +351,12 @@
     setStep(0);
     phase('env');
     status('正在检测系统环境…');
-    return core.invoke('node_status').then(function (st) {
+    // ⚠ 必须有界（2026-09-11 用户 Windows 真机事故：1.0.3 卡在「检测环境」不动）。
+    //   此前只给桌面/内核步骤加了超时，**漏了第一步**，而第一步恰恰最容易卡
+    //   （要执行 node --version，Windows PATH 里可能有应用别名存根）。
+    return withTimeout(core.invoke('node_status'), ENV_PROBE_BUDGET_MS, '环境检测超时').then(function (st) {
+      if (st && st.__timeout) { fail('环境检测超时（探针无响应，可能有异常的可执行文件占位）'); return null; }
+      if (st && st.__error) { fail('环境检测异常：' + st.__error); return null; }
       st = st || {};
       if (st.busy) { setStep(1); status(st.status || '正在准备 Node.js 运行环境…'); return stepNodeWait(); }
       if (!st.installed) {
@@ -377,7 +385,7 @@
   function stepNodeDone() {
     setStep(1);
     status('Node.js ' + (nodeVer || '') + ' 已就绪');
-    // 环境就绪后**才**进入桌面更新（网络步骤，带超时与跳过出口）
+    // 环境就绪后**才**进入桌面版本（网络步骤，带超时与跳过出口）
     return wait(350).then(stepShellUpdate);
   }
 
@@ -468,11 +476,11 @@
     return null;
   }
 
-  // ── 步骤 5：进入面板（= 健康确认：内核据此确认桌面更新成功 / 清 journal）──
+  // ── 步骤 5：进入控制面板（= 健康确认：内核据此确认桌面版本更新成功 / 清 journal）──
   function stepPanel() {
     setStep(5);
     phase('ready');   // 关键：这是「壳已健康启动」的确认信号
-    status('环境就绪 · 正在打开面板…');
+    status('环境就绪 · 正在打开控制面板…');
     $('logo').classList.add('done');
     return wait(700).then(function () { if (core) core.invoke('finish_boot').catch(function () {}); });
   }
@@ -482,16 +490,16 @@
     hideFail();
     hideUpdChoice();
     cur = -1; nodeVer = null; coreFrom = null; coreTo = null; lastError = null; updPlan = null;
-    // 从**环境检测**开始（本地快检查在前）；随后 Node → 桌面更新 → 内核 → 守卫 → 面板。
+    // 从**环境检测**开始（本地快检查在前）；随后 Node → 桌面版本 → 内核 → 守卫 → 控制面板。
     stepEnv().catch(function (e) { fail('引导异常：' + e); });
   }
 
-  // 交互：桌面更新失败选择页（用户已确认的定案）
+  // 交互：桌面版本失败选择页（用户已确认的定案）
   //   【重试】重新尝试安装（手动重试是明确意图，给足预算）；
   //   【继续】始终可用，进入引导后续步骤（有界失败即放行的用户可见形式）。
   $('btnUpdRetry').addEventListener('click', function () {
     hideUpdChoice();
-    status('正在重试桌面更新…');
+    status('正在重试桌面版本更新…');
     stepShellApply().catch(function (e) { showUpdChoice('重试异常：' + e); });
   });
   $('btnUpdSkip').addEventListener('click', function () {
@@ -525,10 +533,10 @@
       if (total > 0) {
         var pct = Math.floor((got / total) * 100);
         showProgress(pct);
-        status('正在下载桌面更新 ' + pct + '%（' + Math.round(got / 1048576 * 10) / 10 + ' / ' + Math.round(total / 1048576 * 10) / 10 + ' MB）…');
+        status('正在下载桌面版本 ' + pct + '%（' + Math.round(got / 1048576 * 10) / 10 + ' / ' + Math.round(total / 1048576 * 10) / 10 + ' MB）…');
       } else {
         showProgress(null);
-        status('正在下载桌面更新（' + Math.round(got / 1048576 * 10) / 10 + ' MB）…');
+        status('正在下载桌面版本（' + Math.round(got / 1048576 * 10) / 10 + ' MB）…');
       }
     });
   }

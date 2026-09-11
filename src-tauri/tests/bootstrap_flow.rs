@@ -184,3 +184,100 @@ fn b7_no_stale_door0_concept_in_user_facing_text() {
     }
     eprintln!("B7 PASS no stale door-0 concept in user-facing text");
 }
+
+/// B9：步骤标签必须与产品语义一致（用户 2026-09-11 明确要求）。
+/// 这六个词是**面向用户的概念**，不是实现细节 —— 用户特别指出「桌面更新」是错误表达，
+/// 应为「桌面版本」，且末步应为「进入控制面板」。此断言防止文案被改回。
+#[test]
+fn b9_step_labels_match_required_semantics() {
+    let html = bootstrap_html();
+    let expected = [
+        ("st-env", "检测环境"),
+        ("st-node", "运行环境"),
+        ("st-shell", "桌面版本"),
+        ("st-core", "内核版本"),
+        ("st-guard", "守卫就绪"),
+        ("st-panel", "进入控制面板"),
+    ];
+    for (id, label) in expected {
+        let needle = format!("id=\"{}\"", id);
+        let pos = html.find(&needle).unwrap_or_else(|| panic!("B9 FAIL 找不到步骤 {}", id));
+        // 该步骤声明之后紧接着的文本节点就是标签
+        let tail = &html[pos..(pos + 200).min(html.len())];
+        assert!(
+            tail.contains(label),
+            "B9 FAIL 步骤 {} 的标签不是「{}」（片段：{}）",
+            id, label, tail
+        );
+    }
+    eprintln!("B9 PASS step labels match required semantics");
+}
+
+/// B10：托盘必须区分左右键（用户报告「Windows 右键不好用」）。
+#[test]
+fn b10_tray_click_is_button_aware() {
+    let m = main_rs();
+    assert!(
+        m.contains("show_menu_on_left_click(false)"),
+        "B10 FAIL 未关闭「左键弹菜单」（左键应显示窗口，右键才弹菜单）"
+    );
+    assert!(
+        m.contains("MouseButton::Left"),
+        "B10 FAIL 托盘点击未区分左键 —— 右键也会 show_main，会把右键菜单顶掉"
+    );
+    assert!(
+        m.contains("MouseButtonState::Up"),
+        "B10 FAIL 未限定抬起状态（应在按键抬起时响应）"
+    );
+    // 不得再出现「匹配任意 Click」的写法
+    assert!(
+        !m.contains("TrayIconEvent::Click { .. } = event"),
+        "B10 FAIL 仍存在不区分按键的托盘 Click 匹配"
+    );
+    eprintln!("B10 PASS tray click is button-aware");
+}
+
+/// B11：Windows 平台配置必须关闭 shadow（用户报告「四周有隐形框框」）。
+/// 官方文档：Windows 上 `shadow: true`（默认）会让无边框窗口多出 1px 白色边框。
+/// 本机平台配置须与基础配置**除 shadow 外完全一致**，避免两处漂移。
+#[test]
+fn b11_windows_config_disables_shadow_and_stays_in_sync() {
+    let dir = manifest_dir();
+    let base: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("tauri.conf.json")).expect("base cfg"))
+            .expect("parse base cfg");
+    let win_path = dir.join("tauri.windows.conf.json");
+    assert!(win_path.exists(), "B11 FAIL 缺少 tauri.windows.conf.json（Windows 平台覆盖）");
+    let win: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&win_path).expect("win cfg")).expect("parse win cfg");
+
+    let b = &base["app"]["windows"][0];
+    let w = &win["app"]["windows"][0];
+    assert_eq!(w["shadow"], serde_json::json!(false), "B11 FAIL Windows shadow 必须为 false（否则无边框窗口有 1px 白边）");
+
+    // 除 shadow 外逐字段比对
+    let bo = b.as_object().expect("base window object");
+    let wo = w.as_object().expect("win window object");
+    for (k, v) in bo {
+        if k == "shadow" { continue; }
+        assert_eq!(wo.get(k), Some(v), "B11 FAIL Windows 覆盖配置字段 {} 与基础配置不一致", k);
+    }
+    eprintln!("B11 PASS windows shadow disabled, config in sync");
+}
+
+/// B12：用户可见文案不得再出现「桌面更新」（应为「桌面版本」）。
+#[test]
+fn b12_no_stale_desktop_update_wording() {
+    let html = bootstrap_html();
+    for bad in ["桌面更新"] {
+        let mut idx = 0;
+        while let Some(p) = html[idx..].find(bad) {
+            let abs = idx + p;
+            let line_start = html[..abs].rfind(char::is_whitespace).map(|x| x + 1).unwrap_or(0);
+            let line_end = html[abs..].find(char::is_whitespace).map(|x| abs + x).unwrap_or(html.len());
+            panic!("B12 FAIL 仍含旧措辞「{}」：{}", bad, html[line_start..line_end].trim());
+        }
+        idx += bad.len();
+    }
+    eprintln!("B12 PASS no stale desktop-update wording");
+}

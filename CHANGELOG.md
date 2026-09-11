@@ -2,6 +2,64 @@
 
 本文件记录桌面壳（`dsh-supervisor-gui`，公开仓 `wasi7mglns/dsh-supervisor-launcher`）的重要变更。
 
+## [未发布]
+
+以下修复**已完成代码与测试，尚未构建/发布**（按用户要求：先逐项确认后再构建）。
+
+### 修复：卡在「检测环境」不动（Windows 真机，1.0.3 仍复现）
+
+**根因（两层叠加）**：
+
+1. **Windows 应用执行别名存根**：Windows 的 PATH 默认含
+   `%LOCALAPPDATA%\Microsoft\WindowsApps`，其中的 `node.exe` 是**别名存根**（重解析点，
+   指向 Microsoft Store），并非真实 Node。`env::find_in_path` 仅用 `is_file()` 判定即选中它。
+2. **探测无超时**：`env::node_version` 用 `Command::output()` **无限阻塞** —— 执行该存根会尝试
+   唤起 Store 并永不返回，引导页从此永久停在「检测系统环境…」。
+   另：`node_status` 是**同步** Tauri 命令，由主线程执行，探测变慢时连 UI 一起拖住。
+
+**修复（四层防护）**：
+- `probe_system_node` **遍历全部候选**而非取第一个（PATH 靠前的坏候选不再掩盖后面可用的 Node）；
+- 过滤 Windows 别名存根（`\WindowsApps\`）与 0 字节文件；
+- 有界执行：单候选 5 秒、整个 PATH 扫描 20 秒硬上限（超时即 kill，视为不可用）；
+- `node_status` 改为 async + `spawn_blocking`，不再占主线程；
+- 前端 `stepEnv` 补 `withTimeout`（45 秒）——此前只给桌面/内核步骤加了超时，**漏了第一步**，
+  而第一步恰恰最容易卡。
+
+### 修复：托盘右键不可用（Windows 真机）
+- `on_tray_icon_event` 原先匹配 `Click { .. }`（**任意键、任意状态**）→ **右键**也会执行
+  `show_main()`，把刚要弹出的右键菜单顶掉/抢走焦点。
+- 同时 `show_menu_on_left_click(true)` 让左键也弹菜单，与「左键显示窗口」的预期冲突。
+- 修复：左键抬起才显示窗口（`MouseButton::Left` + `MouseButtonState::Up`），
+  右键交系统弹菜单（`show_menu_on_left_click(false)`）。
+  注：上游文档明确 Linux 不支持该开关（菜单由桌面环境决定），属平台限制。
+
+### 修复：Windows 窗口四周有「隐形框框」
+- **根因**：Tauri 的 `shadow` 默认 `true`，官方文档明确写明：Windows 上 `true` 会让**无边框**
+  窗口多出 **1px 白色边框**（Win11 还会加圆角）。我们的窗口是 `decorations:false`，正中此条。
+- 修复：新增 **平台配置** `tauri.windows.conf.json`（Tauri 自动按平台合并），仅覆盖 `shadow:false`。
+  已验证合并语义为 RFC 7386 JSON Merge Patch（对象递归、数组替换），
+  故 `security.csp`、`withGlobalTauri`、更新端点等全部保留，仅 `shadow` 改变。
+  未在 `tauri.conf.json` 直接改是因其对 Linux/macOS 同样生效，而那两个平台的 shadow 语义不同。
+
+### 语义统一：步骤名与产品概念对齐
+
+用户明确指出「桌面更新」是错误表达。步骤条现为：
+
+```
+检测环境 → 运行环境 → 桌面版本 → 内核版本 → 守卫就绪 → 进入控制面板
+```
+
+- 「桌面更新」→「**桌面版本**」（该步是"检查/对齐桌面版本"，不是"更新"这一动作）；
+- 「进入面板」→「**进入控制面板**」；
+- 其余文案同步（跳过按钮、检查中/超时/失败提示、下载进度、选择页标题、托盘菜单「显示控制面板」）。
+
+### 回归防护
+`tests/bootstrap_flow.rs` 增至 **12 断言**，新增：
+- B9 步骤标签必须与要求语义逐字一致（防文案被改回）；
+- B10 托盘必须区分左右键；
+- B11 Windows 配置必须 `shadow:false` 且与基础配置**除 shadow 外完全一致**（防两处漂移）；
+- B12 用户可见文案不得再出现「桌面更新」。
+
 ## [1.0.3]（2026-09-11）
 
 ### 修复：内核步骤同样无界 —— 与引导卡死属同一类缺陷（主动审查发现）
