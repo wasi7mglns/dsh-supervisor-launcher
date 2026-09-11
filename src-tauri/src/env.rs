@@ -69,31 +69,52 @@ pub fn path_dirs_local_only() -> Vec<PathBuf> {
 /// 为什么需要：Windows 的 PATH 常含映射盘或 UNC；当网络盘断开时，
 /// GetFileAttributesW / CreateProcessW 会阻塞到 SMB 超时（数十秒，且可能重试）。
 /// 本判定在**执行任何可能触网的操作之前**完成，且自身不触网。
+///
+/// ⚠ **按盘符记忆（2026-09-11 二次修复）**：
+///   `GetDriveTypeW` 对**断开的网络驱动器**可能阻塞（微软文档明确提示该 API 可能慢）。
+///   原实现**对每个 PATH 条目都调一次** —— PATH 里数十个条目往往集中在同一两个盘符，
+///   于是同一个盘被反复查询，一旦该盘有问题就重复付出阻塞代价。
+///   现按「盘符」缓存：最多 26 次查询（且每个盘符只查一次）。
 pub fn is_local_fixed_dir(dir: &Path) -> bool {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::ffi::OsStrExt;
         let w: Vec<u16> = dir.as_os_str().encode_wide().collect();
-        // UNC（以两个反斜杠开头，ASCII 92）→ 跳过
+        // UNC（以两个反斜杠开头，ASCII 92）→ 跳过（纯字面判定，不触网）
         if w.len() >= 2 && w[0] == 92 && w[1] == 92 { return false; }
         // 无盘符（相对路径等）→ 保守放行
         if w.len() < 2 || w[1] != 58 { return true; }
-        let mut root = [0u16; 4];
-        root[0] = w[0];
-        root[1] = 58;   // 冒号
-        root[2] = 92;   // 反斜杠
-        root[3] = 0;
-        extern "system" {
-            fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
-        }
-        // DRIVE_FIXED = 3；其余（REMOTE=4 / NO_ROOT_DIR=1 / UNKNOWN=0）一律跳过
-        return unsafe { GetDriveTypeW(root.as_ptr()) } == 3;
+        return drive_is_fixed(w[0]);
     }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = dir;
         true
     }
+}
+
+/// 盘符是否为固定磁盘（结果按盘符缓存，每个盘符最多查询一次）。
+#[cfg(target_os = "windows")]
+fn drive_is_fixed(letter: u16) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<u16, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(m) = cache.lock() {
+        if let Some(v) = m.get(&letter) { return *v; }
+    }
+    let mut root = [0u16; 4];
+    root[0] = letter;
+    root[1] = 58;   // 冒号
+    root[2] = 92;   // 反斜杠
+    root[3] = 0;
+    extern "system" {
+        fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+    }
+    // DRIVE_FIXED = 3；其余（REMOTE=4 / NO_ROOT_DIR=1 / UNKNOWN=0）一律跳过
+    let fixed = unsafe { GetDriveTypeW(root.as_ptr()) } == 3;
+    if let Ok(mut m) = cache.lock() { m.insert(letter, fixed); }
+    fixed
 }
 
 /// 我们自己记录的 Node 路径（runtime.json）—— **最廉价的探测来源**。

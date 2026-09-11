@@ -766,9 +766,36 @@ fn b40_command_path_must_not_enumerate() {
         "B40 FAIL candidate_summary 仍在现算候选（命令路径上做 I/O）"
     );
     assert!(body.contains("summary"), "B40 FAIL candidate_summary 未读缓存");
-    // 摘要必须在探测线程里写入
-    assert!(p.contains("l.summary = summary"), "B40 FAIL 摘要未在探测线程写入缓存");
+    // 摘要在探测线程里写入缓存（经 set_summary）
+    assert!(p.contains("fn set_summary"), "B40 FAIL 缺 set_summary 写入入口");
+    assert!(p.contains("l.summary = s"), "B40 FAIL set_summary 未真正写缓存");
+    assert!(p.contains("set_summary(summarize("), "B40 FAIL 枚举完成后未写摘要缓存");
     eprintln!("B40 PASS command path does not enumerate");
+}
+
+/// B47：**任何可能阻塞的调用之前都必须先 stage** —— 「规则一」的机械化检查。
+///
+/// 为什么需要：线上故障正是「枚举阶段落在进度上报之外」导致 summary/stuck/trace 三项全空，
+/// 用户看到「卡住且不报错、也没有任何线索」。
+/// 把 I/O 搬进线程只解决「命令不阻塞」，**不解决「卡住时看不见线索」** —— 故需机械化断言。
+#[test]
+fn b47_every_blocking_phase_is_staged() {
+    let p = fs::read_to_string(manifest_dir().join("src").join("nodeprobe.rs")).expect("nodeprobe.rs");
+    let enum_start = p.find("fn enumerate_staged()").expect("B47 FAIL 缺 enumerate_staged");
+    let enum_end = p.find("fn summarize(").expect("B47 FAIL 缺 summarize");
+    let body = &p[enum_start..enum_end];
+    for needle in ["recorded_node_path", "known_locations_staged", "path_dirs_staged"] {
+        let at = body.find(needle).unwrap_or_else(|| panic!("B47 FAIL 未找到 {}", needle));
+        let before = &body[..at];
+        assert!(
+            before.rfind("stage(").is_some(),
+            "B47 FAIL {} 之前没有 stage() —— 卡住时会没有任何线索",
+            needle
+        );
+    }
+    assert!(p.contains("HARD_DEADLINE_MS"), "B47 FAIL 缺硬上限（规则二）");
+    assert!(p.contains("环境探测超过"), "B47 FAIL 硬上限未产出可读原因");
+    eprintln!("B47 PASS every blocking phase is staged");
 }
 
 /// B41：前端**轮询循环**必须有独立于被调方的心跳。

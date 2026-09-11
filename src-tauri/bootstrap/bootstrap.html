@@ -290,6 +290,7 @@
       // ── 环境探测追踪（架构修复 2026-09-11）：探测根因是**环境特有**的，
       //    靠读代码无法确定；这份追踪是定位该类问题唯一可靠的手段。 ──
       'env_candidates=' + ((lastEnv && lastEnv.candidates) || 'none'),
+      'env_probe_error=' + ((lastEnv && lastEnv.probeError) || 'none'),
       'env_stuck=' + (envStuck ? (envStuck.on + '/' + envStuck.ms + 'ms') : 'none'),
       'env_trace=' + ((lastEnv && lastEnv.trace && lastEnv.trace.length) ? lastEnv.trace.map(function (t) { return t.path + '(' + t.ms + 'ms,' + (t.ok ? 'ok' : 'no') + ',' + (t.note || '') + ')'; }).join(' > ') : 'none'),
       'mirror=' + (lastMirror && lastMirror.mirror ? (lastMirror.mirror + '/' + lastMirror.latencyMs + 'ms') : 'none'),
@@ -439,6 +440,16 @@
           }
           st = st || {};
           lastEnv = st;
+          // Rust 侧硬上限触发的**明确失败**：立即给出可操作结论，
+          // 不等前端预算耗尽（那只会得到一句没有信息量的「超时」）。
+          if (st.probeError) {
+            settled = true;
+            envStuck = st.stuck || null;
+            fail('环境探测失败：' + st.probeError);
+            $('btnForceNode').style.display = '';
+            resolve(null);
+            return;
+          }
           if (st.probing) {
             var s = st.stuck;
             if (s && s.on) {

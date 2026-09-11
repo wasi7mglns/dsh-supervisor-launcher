@@ -94,6 +94,12 @@ async fn node_status(app: tauri::AppHandle) -> serde_json::Value {
         o
     };
     o["probing"] = serde_json::json!(!out.finished);
+    // 明确失败原因（到硬上限 / worker 异常）。前端据此立即给出可操作结论，
+    // 而非等自己的预算耗尽后只报一句「超时」。
+    o["probeError"] = match &out.error {
+        Some(e) => serde_json::json!(e),
+        None => serde_json::Value::Null,
+    };
     o["nodePath"] = serde_json::json!(out.path.as_ref().map(|p| p.display().to_string()));
     o["elapsedMs"] = serde_json::json!(out.elapsed_ms);
     o["candidates"] = serde_json::json!(nodeprobe::candidate_summary());
@@ -688,6 +694,9 @@ fn cli_env_plan() -> i32 {
     println!("{}", nodeprobe::candidate_summary());
     println!("完成          = {}", out.finished);
     println!("耗时          = {} ms", out.elapsed_ms);
+    if let Some(e) = &out.error {
+        println!("失败原因      = {}", e);
+    }
     match (&out.path, &out.version) {
         (Some(p), Some(v)) => println!("node          = {} @ {}", v, p.display()),
         _ => println!("node          = （未找到）"),
