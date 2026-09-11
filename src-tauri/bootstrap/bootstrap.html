@@ -235,6 +235,9 @@
   // Rust 侧已有 5 秒/候选 + 20 秒全局上限；这里是前端最后一道兜底。
   var ENV_PROBE_BUDGET_MS = 45000;
   var CORE_PLAN_BUDGET_MS = 90000;      // 多镜像回退查询
+  // 守卫启动：Rust 侧最坏约 130 秒（服务管理器 30s + 兜底 spawn 后 60s + 命令超时），
+  // 此处给 200 秒兜底。旧实现**完全没有超时**，一旦挂起引导页永久停住。
+  var GUARD_START_BUDGET_MS = 200000;
   var CORE_APPLY_BUDGET_MS = 1020000;   // 17 分钟（Rust 侧 npm install 上限 15 分钟）
   function withTimeout(promise, ms, onTimeoutMsg) {
     return new Promise(function (resolve) {
@@ -581,7 +584,15 @@
     setStep(4);
     phase('guard');
     status('正在启动守卫…');
-    return core.invoke('guard_start').then(function (r) {
+    // ⚠ 必须有界（2026-09-11 架构修复）。
+    //   旧实现是**裸 invoke** —— 而 Rust 侧 guard_start 内部会调服务管理器
+    //   （systemctl/launchctl/schtasks）并做两轮 wait_alive，最长可达约 2 分钟。
+    //   一旦任一处挂起，本 Promise 永不 settle → 引导页**永久停在「正在启动守卫…」**，
+    //   无重试、无出口。这与「卡在检测环境」是同一根因模式。
+    //   现加外层超时兜底，并监听 Rust 侧上报的阶段进度（静默等待与卡死无法区分）。
+    return withTimeout(core.invoke('guard_start'), GUARD_START_BUDGET_MS, '守卫启动超时').then(function (r) {
+      if (r && r.__timeout) return guardFailed('守卫启动超时：' + (r.error || '服务管理器无响应'));
+      if (r && r.__error) return guardFailed('守卫启动异常：' + r.__error);
       if (!r || r.ok !== true) return guardFailed('守卫启动失败：' + ((r && r.error) || '未知'));
       return stepGuardReady(0);
     }).catch(function (e) { return guardFailed('守卫启动异常：' + e); });
@@ -602,10 +613,11 @@
   function guardFailed(msg) {
     if (coreFrom && coreTo && coreFrom !== coreTo) {
       status('守卫未就绪 · 正在回退内核 v' + coreFrom + '…');
-      return core.invoke('core_apply', { version: coreFrom }).then(function (r) {
+      // 回退也是 npm 安装：同样必须有界，否则回退失败会让引导永久停在此处。
+      return withTimeout(core.invoke('core_apply', { version: coreFrom }), CORE_APPLY_BUDGET_MS, '回退安装超时').then(function (r) {
         if (!r || r.ok !== true) { fail(msg + '；回退亦失败：' + ((r && r.error) || '未知')); return null; }
         coreTo = coreFrom; // 已回退：再次失败将直接进入失败态（不再循环回退）
-        return core.invoke('guard_start').then(function () { return stepGuardReady(0); });
+        return withTimeout(core.invoke('guard_start'), GUARD_START_BUDGET_MS, '守卫启动超时').then(function () { return stepGuardReady(0); });
       }).catch(function (e) { fail(msg + '；回退异常：' + e); return null; });
     }
     fail(msg);
@@ -729,6 +741,16 @@
     try { if (navigator.clipboard) navigator.clipboard.writeText(t); } catch (e) {}
     status('诊断信息已复制：' + t);
   });
+
+  // 守卫启动阶段进度（Rust 侧 ensure_guard 通过 guard_progress 上报）
+  // 存在理由：ensure_guard 最长约 2 分钟；若只有静态文案，**静默等待与卡死无法区分**，
+  // 用户会误判为卡住并强杀进程，从而错失本可成功的启动。
+  if (evt) {
+    evt.listen('guard_progress', function (e) {
+      var p = e.payload || {};
+      if (p.status) status(p.status);
+    });
+  }
 
   // 下载进度（Rust 侧 shell_update_apply 通过 shell_update_progress 上报）
   // 此前该事件无人监听、且 Rust 侧回调体为空 → 下载全程零反馈。

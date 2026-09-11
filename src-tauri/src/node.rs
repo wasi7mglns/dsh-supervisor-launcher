@@ -222,16 +222,28 @@ pub fn download_verified(
     Err(last_err.unwrap_or_else(|| "下载失败".into()))
 }
 
+/// 安装命令的时间上限。
+///
+/// 这类命令会弹出系统授权对话框（pkexec / osascript / UAC），**必须等用户操作**，
+/// 故预算要给足（用户可能需要一两分钟输入密码）。
+/// 但**不能无界**：在无图形会话、策略禁弹窗、对话框被其它窗口遮挡等环境下，
+/// 进程可能永不返回 —— 原实现用 `.status()`/`.output()`，会让安装线程永久悬挂，
+/// 用户永远停在「正在安装运行环境…」。
+const INSTALL_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 /// 平台安装：官方产物 + 一次性系统授权弹窗。
 pub fn install(file: &Path) -> Result<PathBuf, String> {
     let abs = file.canonicalize().map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
     {
         let cmd = format!("tar -xJf '{}' -C /usr/local --strip-components=1", abs.display());
-        match Command::new("pkexec").args(["sh", "-c", &cmd]).status() {
-            Ok(s) if s.success() => { /* 落点检查 */ }
-            Ok(s) => return Err(format!("pkexec 退出码 {:?}（用户取消或安装失败）", s.code())),
-            Err(e) => return Err(format!("无法启动 pkexec（{}）。请确认系统已安装 pkexec（policykit）。", e)),
+        let out = crate::bounded::run(
+            Command::new("pkexec").args(["sh", "-c", &cmd]),
+            INSTALL_CMD_TIMEOUT,
+        )
+        .map_err(|e| format!("无法启动 pkexec（{}）。请确认系统已安装 pkexec（policykit）。", e))?;
+        if !out.success {
+            return Err(format!("pkexec 退出码 {}（用户取消或安装失败）：{}", out.code.unwrap_or_else(|| "killed".into()), out.stderr.trim()));
         }
         let node = PathBuf::from("/usr/local/bin/node");
         if !node.is_file() { return Err("安装完成但 /usr/local/bin/node 未就位".into()); }
@@ -241,10 +253,13 @@ pub fn install(file: &Path) -> Result<PathBuf, String> {
     {
         let esc = abs.display().to_string().replace('"', "\"");
         let script = format!("do shell script \"installer -pkg '{}' -target /\" with administrator privileges", esc);
-        let out = Command::new("osascript").arg("-e").arg(&script).output()
-            .map_err(|e| format!("无法启动 osascript: {}", e))?;
-        if !out.status.success() {
-            return Err(format!("macOS 安装失败（用户取消或 installer 报错）: {}", String::from_utf8_lossy(&out.stderr)));
+        let out = crate::bounded::run(
+            Command::new("osascript").arg("-e").arg(&script),
+            INSTALL_CMD_TIMEOUT,
+        )
+        .map_err(|e| format!("无法启动 osascript: {}", e))?;
+        if !out.success {
+            return Err(format!("macOS 安装失败（用户取消或 installer 报错）: {}", out.stderr.trim()));
         }
         return Ok(PathBuf::from("/usr/local/bin/node"));
     }
@@ -252,9 +267,14 @@ pub fn install(file: &Path) -> Result<PathBuf, String> {
     {
         let esc = abs.display().to_string().replace('\'', "''");
         let ps = format!("Start-Process -FilePath msiexec -ArgumentList '/i','{}','/qn','/norestart' -Verb RunAs -Wait", esc);
-        let out = Command::new("powershell").args(["-NoProfile", "-Command", &ps]).output()
-            .map_err(|e| format!("无法启动 msiexec: {}", e))?;
-        if !out.status.success() { return Err("Windows 安装失败（用户取消或 msiexec 报错）".into()); }
+        let out = crate::bounded::run(
+            Command::new("powershell").args(["-NoProfile", "-Command", &ps]),
+            INSTALL_CMD_TIMEOUT,
+        )
+        .map_err(|e| format!("无法启动 msiexec: {}", e))?;
+        if !out.success {
+            return Err(format!("Windows 安装失败（用户取消或 msiexec 报错）：{}", out.stderr.trim()));
+        }
         return Ok(PathBuf::from(r"C:\Program Files\nodejs\node.exe"));
     }
     #[allow(unreachable_code)]
@@ -329,14 +349,39 @@ pub fn record_runtime_meta(node_path: &str, version: &str) {
     let _ = std::fs::write(dir.join("runtime.json"), serde_json::to_string_pretty(&meta).unwrap_or_default());
 }
 
+/// 当前 UTC 时间，ISO 8601（`YYYY-MM-DDTHH:MM:SSZ`）。
+///
+/// == 架构修复（2026-09-11）==
+///
+/// 旧实现在 Unix 上**执行外部 `date` 进程**取时间，且 Windows 分支**直接返回空串**。
+/// 两个问题：
+///   ① 为一个纯计算的值去 spawn 进程 —— 无界（原用 `.output()`）、且可能不存在；
+///   ② Windows 上写空值，使 `installedAt` 在 Windows 丢失，跨平台行为不一致。
+/// 现改为纯 std 计算（Howard Hinnant 的 civil-from-days 算法），三平台一致、无副作用。
+/// 格式与内核侧 `new Date().toISOString()` 同族，下游（仅展示）可直接解析。
 pub fn now_iso() -> String {
-    #[cfg(target_os = "windows")]
-    { "".to_string() }
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Ok(o) = Command::new("date").arg("-u").arg("+%Y-%m-%dT%H:%M:%SZ").output() {
-            return String::from_utf8_lossy(&o.stdout).trim().to_string();
-        }
-        "".to_string()
-    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, m, d) = civil_from_days(days);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, h, mi, s)
+}
+
+/// 把「自 1970-01-01 起的天数」转为 (年, 月, 日)。
+/// 算法来源：Howard Hinnant 的 `civil_from_days`（公有领域，已被广泛验证）。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64;                       // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);          // [0, 365]
+    let mp = (5 * doy + 2) / 153;                               // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;              // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;       // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }

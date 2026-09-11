@@ -7,6 +7,8 @@
 //      → 拉起守卫 daemon → 面板 127.0.0.1:3100。内核闭源（npm 安装），壳不内嵌任何内核资产。
 // 托盘常驻：关窗 = 隐藏；菜单动作直发本地 API（裸 TCP，无额外依赖）。
 
+// 有界子进程执行（公共设施）：所有外部命令一律经它，避免「无界阻塞分散潜伏」。
+mod bounded;
 mod core;
 mod env;
 // 镜像源适配（壳自持）：装机时无内核，三处下载都必须自带镜像能力。
@@ -79,7 +81,7 @@ async fn node_status(app: tauri::AppHandle) -> serde_json::Value {
 
     let mut o = {
         let state = app.state::<Mutex<RunState>>();
-        let st = state.lock().unwrap();
+        let st = state.lock().unwrap_or_else(|e| e.into_inner());
         let installed = out.version.clone().or_else(|| st.installed.clone());
         let mut o = log(&st);
         o["installed"] = serde_json::json!(installed);
@@ -138,9 +140,17 @@ fn finish_boot(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 互斥锁中毒恢复的**统一约定**（2026-09-11 架构修复）：
+///
+/// 全部 `RunState` 加锁点使用 `.unwrap_or_else(|e| e.into_inner())` 而非 `.unwrap()`。
+/// 原实现一旦有任何线程在持锁期间 panic，该锁**永久中毒**，此后**所有**命令
+/// 都在加锁处 panic —— 用户看到的是「重启也没用、功能永久失效」。
+/// 锁内是普通状态快照（不承载跨字段不变式），中毒后仍可用，故取回内部值继续。
+///
+/// 原则：**一次 panic 不应让整个应用的功能不可恢复地失效。**
 #[tauri::command]
 fn start_node_install(state: tauri::State<Mutex<RunState>>, app: tauri::AppHandle) -> Result<(), String> {
-    let mut st = state.lock().unwrap();
+    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
     if st.busy { return Ok(()); }
     st.busy = true;
     st.error = None;
@@ -151,7 +161,7 @@ fn start_node_install(state: tauri::State<Mutex<RunState>>, app: tauri::AppHandl
     std::thread::spawn(move || {
         let out = run_install(&handle);
         let state = handle.state::<Mutex<RunState>>();
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.busy = false;
         match out {
             Ok((node_path, version)) => {
@@ -181,7 +191,7 @@ fn start_node_install(state: tauri::State<Mutex<RunState>>, app: tauri::AppHandl
 fn push_status(app: &tauri::AppHandle, status: String, progress: f32) {
     {
         let state = app.state::<Mutex<RunState>>();
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.status = status.clone();
         s.progress = progress;
         s.logs.push(status.clone());
@@ -235,7 +245,14 @@ fn core_exe_names() -> &'static [&'static str] {
 fn locate_core_candidates(resource_dir: Option<PathBuf>) -> Vec<PathBuf> {
     let home = env::home();
     let mut out: Vec<PathBuf> = Vec::new();
+    // ⚠ 与 env.rs 的 PATH 探测同一类防护（2026-09-11 架构修复）：
+    //   is_file() / canonicalize() 底层会触网 —— 在断开的映射盘或 UNC 路径上
+    //   可能阻塞数十秒，而本函数在**内核定位的关键路径**上（引导页每一步都要用）。
+    //   故先做「本地固定盘」判定（GetDriveTypeW 自身不触网），再访问文件系统。
     let mut add = |p: PathBuf, out: &mut Vec<PathBuf>| {
+        if let Some(dir) = p.parent() {
+            if !env::is_local_fixed_dir(dir) { return; }
+        }
         if !p.is_file() { return; }
         let real = std::fs::canonicalize(&p).unwrap_or(p); // 解析 ~/.local/bin 软链到包内真实路径
         if !out.contains(&real) { out.push(real); }
@@ -280,6 +297,14 @@ fn locate_core_candidates(resource_dir: Option<PathBuf>) -> Vec<PathBuf> {
 
 /// 定位已安装内核：多候选**按版本最高**仲裁（K5 修复）——旧内核不得遮蔽新内核。
 fn locate_core(app: &tauri::AppHandle) -> Option<PathBuf> {
+    locate_core_with_version(app).map(|(p, _)| p)
+}
+
+/// 定位内核并**一并返回其版本**（避免调用方再执行一次二进制取版本）。
+///
+/// 仲裁规则（K5）：多候选中**按版本最高**选取 —— 旧内核不得遮蔽新内核。
+/// 每个候选的版本探测都经有界执行器（10 秒上限），单个坏候选不会拖死定位。
+fn locate_core_with_version(app: &tauri::AppHandle) -> Option<(PathBuf, String)> {
     let cands = locate_core_candidates(app.path().resource_dir().ok());
     if cands.is_empty() { return None; }
     let mut best: Option<(PathBuf, String)> = None;
@@ -288,19 +313,42 @@ fn locate_core(app: &tauri::AppHandle) -> Option<PathBuf> {
         let better = best.as_ref().map(|(_, bv)| core::semver_cmp(&v, bv) > 0).unwrap_or(true);
         if better { best = Some((c.clone(), v)); }
     }
-    best.map(|(p, _)| p).or_else(|| cands.into_iter().next())
+    best.or_else(|| cands.into_iter().next().map(|p| (p, "0.0.0".into())))
 }
 
 /// 引导页查询用：内核是否已安装 + 当前版本 + 真实包名提示（不再硬编码平台字符串）。
+///
+/// 内核状态查询。
+///
+/// == 架构修复（2026-09-11）==
+///
+/// 1) **必须 async**：旧实现是同步命令 → Tauri 在**主线程**执行 →
+///    `locate_core` 会**逐个候选执行内核二进制**（每个 10 秒上限）取版本做仲裁，
+///    且随后又对选中项再执行一次取版本。候选一多（PATH + npm 目录 + 资源目录）
+///    即可把主线程占住数十秒 —— 界面完全无响应。
+///    现把全部工作放进阻塞线程池，主线程立即返回。
+///
+/// 2) **不重复执行**：`locate_core` 内部已按版本仲裁并取过版本，
+///    旧实现在外面又调一次 `installed_version`，属纯浪费（每次都可能是一次进程启动）。
+///    现让 `locate_core` 一并返回版本。
 #[tauri::command]
-fn core_status(app: tauri::AppHandle) -> serde_json::Value {
-    let bin = locate_core(&app);
-    let version = bin.as_ref().and_then(|b| core::installed_version(b));
+async fn core_status(app: tauri::AppHandle) -> serde_json::Value {
     let pkg = core::package_name().unwrap_or_else(|_| "@dsh-sup/dsh-core-<platform>".into());
+    let located = tauri::async_runtime::spawn_blocking(move || {
+        let a = app.clone();
+        locate_core_with_version(&a)
+    })
+    .await
+    .ok()
+    .flatten();
+    let (installed, version, path) = match located {
+        Some((p, v)) => (true, Some(v), Some(p.display().to_string())),
+        None => (false, None, None),
+    };
     serde_json::json!({
-        "installed": bin.is_some(),
+        "installed": installed,
         "version": version,
-        "path": bin.map(|p| p.display().to_string()),
+        "path": path,
         "package": pkg,
         "hint": format!("npm i -g {}", pkg),
     })
@@ -363,8 +411,29 @@ async fn core_apply(app: tauri::AppHandle, version: Option<String>) -> Result<se
 /// 引导页驱动：申请所有者启动守卫（唯一启停权威，见 start_guard_service）。阻塞放线程池。
 #[tauri::command]
 async fn guard_start(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    // ⚠ 必须有界（2026-09-11 架构修复）。
+    //
+    // 旧实现：`spawn_blocking(ensure_guard).await` —— **无超时**。
+    // 而 ensure_guard 内部会：① 调服务管理器（原为无界 .output()）
+    // ② wait_alive 最多 30 秒 ③ 兜底 spawn 后再等 60 秒。
+    // 任一处挂起 → 本命令永不返回 → 前端 invoke('guard_start') 永不 settle
+    // → 引导页**永久停在「正在启动守卫…」**，无重试、无出口。
+    // 这与「卡在检测环境」是**同一根因模式**，只是发生在另一个步骤上。
+    //
+    // 两层保证：① 内部各命令已全部有界；② 此处再加外层兜底。
+    // 注：超时不会取消 spawn_blocking 中已启动的任务（它会自然结束），
+    // 但**命令会返回**，前端因此能拿到结论并给出重试/诊断入口。
+    const GUARD_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
     let a = app.clone();
-    let r = tauri::async_runtime::spawn_blocking(move || ensure_guard(&a)).await.map_err(|e| e.to_string())?;
+    let task = tauri::async_runtime::spawn_blocking(move || ensure_guard(&a));
+    let r = match tokio::time::timeout(GUARD_TOTAL_BUDGET, task).await {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("守卫启动任务异常: {}", e)),
+        Err(_) => Err(format!(
+            "守卫启动超时（{} 秒未完成）。可能原因：服务管理器无响应，或守卫进程无法启动。请用 dsh-supervisor-gui --service-plan 查看服务定义状态。",
+            GUARD_TOTAL_BUDGET.as_secs()
+        )),
+    };
     Ok(match r {
         Ok(()) => serde_json::json!({"ok": true}),
         Err(e) => serde_json::json!({"ok": false, "error": e}),
@@ -417,35 +486,42 @@ fn win_ctl(app: tauri::AppHandle, action: String) -> Result<(), String> {
 ///   Linux=systemd --user；macOS=launchctl kickstart；Windows=schtasks。
 /// 壳**绝不直接 spawn 守卫进程**——那会产生游离于服务管理器的第二实例（身份漂移，
 /// 且使「停止守卫」无唯一权威）。壳只请求所有者启动。
+/// 服务管理器命令的时间上限。
+///
+/// ⚠ 这些调用原先全部用 `.output()`（**无界**），而它们在引导**关键路径**上：
+///   ensure_guard → start_guard_service → 本函数。systemctl/launchctl/schtasks 在
+///   dbus 异常、服务管理器无响应时会长时间挂起 —— 则 guard_start 永不返回，
+///   引导页永久停在「正在启动守卫…」（与「卡在检测环境」同一根因模式）。
+///   故一律经 bounded::run：超时即 kill，让上层走 spawn 兜底路径。
+const GUARD_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[cfg(target_os = "linux")]
 fn start_guard_service() -> Result<(), String> {
-    let out = std::process::Command::new("systemctl")
-        .args(["--user", "start", "dsh-supervisor"])
-        .output()
-        .map_err(|e| format!("无法调用 systemctl: {}", e))?;
-    if out.status.success() { Ok(()) } else {
-        Err(format!("systemctl --user start dsh-supervisor 失败: {}", String::from_utf8_lossy(&out.stderr).trim()))
-    }
+    bounded::run_checked(
+        std::process::Command::new("systemctl").args(["--user", "start", "dsh-supervisor"]),
+        GUARD_CMD_TIMEOUT,
+        "systemctl --user start dsh-supervisor",
+    )
+    .map(|_| ())
 }
 #[cfg(target_os = "macos")]
 fn start_guard_service() -> Result<(), String> {
-    let out = std::process::Command::new("sh")
-        .args(["-c", "launchctl kickstart -k gui/$(id -u)/com.dsh.supervisor"])
-        .output()
-        .map_err(|e| format!("无法调用 launchctl: {}", e))?;
-    if out.status.success() { Ok(()) } else {
-        Err(format!("launchctl kickstart 失败: {}", String::from_utf8_lossy(&out.stderr).trim()))
-    }
+    bounded::run_checked(
+        std::process::Command::new("sh")
+            .args(["-c", "launchctl kickstart -k gui/$(id -u)/com.dsh.supervisor"]),
+        GUARD_CMD_TIMEOUT,
+        "launchctl kickstart",
+    )
+    .map(|_| ())
 }
 #[cfg(target_os = "windows")]
 fn start_guard_service() -> Result<(), String> {
-    let out = std::process::Command::new("schtasks")
-        .args(["/Run", "/TN", "DSH-Supervisor"])
-        .output()
-        .map_err(|e| format!("无法调用 schtasks: {}", e))?;
-    if out.status.success() { Ok(()) } else {
-        Err(format!("schtasks /Run 失败: {}", String::from_utf8_lossy(&out.stderr).trim()))
-    }
+    bounded::run_checked(
+        std::process::Command::new("schtasks").args(["/Run", "/TN", "DSH-Supervisor"]),
+        GUARD_CMD_TIMEOUT,
+        "schtasks /Run",
+    )
+    .map(|_| ())
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn start_guard_service() -> Result<(), String> { Err("当前平台不支持守卫服务管理".into()) }
@@ -453,30 +529,39 @@ fn start_guard_service() -> Result<(), String> { Err("当前平台不支持守�
 /// 请求守卫的所有者停止守卫（契约 §4.1 退出时序的最后一步——守卫自身不再停自己）。
 #[cfg(target_os = "linux")]
 fn stop_guard_service() -> Result<(), String> {
-    let out = std::process::Command::new("systemctl")
-        .args(["--user", "stop", "dsh-supervisor"])
-        .output()
-        .map_err(|e| format!("无法调用 systemctl: {}", e))?;
-    if out.status.success() { Ok(()) } else {
-        Err(format!("systemctl --user stop 失败: {}", String::from_utf8_lossy(&out.stderr).trim()))
-    }
+    bounded::run_checked(
+        std::process::Command::new("systemctl").args(["--user", "stop", "dsh-supervisor"]),
+        GUARD_CMD_TIMEOUT,
+        "systemctl --user stop",
+    )
+    .map(|_| ())
 }
 #[cfg(target_os = "macos")]
 fn stop_guard_service() -> Result<(), String> {
-    let out = std::process::Command::new("sh")
-        .args(["-c", "launchctl bootout gui/$(id -u)/com.dsh.supervisor"])
-        .output()
-        .map_err(|e| format!("无法调用 launchctl: {}", e))?;
-    if out.status.success() { Ok(()) } else {
-        Err(format!("launchctl bootout 失败: {}", String::from_utf8_lossy(&out.stderr).trim()))
-    }
+    bounded::run_checked(
+        std::process::Command::new("sh")
+            .args(["-c", "launchctl bootout gui/$(id -u)/com.dsh.supervisor"]),
+        GUARD_CMD_TIMEOUT,
+        "launchctl bootout",
+    )
+    .map(|_| ())
 }
 #[cfg(target_os = "windows")]
 fn stop_guard_service() -> Result<(), String> {
     // Windows：先停 watchdog 保活任务，再终止守卫进程（否则 watchdog 会立刻重新拉起）。
-    let _ = std::process::Command::new("schtasks").args(["/End", "/TN", "DSH-Supervisor-Watchdog"]).output();
-    let _ = std::process::Command::new("schtasks").args(["/End", "/TN", "DSH-Supervisor"]).output();
-    let _ = std::process::Command::new("taskkill").args(["/F", "/IM", "dsh-supervisor.exe"]).output();
+    // 全部有界：退出流程也要能在服务管理器无响应时走完，否则用户会觉得「程序关不掉」。
+    bounded::run_lossy(
+        std::process::Command::new("schtasks").args(["/End", "/TN", "DSH-Supervisor-Watchdog"]),
+        GUARD_CMD_TIMEOUT,
+    );
+    bounded::run_lossy(
+        std::process::Command::new("schtasks").args(["/End", "/TN", "DSH-Supervisor"]),
+        GUARD_CMD_TIMEOUT,
+    );
+    bounded::run_lossy(
+        std::process::Command::new("taskkill").args(["/F", "/IM", "dsh-supervisor.exe"]),
+        GUARD_CMD_TIMEOUT,
+    );
     Ok(())
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -506,7 +591,14 @@ fn shutdown_all(port: u16) {
 /// 端口从用户 config.apiPort 解析（非硬编码 3100）。
 fn ensure_guard(app: &tauri::AppHandle) -> Result<(), String> {
     let port = env::api_port();
-    if is_alive(port) { return Ok(()); }
+    // 进度上报（2026-09-11 架构修复）：本函数最长可耗时约 2 分钟（服务管理器启动最多 30s，
+    // 兜底 spawn 后再等 60s），而这段时间前端只有一句静态的「正在启动守卫…」——
+    // **静默等待与卡死无法区分**，用户会误判为卡住并强杀。故每个阶段都上报。
+    let step = |s: &str| {
+        let _ = app.emit("guard_progress", serde_json::json!({ "status": s }));
+        update::log(s);
+    };
+    if is_alive(port) { step("守卫已在运行"); return Ok(()); }
 
     let guard = locate_core(app).ok_or_else(|| match core::package_name() {
         Ok(p) => format!("未检测到内核。请先安装：npm i -g {}", p),
@@ -516,22 +608,25 @@ fn ensure_guard(app: &tauri::AppHandle) -> Result<(), String> {
     // ① 建立服务定义（**首次安装的关键一步**）。
     //    旧实现直接跳到 start，而首启时服务定义根本不存在 -> 必然失败 -> 卡在「守卫就绪」。
     //    这一步是幂等的：已存在则直接返回。
+    step("正在建立守卫服务定义…");
     match service::ensure_defined(&guard) {
         Ok(desc) => update::log(&format!("守卫服务定义: {}", desc)),
         Err(e) => update::log(&format!("守卫服务定义失败（稍后走 spawn 兜底）: {}", e)),
     }
 
     // ② 请求服务管理器启动（正常路径：由 systemd/launchd/schtasks 托管，具备开机自启与崩溃自拉）
+    step("正在请求服务管理器启动守卫…");
     let started = start_guard_service();
     if let Err(e) = &started {
         update::log(&format!("服务管理器启动失败: {}", e));
     }
+    step("等待守卫就绪（服务管理器路径）…");
     if wait_alive(port, 60) { return Ok(()); }
 
     // ③ 兜底：直接拉起守护进程。
     //    服务管理器不可用的场景真实存在（容器/无 user session/策略拦截），
     //    此时若不给兜底，用户将被永久挡在门外。
-    update::log("服务管理器未能在 30s 内拉起守卫，改用直接 spawn 兜底");
+    step("服务管理器未能在 30s 内拉起守卫 · 改用直接启动兜底…");
     match service::spawn_daemon(&guard) {
         Ok(pid) => update::log(&format!("兜底 spawn 守卫 pid={}", pid)),
         Err(e) => {
@@ -651,6 +746,17 @@ fn show_main(app: &tauri::AppHandle) {
 
 fn post_local(port: u16, path: &str) {
     let _ = post_local_timeout(port, path, std::time::Duration::from_secs(60));
+}
+
+/// 把本地 API 调用派发到独立线程（**绝不阻塞 UI 线程**）。
+///
+/// 用于托盘菜单等由 UI 线程派发的回调：这些回调里的网络 I/O 一旦阻塞，
+/// 整个界面（含重绘）都会被冻结 —— 实测观感是「点击无反应」。
+///
+/// 退出流程同样经此派发：即使守卫无响应，菜单也立即响应，
+/// 用户不会觉得「程序关不掉」。
+fn spawn_local_post(port: u16, path: &'static str) {
+    std::thread::spawn(move || post_local(port, path));
 }
 
 /// 同 post_local，但带读写超时（防止守卫挂起时壳无限阻塞）。返回响应体（解码 utf8 尽力）。
@@ -1126,7 +1232,7 @@ fn main() {
                     let out = nodeprobe::status(std::time::Duration::from_secs(45));
                     if let Some(v) = out.version {
                         let st = h.state::<Mutex<RunState>>();
-                        st.lock().unwrap().installed = Some(v);
+                        st.lock().unwrap_or_else(|e| e.into_inner()).installed = Some(v);
                     }
                 });
             }
@@ -1138,7 +1244,7 @@ fn main() {
                 if let Ok(c) = node::latest_lts() {
                     let v = c.version.clone();
                     let state = handle.state::<Mutex<RunState>>();
-                    let mut s = state.lock().unwrap();
+                    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                     s.latest = Some(v.clone());
                     drop(s);
                     let _ = handle.emit("env_status", serde_json::json!({ "latest": v }));
@@ -1167,15 +1273,26 @@ fn main() {
                 .on_menu_event(move |app, event| {
                     match event.id.as_ref() {
                         "show" => show_main(app),
-                        // 归一化：启停唯一入口 /lifecycle/dsh/*（旧 /start|/stop|/restart 已删，2026-09）
-                        "start" => post_local(port, "/lifecycle/dsh/start"),
-                        "stop" => post_local(port, "/lifecycle/dsh/stop"),
-                        "restart" => post_local(port, "/lifecycle/dsh/restart"),
+                        // ⚠ 网络 I/O **必须离开 UI 线程**（2026-09-11 架构修复）。
+                        //   托盘菜单事件由 UI 线程派发，而 post_local 最多阻塞 60 秒
+                        //   （TCP 连接 + 读写超时）。守卫挂起或端口无响应时，
+                        //   点击「启动/停止/重启」会**把整个界面冻结 60 秒** ——
+                        //   用户看到的是「点了没反应」，且期间窗口无法重绘。
+                        //   改为派发到独立线程：菜单立即响应，结果异步生效。
+                        "start" => spawn_local_post(port, "/lifecycle/dsh/start"),
+                        "stop" => spawn_local_post(port, "/lifecycle/dsh/stop"),
+                        "restart" => spawn_local_post(port, "/lifecycle/dsh/restart"),
                         // 退出管家 = 完全退出：通知守卫停止全部服务链，随后壳退出
                         "quit" => {
-                            // 契约 §4.1：请求内核停被管对象（等回执）→ 由所有者停止守卫 → 壳退出
-                            shutdown_all(port);
-                            app.exit(0);
+                            // 契约 §4.1：请求内核停被管对象（等回执）→ 由所有者停止守卫 → 壳退出。
+                            // ⚠ 同样离开 UI 线程：退出握手最坏可耗时约 70 秒（/session/stop 60s
+                            //   + 轮询 10s）。若在 UI 线程做，用户会看到窗口卡住不动，
+                            //   误以为「程序关不掉」而强杀 —— 那会跳过退出握手，留下未停的 DSH。
+                            let h = app.clone();
+                            std::thread::spawn(move || {
+                                shutdown_all(port);
+                                h.exit(0);
+                            });
                         }
                         _ => {}
                     }

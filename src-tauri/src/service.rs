@@ -25,6 +25,16 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+// ── 服务管理器命令的时间上限（2026-09-11 架构修复）──
+//
+// ⚠ 这些命令原先全部用 `.output()`（**无界**），而它们位于引导的**关键路径**上
+//   （建立服务定义 → 启动守卫 → 进入面板）。systemctl 在 dbus 会话异常、systemd 无响应时
+//   会长时间挂起 —— 此时本函数永不返回，`guard_start` 永不返回，
+//   引导页永久停在「正在启动守卫…」（与「卡在检测环境」是同一根因模式）。
+//   故一律经 bounded::run 执行：超时即 kill 并如实返回错误，让上层走兜底路径。
+const SVC_QUICK: std::time::Duration = std::time::Duration::from_secs(8);
+const SVC_NORMAL: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -74,15 +84,26 @@ pub fn ensure_defined(guard: &Path) -> Result<String, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("创建 systemd 目录失败: {}", e))?;
     }
     std::fs::write(&path, body).map_err(|e| format!("写入 unit 失败: {}", e))?;
-    let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
-    let en = Command::new("systemctl")
-        .args(["--user", "enable", "dsh-supervisor.service"])
-        .output();
+    // 全部经 bounded::run：超时即返回，绝不把引导挂在 systemctl 上。
+    crate::bounded::run_lossy(
+        Command::new("systemctl").args(["--user", "daemon-reload"]),
+        SVC_QUICK,
+    );
+    let en = crate::bounded::run(
+        Command::new("systemctl").args(["--user", "enable", "dsh-supervisor.service"]),
+        SVC_NORMAL,
+    );
     // linger：未登录也保持用户服务（否则注销后守卫停止）
-    let _ = Command::new("loginctl").arg("enable-linger").arg(user_name()).output();
+    crate::bounded::run_lossy(
+        Command::new("loginctl").arg("enable-linger").arg(user_name()),
+        SVC_NORMAL,
+    );
+    // 注意：enable 失败不算致命 —— 服务定义已写入，start 时仍可拉起（并另有 spawn 兜底）。
+    // 故这里只如实描述状态，不返回 Err（否则会把「可继续」的情形误判为彻底失败）。
     match en {
-        Ok(o) if o.status.success() => Ok(format!("已建立并启用 {}", path.display())),
-        _ => Ok(format!("已建立（enable 未成功，start 时重试）{}", path.display())),
+        Ok(o) if o.success => Ok(format!("已建立并启用 {}", path.display())),
+        Ok(o) => Ok(format!("已建立（enable 未成功：{}，start 时重试）{}", o.stderr.trim(), path.display())),
+        Err(e) => Ok(format!("已建立（enable 超时/失败：{}，start 时重试）{}", e, path.display())),
     }
 }
 
@@ -114,15 +135,15 @@ pub fn ensure_defined(guard: &Path) -> Result<String, String> {
     std::fs::write(&path, body).map_err(|e| format!("写入 plist 失败: {}", e))?;
     // bootstrap 会因 RunAtLoad 立即启动；KeepAlive 负责崩溃重启。
     let cmd = format!("launchctl bootstrap gui/$(id -u) \"{}\"", path.display());
-    let out = Command::new("sh").args(["-c", &cmd]).output();
+    let out = crate::bounded::run(Command::new("sh").args(["-c", &cmd]), SVC_NORMAL);
     match out {
-        Ok(o) if o.status.success() => Ok(format!("已建立并加载 {}", path.display())),
+        Ok(o) if o.success => Ok(format!("已建立并加载 {}", path.display())),
         Ok(o) => Ok(format!(
             "已建立（bootstrap 未成功: {}，start 时重试）{}",
-            String::from_utf8_lossy(&o.stderr).trim(),
+            o.stderr.trim(),
             path.display()
         )),
-        Err(e) => Ok(format!("已建立（bootstrap 调用失败: {}）{}", e, path.display())),
+        Err(e) => Ok(format!("已建立（bootstrap 超时/失败: {}）{}", e, path.display())),
     }
 }
 
@@ -130,11 +151,11 @@ pub fn ensure_defined(guard: &Path) -> Result<String, String> {
 
 #[cfg(target_os = "windows")]
 pub fn ensure_defined(guard: &Path) -> Result<String, String> {
-    if let Ok(o) = Command::new("schtasks")
-        .args(["/Query", "/TN", "DSH-Supervisor"])
-        .output()
-    {
-        if o.status.success() {
+    if let Ok(o) = crate::bounded::run(
+        Command::new("schtasks").args(["/Query", "/TN", "DSH-Supervisor"]),
+        SVC_QUICK,
+    ) {
+        if o.success {
             return Ok("已存在 计划任务 DSH-Supervisor".into());
         }
     }
@@ -149,24 +170,21 @@ pub fn ensure_defined(guard: &Path) -> Result<String, String> {
     }
     let shim = format!("@echo off\r\n\"{}\" daemon\r\n", guard.display());
     std::fs::write(&wrapper, shim).map_err(|e| format!("写入包装脚本失败: {}", e))?;
-    let out = Command::new("schtasks")
-        .args([
+    let out = crate::bounded::run(
+        Command::new("schtasks").args([
             "/Create",
             "/TN", "DSH-Supervisor",
             "/SC", "ONLOGON",
             "/RL", "HIGHEST",
             "/F",
             "/TR", &wrapper.display().to_string(),
-        ])
-        .output()
-        .map_err(|e| format!("schtasks 调用失败: {}", e))?;
-    if out.status.success() {
+        ]),
+        SVC_NORMAL,
+    )?;
+    if out.success {
         Ok(format!("已建立 计划任务 DSH-Supervisor -> {}", wrapper.display()))
     } else {
-        Err(format!(
-            "schtasks /Create 失败: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
+        Err(format!("schtasks /Create 失败: {}", out.stderr.trim()))
     }
 }
 

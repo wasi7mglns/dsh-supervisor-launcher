@@ -8,6 +8,109 @@
 
 ## [1.0.5]（2026-09-11）
 
+### 修复（架构级）：全壳审计 —— 「无界阻塞 + 被 await」同一模式另有 6 处
+
+用户要求顺着环境探测的根因，深度排查整个桌面壳是否还有同类（逻辑/架构）缺陷。
+把根因抽象为可检索的模式 —— **① 无界阻塞调用 ② 被命令 await ③ 失败被静默吞掉** ——
+逐类扫描全部源码后，确认同一模式**另有 6 处**，其中 2 处在引导关键路径上。
+
+#### 新增公共设施 `src/bounded.rs`
+
+审计发现「无界执行」是**分散潜伏**的：service.rs / main.rs / node.rs 各写各的
+`.output()`。故提取公共有界执行器，**所有**外部命令一律经它执行：
+
+- 输出重定向到**临时文件**而非管道（管道不读取会在填满 64KB 缓冲后死锁）；
+- 轮询 `try_wait` + 超时 kill（std 无跨平台 wait-with-timeout）；
+- Windows 加 `CREATE_NO_WINDOW`（GUI 调控制台程序不弹黑框）；
+- 自带单测：成功路径 / 超时必须被 kill / 不存在的二进制返回 Err 而非 panic。
+
+#### 六处同源缺陷与修复
+
+**① 服务管理器命令全部无界（致命 —— P0 已在关键路径上）**
+
+`service.rs` 的 `systemctl --user daemon-reload/enable`、`loginctl enable-linger`、
+`launchctl bootstrap`、`schtasks /Query /Create`，以及 `main.rs` 的
+`start_guard_service` / `stop_guard_service` / `taskkill` —— **全部**用 `.output()`。
+
+而它们在**建立服务定义 → 启动守卫**这条唯一通道上。systemd 在 dbus 会话异常、
+systemd 无响应时会长时间挂起 → `ensure_guard` 永不返回 → 引导页永久停在
+「正在启动守卫…」。**与环境探测卡死是同一根因，只是发生在下一步。**
+
+**② `guard_start` 无外层超时（致命）**
+
+```rust
+// 旧：spawn_blocking(ensure_guard).await   ← 无超时
+```
+
+而前端调用它时是**裸 invoke**（无 `withTimeout`）—— 两侧都没有界。
+现：Rust 侧加 `tokio::time::timeout`（180 秒）+ 前端加 `GUARD_START_BUDGET_MS`（200 秒）。
+
+**③ `guard_start` 全程静默（UX 缺陷，会被误判为卡死）**
+
+`ensure_guard` 最长可耗时约 2 分钟（服务管理器 30s + 兜底 spawn 后 60s），
+而这段时间前端只有一句静态的「正在启动守卫…」。
+**静默等待与卡死无法区分** —— 用户会误判并强杀进程，从而错失本可成功的启动。
+现每个阶段经 `guard_progress` 事件上报，前端实时显示。
+
+**④ `core_status` 是同步命令且在**主线程**执行二进制**
+
+`fn core_status`（非 async）→ Tauri 在**主线程**执行 → 内部 `locate_core` 会
+**逐个候选执行内核二进制**（每个 10 秒上限）取版本做仲裁，且随后又对选中项
+再执行一次。候选一多（PATH + npm 目录 + 资源目录）即把主线程占住数十秒 ——
+界面完全无响应。现改为 async + 阻塞线程池，并让 `locate_core` 一并返回版本，
+消除重复执行。
+
+**⑤ 托盘菜单在 UI 线程做网络 I/O**
+
+`on_menu_event` 由 UI 线程派发，而分支里直接调 `post_local`（最长阻塞 60 秒）。
+守卫挂起或端口无响应时，点击「启动/停止/重启」会**把整个界面冻结 60 秒** ——
+用户看到的是「点了没反应」。同样地，「退出」在 UI 线程做完整退出握手（最坏约 70 秒），
+会被感知为「程序关不掉」而强杀，从而**跳过退出握手、留下未停的 DSH**。
+现两者均派发到独立线程。
+
+**⑥ 内核候选定位未过滤可能阻塞的路径**
+
+`locate_core_candidates` 的 `is_file()` / `canonicalize()` 会触网 —— 在断开的映射盘
+或 UNC 上可能阻塞数十秒，而该函数在**内核定位的关键路径**上（引导页每步都用到）。
+已在 `env.rs` 修过同类问题（PATH 探测），但此处漏修。现复用 `is_local_fixed_dir`。
+
+#### 另两处隐患（非阻塞类）
+
+**⑦ 互斥锁中毒后全部命令永久 panic**
+
+6 处 `.lock().unwrap()`：任何线程在持锁期间 panic → 锁**永久中毒** →
+此后**所有**命令在加锁处 panic。用户看到的是「重启也没用、功能永久失效」。
+锁内是普通状态快照（不承载跨字段不变式），中毒后仍可用，故改为
+`.unwrap_or_else(|e| e.into_inner())`。原则：**一次 panic 不应让功能不可恢复地失效。**
+
+**⑧ `now_iso()` 为取时间执行外部进程，且 Windows 返回空串**
+
+Unix 上 spawn `date`（无界、且系统可能没有该命令）；**Windows 分支直接返回空串**，
+使 `installedAt` 在 Windows 丢失、跨平台行为不一致。
+现改为纯 std 计算（Howard Hinnant civil-from-days 算法），三平台一致、无副作用。
+
+#### 系统性门禁（本次审计最重要的产出）
+
+逐个修完还不够 —— 缺陷之所以能**分散潜伏**，正是因为缺少系统性检查。
+故新增 8 条架构门禁，其中 B32 是**全量源码扫描**：
+
+| 断言 | 内容 |
+|---|---|
+| **B32** | **任何** Rust 源码都不得出现裸 `.output()` / `.status()`（豁免执行器自身） |
+| B33 | `guard_start` 必须两侧都有超时（Rust tokio + 前端 withTimeout） |
+| B34 | 必须上报 `guard_progress` 且前端监听（静默等待 ≠ 卡死） |
+| B35 | `core_status` 必须 async 且复用版本（阻塞工作不得留在主线程） |
+| B36 | 托盘分支必须走 `spawn_local_post`（不得在 UI 线程做网络 I/O） |
+| B37 | 内核候选定位必须过滤非本地盘 |
+| B38 | 时间戳不得执行外部进程 |
+| B39 | 互斥锁不得用裸 unwrap（中毒恢复） |
+
+#### 验证
+
+- 壳测试 **50 项全通过**（bootstrap_flow 38 + updater_artifacts 6 + 单元 6）；
+- `--env-plan` 50ms 命中；`--service-plan --service-apply` 在干净 HOME 下真实建立 unit；
+- 全量源码扫描确认**零**裸 `.output()`/`.status()` 残留。
+
 ### 修复（架构级）：环境探测被无界系统调用卡死 —— 1.0.3/1.0.4 两次修复都未触及根因
 
 用户真机反馈：1.0.4 **仍然**卡在「检测环境」，诊断信息为

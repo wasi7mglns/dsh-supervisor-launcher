@@ -592,3 +592,154 @@ fn b31_diagnostics_include_probe_trace_and_mirror() {
     );
     eprintln!("B31 PASS diagnostics include trace and mirror");
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// 架构门禁（2026-09-11 全壳审计）：杜绝「无界阻塞 + 被 await」再次散布
+//
+// 背景：环境探测卡死的根因是「无界阻塞调用 + 被命令 await」。
+//   审计发现**同一模式散布在 6 处**（服务管理器命令、guard_start、core_status、
+//   托盘菜单、安装命令、内核候选定位）。逐个修完后必须有**系统性门禁**，
+//   否则新增代码仍会重犯 —— 缺陷之所以能分散潜伏，正是因为缺少这类检查。
+// ═══════════════════════════════════════════════════════════════════
+
+/// 读取 src 下全部 Rust 源码（供全量源码扫描式断言使用）。
+fn all_rust_sources() -> Vec<(String, String)> {
+    let dir = manifest_dir().join("src");
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = p.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
+            if let Ok(s) = fs::read_to_string(&p) {
+                out.push((name, s));
+            }
+        }
+    }
+    out
+}
+
+/// B32：**任何**外部命令都不得用裸 `.output()` / `.status()`（无界阻塞）。
+///
+/// 这是本次审计最重要的系统性防线：外部命令必须经 `bounded::run` 执行。
+/// 否则在服务管理器无响应、网络盘断开、杀软拦截等环境下会无界挂起 ——
+/// 这正是「卡在检测环境」「卡在守卫就绪」的共同根因。
+#[test]
+fn b32_no_bare_blocking_command_calls() {
+    let mut offenders: Vec<String> = Vec::new();
+    for (name, src) in all_rust_sources() {
+        // bounded.rs 是执行器自身实现（它当然要 spawn），豁免。
+        if name == "bounded.rs" {
+            continue;
+        }
+        for (i, line) in src.split('\n').enumerate() {
+            let t = line.trim();
+            if t.starts_with("//") || t.starts_with("*") {
+                continue;
+            }
+            if t.contains(".output()") || t.contains(".status()") {
+                offenders.push(format!("{}:{} {}", name, i + 1, t));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "B32 FAIL 存在无界外部命令调用（应改用 crate::bounded::run）：\n{}",
+        offenders.join("\n")
+    );
+    eprintln!("B32 PASS no bare blocking command calls");
+}
+
+/// B33：`guard_start` 必须两侧都有超时（服务管理器挂起 → 引导页永久停住）。
+#[test]
+fn b33_guard_start_has_timeout() {
+    let m = main_rs();
+    assert!(m.contains("GUARD_TOTAL_BUDGET"), "B33 FAIL guard_start 缺总预算");
+    assert!(
+        m.contains("tokio::time::timeout(GUARD_TOTAL_BUDGET"),
+        "B33 FAIL guard_start 未用 tokio 超时包裹"
+    );
+    let h = bootstrap_html();
+    assert!(h.contains("GUARD_START_BUDGET_MS"), "B33 FAIL 前端缺守卫启动预算");
+    assert!(
+        h.contains("withTimeout(core.invoke('guard_start')"),
+        "B33 FAIL 前端 guard_start 未包超时（裸 invoke）"
+    );
+    eprintln!("B33 PASS guard_start bounded on both sides");
+}
+
+/// B34：壳必须上报守卫启动阶段进度（静默等待与卡死无法区分）。
+#[test]
+fn b34_guard_progress_is_reported() {
+    assert!(main_rs().contains("guard_progress"), "B34 FAIL Rust 侧未上报 guard_progress");
+    let h = bootstrap_html();
+    assert!(h.contains("evt.listen('guard_progress'"), "B34 FAIL 前端未监听 guard_progress");
+    eprintln!("B34 PASS guard progress reported");
+}
+
+/// B35：阻塞工作不得留在主线程（同步命令执行二进制会占住 UI 数十秒）。
+#[test]
+fn b35_blocking_work_not_on_main_thread() {
+    let m = main_rs();
+    assert!(
+        m.contains("async fn core_status"),
+        "B35 FAIL core_status 仍是同步命令（会占主线程执行二进制）"
+    );
+    assert!(
+        m.contains("locate_core_with_version"),
+        "B35 FAIL core_status 未把定位工作放进阻塞线程池 / 未复用版本"
+    );
+    eprintln!("B35 PASS blocking work off main thread");
+}
+
+/// B36：托盘/退出回调不得在 UI 线程做网络 I/O。
+#[test]
+fn b36_tray_io_off_ui_thread() {
+    let m = main_rs();
+    assert!(m.contains("spawn_local_post"), "B36 FAIL 缺 off-thread 派发函数");
+    assert!(
+        m.contains(r#""start" => spawn_local_post("#),
+        "B36 FAIL 托盘 start 仍在 UI 线程调用 post_local"
+    );
+    assert!(
+        !m.contains(r#""start" => post_local("#),
+        "B36 FAIL 托盘 start 仍直接调用 post_local（会冻结界面）"
+    );
+    eprintln!("B36 PASS tray IO off UI thread");
+}
+
+/// B37：内核候选定位必须过滤可能阻塞的非本地盘（与 PATH 探测同一防护）。
+#[test]
+fn b37_core_candidates_filter_network_paths() {
+    assert!(
+        main_rs().contains("env::is_local_fixed_dir(dir)"),
+        "B37 FAIL 内核候选定位未过滤非本地盘（网络盘 is_file 会阻塞）"
+    );
+    eprintln!("B37 PASS core candidates filter network paths");
+}
+
+/// B38：时间戳不得依赖外部进程，且三平台行为一致。
+#[test]
+fn b38_now_iso_is_pure_std() {
+    let n = fs::read_to_string(manifest_dir().join("src").join("node.rs")).expect("node.rs");
+    assert!(!n.contains(r#"Command::new("date")"#), "B38 FAIL now_iso 仍执行外部 date");
+    assert!(n.contains("civil_from_days"), "B38 FAIL 未用纯 std 日期换算");
+    eprintln!("B38 PASS now_iso pure std");
+}
+
+/// B39：互斥锁不得用裸 unwrap（中毒后所有命令永久 panic）。
+#[test]
+fn b39_mutex_poisoning_recovered() {
+    let m = main_rs();
+    assert!(
+        !m.contains(".lock().unwrap()"),
+        "B39 FAIL 仍有裸 .lock().unwrap()（锁中毒后全部命令 panic）"
+    );
+    assert!(
+        m.contains(".lock().unwrap_or_else(|e| e.into_inner())"),
+        "B39 FAIL 未使用中毒恢复式加锁"
+    );
+    eprintln!("B39 PASS mutex poisoning recovered");
+}
