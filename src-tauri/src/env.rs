@@ -18,17 +18,13 @@ pub fn node_exe() -> &'static str {
     if cfg!(windows) { "node.exe" } else { "node" }
 }
 
-/// 候选是否可用：过滤 Windows 上的应用执行别名存根与空文件。
-/// （别名存根不是可执行程序，执行它会挂起或唤起 Store；0 字节文件同理不可用。）
+/// 候选是否可用（平台判定）。
+///
+/// 实现已下沉到 platform 层（2026-09-11）。Windows 必须过滤两类**伪可执行**：
+///   · `\WindowsApps\` 下的应用执行别名存根（执行它会挂起或唤起 Store）；
+///   · 0 字节文件。
 pub fn is_usable_candidate(cand: &Path) -> bool {
-    if !cand.is_file() { return false; }
-    #[cfg(target_os = "windows")]
-    {
-        let low = cand.to_string_lossy().to_ascii_lowercase();
-        if low.contains("\\windowsapps\\") { return false; }
-        if std::fs::metadata(cand).map(|m| m.len() == 0).unwrap_or(true) { return false; }
-    }
-    true
+    crate::platform::current().is_usable_executable(cand)
 }
 
 /// PATH 扫描的总预算：即使 PATH 里存在会阻塞的路径，也不会把调用方拖成分钟级。
@@ -75,52 +71,14 @@ pub fn path_dirs_local_only() -> Vec<PathBuf> {
 ///   原实现**对每个 PATH 条目都调一次** —— PATH 里数十个条目往往集中在同一两个盘符，
 ///   于是同一个盘被反复查询，一旦该盘有问题就重复付出阻塞代价。
 ///   现按「盘符」缓存：最多 26 次查询（且每个盘符只查一次）。
-pub fn is_local_fixed_dir(dir: &Path) -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        let w: Vec<u16> = dir.as_os_str().encode_wide().collect();
-        // UNC（以两个反斜杠开头，ASCII 92）→ 跳过（纯字面判定，不触网）
-        if w.len() >= 2 && w[0] == 92 && w[1] == 92 { return false; }
-        // 无盘符（相对路径等）→ 保守放行
-        if w.len() < 2 || w[1] != 58 { return true; }
-        return drive_is_fixed(w[0]);
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = dir;
-        true
-    }
-}
-
-/// 盘符是否为固定磁盘（结果按盘符缓存，每个盘符最多查询一次）。
-#[cfg(target_os = "windows")]
-fn drive_is_fixed(letter: u16) -> bool {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<u16, bool>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(m) = cache.lock() {
-        if let Some(v) = m.get(&letter) { return *v; }
-    }
-    let mut root = [0u16; 4];
-    root[0] = letter;
-    root[1] = 58;   // 冒号
-    root[2] = 92;   // 反斜杠
-    root[3] = 0;
-    extern "system" {
-        fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
-    }
-    // DRIVE_FIXED = 3；其余（REMOTE=4 / NO_ROOT_DIR=1 / UNKNOWN=0）一律跳过
-    let fixed = unsafe { GetDriveTypeW(root.as_ptr()) } == 3;
-    if let Ok(mut m) = cache.lock() { m.insert(letter, fixed); }
-    fixed
-}
-
-/// 我们自己记录的 Node 路径（runtime.json）—— **最廉价的探测来源**。
+/// 该目录是否位于**本地固定盘**（平台判定）。
 ///
-/// 架构要点：壳安装 Node 后已把落点写入 runtime.json，但此前**从未回读**，
-/// 每次启动仍去猜 PATH。回读它可跳过全部外部进程探测，也避免「装了却找不到」。
+/// 实现已下沉到 platform 层（2026-09-11）。调用方在引导的**关键路径**上，
+/// 而 `Path::is_file()` 在断开的映射盘/UNC 上会触网阻塞数十秒。
+pub fn is_local_fixed_dir(dir: &Path) -> bool {
+    crate::platform::current().is_local_fixed_dir(dir)
+}
+
 pub fn recorded_node_path() -> Option<PathBuf> {
     let p = supervisor_dir().join("runtime.json");
     let s = std::fs::read_to_string(&p).ok()?;
@@ -193,31 +151,21 @@ pub fn probe_system_node() -> Option<(PathBuf, String)> {
 ///   真实路径随**系统盘符**与**系统语言**变化（中文系统是 `Program Files` 的本地化目录名），
 ///   也可能装在 `Program Files (x86)`。故一律经 `ProgramFiles` / `ProgramFiles(x86)`
 ///   环境变量推导 —— 这也是 `nodeprobe::known_locations()` 采用的口径，两处必须一致。
+/// **安装后** Node 可执行文件应出现的位置（平台判定；用于校验安装成功）。
+///
+/// 实现已下沉到 platform 层（2026-09-11）。
+/// ⚠ Windows 不得硬编码 `C:\Program Files`：真实路径随**系统盘符**与
+///   **系统语言**变化（中文系统是本地化目录名），也可能装在 `Program Files (x86)`，
+///   故一律经 `ProgramFiles` / `ProgramFiles(x86)` 环境变量推导。
 pub fn known_install_node_path() -> Option<PathBuf> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        // Linux 与 macOS：官方安装（tar / pkg）都落到 /usr/local/bin。
-        let p = PathBuf::from("/usr/local/bin/node");
-        if p.is_file() { return Some(p); }
-        // macOS Apple Silicon 上的 Homebrew 落点（原生 arm64 安装常见于此）
-        let hb = PathBuf::from("/opt/homebrew/bin/node");
-        if hb.is_file() { return Some(hb); }
-        None
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let exe = "node.exe";
-        for var in ["ProgramFiles", "ProgramFiles(x86)"] {
-            if let Ok(base) = std::env::var(var) {
-                let p = PathBuf::from(base).join("nodejs").join(exe);
-                if p.is_file() { return Some(p); }
-            }
-        }
+    let p = crate::platform::current().node_bin_after_install();
+    if p.is_file() {
+        Some(p)
+    } else {
         None
     }
 }
 
-/// 产品用户数据根（~/.dsh/supervisor）。
 pub fn supervisor_dir() -> PathBuf {
     let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".dsh").join("supervisor")

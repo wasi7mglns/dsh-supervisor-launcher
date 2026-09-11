@@ -347,11 +347,10 @@ pub fn install_version(pkg: &str, version: &str, prefix: Option<&Path>, registry
     cmd.args(["install", "-g", "--no-audit", "--no-fund"]).arg(&spec);
     if let Some(p) = prefix { cmd.arg("--prefix").arg(p); }
     if let Some(r) = registry { if !r.is_empty() { cmd.env("npm_config_registry", r); } }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW：GUI 进程调 npm 不弹控制台
-    }
+    // CREATE_NO_WINDOW：GUI 进程调 npm 不弹控制台。
+    // 经 bounded::prepare（**infra 原语**，与 bounded::run 同一处实现）——
+    // 本文件因此不再需要平台分支（门禁 G1）。
+    crate::bounded::prepare(&mut cmd);
     // ⚠ 必须有界（2026-09-11 修复，与引导页「网络步骤无超时 → 永久卡住」属同一类缺陷）：
     //   原实现用 `cmd.output()` **无限阻塞** —— npm 因网络停滞/registry 无响应而挂起时，
     //   引导页会永久停在「正在安装内核…」，用户除了杀进程别无选择。

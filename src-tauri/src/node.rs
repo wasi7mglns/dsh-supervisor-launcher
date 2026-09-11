@@ -2,7 +2,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 // 镜像候选已收敛到 mirror.rs 的 NODE_PRESETS（壳自持配置，支持用户自定义）。
 
@@ -23,10 +22,10 @@ fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// index.json `files[]` 里的平台标签 —— **必须与 `platform_file()` 选定的产物语义一致**。
+/// index.json `files[]` 里的平台标签 —— **必须与 `platform_artifact()` 选定的产物语义一致**。
 ///
 /// ⚠ macOS 标签语义修正（2026-09-11，实测驱动）：
-///   原实现 arm64 返回 `osx-arm64-tar`、x64 返回 `osx-x64-tar`，而 `platform_file()`
+///   原实现 arm64 返回 `osx-arm64-tar`、x64 返回 `osx-x64-tar`，而 `platform_artifact()`
 ///   返回的是官方 **`.pkg`** —— 判定依据（tar 标签）与下载对象（pkg）**不是一回事**。
 ///   它能工作只是因为两者恰好都存在，属**侥幸而非正确**。
 ///
@@ -38,10 +37,10 @@ fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
 ///
 ///   补充实测证据：解包 `node-v24.21.0.pkg` 可见其 payload 同时含 x86_64 与 arm64
 ///   两个 Mach-O 切片（fat 二进制），即 .pkg 确为**通用包**，两种 Arch 都能原生安装。
-/// 判定标签必须**按架构**给出，且与 `platform_file()` 的产物语义一致。
+/// 判定标签必须**按架构**给出，且与 `platform_artifact()` 的产物语义一致。
 ///
 /// ⚠ Linux 也曾硬编码 `linux-x64`（2026-09-11 审计发现，与 macOS 同类）：
-///   在 arm64 上 `platform_file()` 返回 `node-v{V}-linux-arm64.tar.xz`，
+///   在 arm64 上 `platform_artifact()` 返回 `node-v{V}-linux-arm64.tar.xz`，
 ///   而标签却是 `linux-x64` —— 判定依据与产物不是一回事。
 ///   它能通过 `has` 检查只是因为「恰好 x64 标签也在 files[] 里」，
 ///   属**侥幸而非正确**：若某版本只有 x64 而无 arm64，代码仍会判定可用，
@@ -54,50 +53,14 @@ fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
 ///
 /// ⚠ 已知限制（诚实记录）：Windows arm64 上只能装 x64 msi（依赖系统模拟执行），
 ///   因为官方未提供 arm64 msi。若要原生 arm64，需改用 zip 解包路径 —— 当前未实现。
-fn platform_tag() -> &'static str {
-    #[cfg(target_os = "linux")]
-    {
-        return if std::env::consts::ARCH == "aarch64" { "linux-arm64" } else { "linux-x64" };
-    }
-    #[cfg(target_os = "macos")]
-    { return "osx-x64-pkg"; }
-    #[cfg(target_os = "windows")]
-    { return "win-x64-msi"; }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    { "linux-x64" }
-}
-
-/// 当前平台对应的官方发布文件名（version 不带 v，如 "22.2.0"）。
-fn platform_file(version: &str) -> Option<String> {
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        _ => return None,
-    };
-    #[cfg(target_os = "linux")]
-    { Some(format!("node-v{}-linux-{}.tar.xz", version, arch)) }
-    #[cfg(target_os = "macos")]
-    {
-        // ⚠ macOS 必须用官方 **.pkg**（2026-09-11 修复）：
-        //   原实现下载 `node-v<ver>-darwin-<arch>.tar.gz`（tarball），却交给
-        //   `installer -pkg` 执行 —— 格式不匹配，**必然安装失败**。
-        //   官方提供的是通用 .pkg（`node-v<ver>.pkg`，arm64/x64 通用，见 index.json
-        //   的 files 条目标签 `osx-*-tar` 仅表示 tarball 存在，与本路径无关）。
-        //   选择 .pkg 而非 tarball 的原因：它带**签名与安装位置语义**，
-        //   可用一次系统授权装到 /usr/local，与其它平台行为一致。
-        let _ = arch;
-        Some(format!("node-v{}.pkg", version))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // 官方**没有** win-arm64-msi（files[] 只有 win-arm64-7z / win-arm64-zip）。
-        // 故 arm64 Windows 也取 x64 msi —— 依赖系统的 x64 模拟执行。这是**有意为之的
-        // 折中**（原生 arm64 需改用 zip 解包，当前未实现），并在 platform_tag() 中如实记录。
-        let _ = arch;
-        Some(format!("node-v{}-x64.msi", version))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    { None }
+/// 当前平台的 Node 官方制品（**标签 + 文件名同源**）。
+///
+/// 实现已下沉到 platform 层（2026-09-11）：这是纯「平台 → 官方制品」映射
+/// （tar.xz / pkg / msi），属于**平台知识**而非业务逻辑。
+///
+/// 返回 None 表示本平台无可用制品（调用方据此跳过该版本）。
+fn platform_artifact(version: &str) -> Option<crate::platform::NodeArtifact> {
+    crate::platform::current().node_artifact(version)
 }
 
 /// 从一个 index.json 文本中解析「本平台可用的最高 LTS」。
@@ -111,8 +74,12 @@ fn best_from_index(raw: &str) -> Option<(String, String)> {
         if !is_lts { continue; }
         let ver = item.get("version").and_then(|v| v.as_str()).unwrap_or("");
         if ver.is_empty() || !ver.starts_with('v') { continue; }
-        let file = match platform_file(&ver[1..]) { Some(f) => f, None => continue };
-        let tag = platform_tag();
+        // 标签与文件名**同源**（平台层一次给出）——
+        //   旧实现分别调 platform_file() 与 platform_tag()，两者语义可能不一致
+        //   （macOS 曾出现「判定用 tar 标签、下载用 pkg」的侥幸正确）。
+        let art = match platform_artifact(&ver[1..]) { Some(a) => a, None => continue };
+        let file = art.file;
+        let tag = art.tag;
         let has = item.get("files").and_then(|v| v.as_array())
             .map(|a| a.iter().any(|x| x.as_str().map(|s| s == file || (s == tag)).unwrap_or(false)))
             .unwrap_or(false);
@@ -203,9 +170,6 @@ fn version_gt(a: &str, b: &str) -> bool {
     false
 }
 
-
-
-
 /// 下载 + SHASUMS256 强校验，返回本地文件路径。
 ///
 /// 源顺序（2026-09-11 重写）：**优先使用发现阶段选出的最快源**（`preferred`），
@@ -261,66 +225,17 @@ pub fn download_verified(
     Err(last_err.unwrap_or_else(|| "下载失败".into()))
 }
 
-/// 安装命令的时间上限。
-///
-/// 这类命令会弹出系统授权对话框（pkexec / osascript / UAC），**必须等用户操作**，
-/// 故预算要给足（用户可能需要一两分钟输入密码）。
-/// 但**不能无界**：在无图形会话、策略禁弹窗、对话框被其它窗口遮挡等环境下，
-/// 进程可能永不返回 —— 原实现用 `.status()`/`.output()`，会让安装线程永久悬挂，
-/// 用户永远停在「正在安装运行环境…」。
-const INSTALL_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-
 /// 平台安装：官方产物 + 一次性系统授权弹窗。
+///
+/// 实现已下沉到 platform 层（2026-09-11）：三平台的提权通道与安装器各不相同
+/// （pkexec+tar / osascript+installer / powershell+msiexec），这是平台知识。
+///
+/// ⚠ 这是**壳独有**的能力：装内核之前必须先把运行环境装好（引导顺序 R1），
+///   而提权需要人在场 —— 内核（无头系统服务）永远做不到这件事。
 pub fn install(file: &Path) -> Result<PathBuf, String> {
-    let abs = file.canonicalize().map_err(|e| e.to_string())?;
-    #[cfg(target_os = "linux")]
-    {
-        let cmd = format!("tar -xJf '{}' -C /usr/local --strip-components=1", abs.display());
-        let out = crate::bounded::run(
-            Command::new("pkexec").args(["sh", "-c", &cmd]),
-            INSTALL_CMD_TIMEOUT,
-        )
-        .map_err(|e| format!("无法启动 pkexec（{}）。请确认系统已安装 pkexec（policykit）。", e))?;
-        if !out.success {
-            return Err(format!("pkexec 退出码 {}（用户取消或安装失败）：{}", out.code.unwrap_or_else(|| "killed".into()), out.stderr.trim()));
-        }
-        let node = PathBuf::from("/usr/local/bin/node");
-        if !node.is_file() { return Err("安装完成但 /usr/local/bin/node 未就位".into()); }
-        return Ok(node);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let esc = abs.display().to_string().replace('"', "\"");
-        let script = format!("do shell script \"installer -pkg '{}' -target /\" with administrator privileges", esc);
-        let out = crate::bounded::run(
-            Command::new("osascript").arg("-e").arg(&script),
-            INSTALL_CMD_TIMEOUT,
-        )
-        .map_err(|e| format!("无法启动 osascript: {}", e))?;
-        if !out.success {
-            return Err(format!("macOS 安装失败（用户取消或 installer 报错）: {}", out.stderr.trim()));
-        }
-        return Ok(PathBuf::from("/usr/local/bin/node"));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let esc = abs.display().to_string().replace('\'', "''");
-        let ps = format!("Start-Process -FilePath msiexec -ArgumentList '/i','{}','/qn','/norestart' -Verb RunAs -Wait", esc);
-        let out = crate::bounded::run(
-            Command::new("powershell").args(["-NoProfile", "-Command", &ps]),
-            INSTALL_CMD_TIMEOUT,
-        )
-        .map_err(|e| format!("无法启动 msiexec: {}", e))?;
-        if !out.success {
-            return Err(format!("Windows 安装失败（用户取消或 msiexec 报错）：{}", out.stderr.trim()));
-        }
-        return Ok(PathBuf::from(r"C:\Program Files\nodejs\node.exe"));
-    }
-    #[allow(unreachable_code)]
-    Err("当前平台暂不支持自动安装 Node.js".into())
+    crate::platform::current().install_node(file)
 }
 
-/// 是否需要升级：未安装（None）或已装版本低于最新 LTS。
 pub fn outdated(installed: Option<&str>, latest: &str) -> bool {
     match installed {
         None => true,

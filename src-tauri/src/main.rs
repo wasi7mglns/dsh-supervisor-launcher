@@ -17,8 +17,10 @@ mod mirror;
 // 根因：探测内含无界阻塞系统调用，且被命令 await —— 详见本文件根因说明。
 mod nodeprobe;
 mod node;
-// 守卫服务定义（三平台）+ spawn 兜底：首启时壳是唯一在场组件，服务定义只能由壳建立。
-mod service;
+// ★ 平台适配层（2026-09-11）：**全仓唯一的平台分支所在地**。
+// 它接管了原先分居两处的「服务定义」（service.rs）与「服务启停」（原本文件），
+// 消除「同一概念分居两层」的分层违规 —— 加平台不再需要改两处不同层。
+mod platform;
 // 桌面壳自更新 + 落盘日志 + 身份上报（2026-09-11）
 mod update;
 
@@ -271,7 +273,7 @@ fn core_exe_names() -> &'static [&'static str] {
 /// 收集全部内核候选（去重 + 解析符号链接），供「按版本最高仲裁」使用。
 /// 跨平台路径规范：
 ///   - PATH（env::find_in_path，Windows 走 PATHEXT）
-///   - Windows: %APPDATA%\\npm（npm 全局 bin 目录）
+///   - Windows: %APPDATA%\npm（npm 全局 bin 目录）+ 包内真实脚本
 ///   - macOS:   /opt/homebrew/bin（Apple Silicon）、/usr/local/bin（Intel）
 ///   - Unix:    ~/.npm-global/bin、~/.local/bin（内核 install 写入的软链）
 ///   - 资源目录内嵌兜底（旧版过渡）
@@ -284,7 +286,7 @@ fn locate_core_candidates(resource_dir: Option<PathBuf>) -> Vec<PathBuf> {
     //   is_file() / canonicalize() 底层会触网 —— 在断开的映射盘或 UNC 路径上
     //   可能阻塞数十秒，而本函数在**内核定位的关键路径**上（引导页每一步都要用）。
     //   故先做「本地固定盘」判定（GetDriveTypeW 自身不触网），再访问文件系统。
-    let mut add = |p: PathBuf, out: &mut Vec<PathBuf>| {
+    let add = |p: PathBuf, out: &mut Vec<PathBuf>| {
         if let Some(dir) = p.parent() {
             if !env::is_local_fixed_dir(dir) { return; }
         }
@@ -295,29 +297,13 @@ fn locate_core_candidates(resource_dir: Option<PathBuf>) -> Vec<PathBuf> {
     for name in core_exe_names().iter().copied() {
         if let Some(p) = env::find_in_path(name) { add(p, &mut out); }
     }
-    #[cfg(windows)]
+    // 平台额外候选（Windows 的 %APPDATA%\npm 与包内真实脚本；macOS 的 Homebrew 落点）
+    // —— 已下沉到 platform 层（2026-09-11），本文件不再出现平台分支。
     {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            let npm_root = PathBuf::from(&appdata).join("npm");
-            for name in core_exe_names().iter().copied() {
-                // npm 生成的 .cmd 垫片（在 npm 根目录下）
-                add(npm_root.join(name), &mut out);
-            }
-            // 真实包内脚本（2026-09-11 补充）：
-            //   .cmd 垫片无法被 package_dir_of 解析（父目录不是 bin/），
-            //   且执行它取版本在部分环境下会失败。直接给出包内真实路径优先命中，
-            //   既能正确读 package.json 取版本，也能让 global_prefix_for 正常推导前缀。
-            if let Ok(pkg) = core::package_name() {
-                let real = npm_root.join("node_modules").join(&pkg).join("bin").join("dsh-supervisor");
-                add(real, &mut out);
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        for name in core_exe_names().iter().copied() {
-            add(PathBuf::from("/opt/homebrew/bin").join(name), &mut out);
-            add(PathBuf::from("/usr/local/bin").join(name), &mut out);
+        let names: Vec<&str> = core_exe_names().iter().copied().collect();
+        let pkg = core::package_name().ok();
+        for p in crate::platform::current().core_extra_candidates(&names, pkg.as_deref()) {
+            add(p, &mut out);
         }
     }
     for name in core_exe_names().iter().copied() {
@@ -443,7 +429,7 @@ async fn core_apply(app: tauri::AppHandle, version: Option<String>) -> Result<se
     })
 }
 
-/// 引导页驱动：申请所有者启动守卫（唯一启停权威，见 start_guard_service）。阻塞放线程池。
+/// 引导页驱动：申请所有者启动守卫（唯一启停权威，见 platform::service::start）。阻塞放线程池。
 #[tauri::command]
 async fn guard_start(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     // ⚠ 必须有界（2026-09-11 架构修复）。
@@ -526,90 +512,17 @@ fn win_ctl(app: tauri::AppHandle, action: String) -> Result<(), String> {
     }
 }
 
-/// 请求守卫的「生命周期所有者」启动守卫（契约 ARCHITECTURE-CONTRACT-phase0 §2.3）：
-///   Linux=systemd --user；macOS=launchctl kickstart；Windows=schtasks。
-/// 壳**绝不直接 spawn 守卫进程**——那会产生游离于服务管理器的第二实例（身份漂移，
-/// 且使「停止守卫」无唯一权威）。壳只请求所有者启动。
-/// 服务管理器命令的时间上限。
-///
-/// ⚠ 这些调用原先全部用 `.output()`（**无界**），而它们在引导**关键路径**上：
-///   ensure_guard → start_guard_service → 本函数。systemctl/launchctl/schtasks 在
-///   dbus 异常、服务管理器无响应时会长时间挂起 —— 则 guard_start 永不返回，
-///   引导页永久停在「正在启动守卫…」（与「卡在检测环境」同一根因模式）。
-///   故一律经 bounded::run：超时即 kill，让上层走 spawn 兜底路径。
-const GUARD_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-#[cfg(target_os = "linux")]
-fn start_guard_service() -> Result<(), String> {
-    bounded::run_checked(
-        std::process::Command::new("systemctl").args(["--user", "start", "dsh-supervisor"]),
-        GUARD_CMD_TIMEOUT,
-        "systemctl --user start dsh-supervisor",
-    )
-    .map(|_| ())
-}
-#[cfg(target_os = "macos")]
-fn start_guard_service() -> Result<(), String> {
-    bounded::run_checked(
-        std::process::Command::new("sh")
-            .args(["-c", "launchctl kickstart -k gui/$(id -u)/com.dsh.supervisor"]),
-        GUARD_CMD_TIMEOUT,
-        "launchctl kickstart",
-    )
-    .map(|_| ())
-}
-#[cfg(target_os = "windows")]
-fn start_guard_service() -> Result<(), String> {
-    bounded::run_checked(
-        std::process::Command::new("schtasks").args(["/Run", "/TN", "DSH-Supervisor"]),
-        GUARD_CMD_TIMEOUT,
-        "schtasks /Run",
-    )
-    .map(|_| ())
-}
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn start_guard_service() -> Result<(), String> { Err("当前平台不支持守卫服务管理".into()) }
-
-/// 请求守卫的所有者停止守卫（契约 §4.1 退出时序的最后一步——守卫自身不再停自己）。
-#[cfg(target_os = "linux")]
-fn stop_guard_service() -> Result<(), String> {
-    bounded::run_checked(
-        std::process::Command::new("systemctl").args(["--user", "stop", "dsh-supervisor"]),
-        GUARD_CMD_TIMEOUT,
-        "systemctl --user stop",
-    )
-    .map(|_| ())
-}
-#[cfg(target_os = "macos")]
-fn stop_guard_service() -> Result<(), String> {
-    bounded::run_checked(
-        std::process::Command::new("sh")
-            .args(["-c", "launchctl bootout gui/$(id -u)/com.dsh.supervisor"]),
-        GUARD_CMD_TIMEOUT,
-        "launchctl bootout",
-    )
-    .map(|_| ())
-}
-#[cfg(target_os = "windows")]
-fn stop_guard_service() -> Result<(), String> {
-    // Windows：先停 watchdog 保活任务，再终止守卫进程（否则 watchdog 会立刻重新拉起）。
-    // 全部有界：退出流程也要能在服务管理器无响应时走完，否则用户会觉得「程序关不掉」。
-    bounded::run_lossy(
-        std::process::Command::new("schtasks").args(["/End", "/TN", "DSH-Supervisor-Watchdog"]),
-        GUARD_CMD_TIMEOUT,
-    );
-    bounded::run_lossy(
-        std::process::Command::new("schtasks").args(["/End", "/TN", "DSH-Supervisor"]),
-        GUARD_CMD_TIMEOUT,
-    );
-    bounded::run_lossy(
-        std::process::Command::new("taskkill").args(["/F", "/IM", "dsh-supervisor.exe"]),
-        GUARD_CMD_TIMEOUT,
-    );
-    Ok(())
-}
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn stop_guard_service() -> Result<(), String> { Err("当前平台不支持守卫服务管理".into()) }
+// ── 守卫服务的「启停」已迁入 platform 层（2026-09-11）──
+//
+// 此处原定义 start_guard_service / stop_guard_service（含 8 份 #[cfg]），
+// 与 service.rs 的「服务定义」（另 4 份 #[cfg]）分居两层 —— 同一概念的 per-OS
+// 知识被切开，加一个平台要改两处**不同层**，且很容易只改一处。
+//
+// 现统一在 platform::service::ServiceControl：**定义与启停永远是同一个对象**。
+//
+// · 原 GUARD_CMD_TIMEOUT=20s 的有界性 → platform::SVC_NORMAL
+// · 原「壳绝不直接 spawn 守卫」的政策 → platform::service::spawn_daemon 的文档
+//   （该约束不凌驾于可用性：容器/无 user session/策略拦截等场景需 spawn 兜底）
 
 /// 退出管家（契约 §4.1 冻结时序）：请求内核停全部被管对象（同步等待回执）→ 由所有者停止守卫。
 /// 内核在回执前**不会**停止自己（阶段 1 已移除内核自停）。
@@ -626,7 +539,7 @@ fn shutdown_all(port: u16) {
             _ => std::thread::sleep(std::time::Duration::from_millis(250)),
         }
     }
-    if let Err(e) = stop_guard_service() {
+    if let Err(e) = platform::service().stop() {
         eprintln!("[shell] 停止守卫失败: {}（可手动 systemctl --user stop dsh-supervisor）", e);
     }
 }
@@ -653,14 +566,14 @@ fn ensure_guard(app: &tauri::AppHandle) -> Result<(), String> {
     //    旧实现直接跳到 start，而首启时服务定义根本不存在 -> 必然失败 -> 卡在「守卫就绪」。
     //    这一步是幂等的：已存在则直接返回。
     step("正在建立守卫服务定义…");
-    match service::ensure_defined(&guard) {
+    match platform::service().ensure_defined(&guard) {
         Ok(desc) => update::log(&format!("守卫服务定义: {}", desc)),
         Err(e) => update::log(&format!("守卫服务定义失败（稍后走 spawn 兜底）: {}", e)),
     }
 
     // ② 请求服务管理器启动（正常路径：由 systemd/launchd/schtasks 托管，具备开机自启与崩溃自拉）
     step("正在请求服务管理器启动守卫…");
-    let started = start_guard_service();
+    let started = platform::service().start();
     if let Err(e) = &started {
         update::log(&format!("服务管理器启动失败: {}", e));
     }
@@ -671,7 +584,7 @@ fn ensure_guard(app: &tauri::AppHandle) -> Result<(), String> {
     //    服务管理器不可用的场景真实存在（容器/无 user session/策略拦截），
     //    此时若不给兜底，用户将被永久挡在门外。
     step("服务管理器未能在 30s 内拉起守卫 · 改用直接启动兜底…");
-    match service::spawn_daemon(&guard) {
+    match platform::service().spawn_daemon(&guard) {
         Ok(pid) => update::log(&format!("兜底 spawn 守卫 pid={}", pid)),
         Err(e) => {
             return Err(format!(
@@ -1248,8 +1161,8 @@ fn cli_service_plan() -> i32 {
     use std::path::PathBuf;
     println!("== 守卫服务定义自检 ==");
     println!("平台          = {}", std::env::consts::OS);
-    println!("服务定义路径  = {}", service::definition_path().display());
-    println!("现存          = {}", if service::definition_path().is_file() { "是" } else { "否" });
+    println!("服务定义路径  = {}", platform::service().definition_path().display());
+    println!("现存          = {}", if platform::service().definition_path().is_file() { "是" } else { "否" });
     println!("HOME          = {}", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| "(未设置)".into()));
 
     // 守卫可执行文件定位（与实际 ensure_guard 同一路径推导，避免「自检通过但运行时找不到」）。
@@ -1277,11 +1190,11 @@ fn cli_service_plan() -> i32 {
         eprintln!("无法建立：未定位到守卫可执行文件（先安装内核）");
         return 2;
     };
-    match service::ensure_defined(&g) {
+    match platform::service().ensure_defined(&g) {
         Ok(desc) => {
             println!("");
             println!("建立结果      = {}", desc);
-            println!("建立后现存    = {}", if service::definition_path().is_file() { "是" } else { "否" });
+            println!("建立后现存    = {}", if platform::service().definition_path().is_file() { "是" } else { "否" });
             0
         }
         Err(e) => {
@@ -1325,6 +1238,15 @@ fn main() {
     // 无头冒烟入口：--node-plan 仅打印环境探针 + 官方最新 LTS，不启动窗口。
     if std::env::args().any(|a| a == "--node-plan") {
         std::process::exit(cli_plan());
+    }
+    // 无头自检：**平台矩阵**（2026-09-11，门禁 A4/G4）。
+    //
+    // 目的：把「平台矩阵」从**文档承诺**变成**可执行断言** ——
+    //   文档说支持某能力但代码没实现，这一输出会在三平台 CI 上暴露。
+    //   同时它是「平台适配层真的被接上」的活体证据（否则全是 dead_code 警告）。
+    if std::env::args().any(|a| a == "--platform-matrix") {
+        println!("{}", platform::matrix_text());
+        std::process::exit(0);
     }
     // 无头自检：内核版本治理（包名/镜像/最新版本）——发布后冒烟验证，无需 GUI。
     if std::env::args().any(|a| a == "--core-plan") {

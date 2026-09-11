@@ -473,98 +473,23 @@ fn path_dirs_staged() -> Vec<PathBuf> {
     v
 }
 
-/// 已知安装落点。全部通过 PathBuf::push 拼接（不写字面量反斜杠）。
-fn known_locations() -> Vec<(String, PathBuf)> {
-    let mut v: Vec<(String, PathBuf)> = Vec::new();
-
-    #[cfg(target_os = "windows")]
-    {
-        let exe = "node.exe";
-        if let Ok(pf) = std::env::var("ProgramFiles") {
-            v.push(("已知".to_string(), PathBuf::from(&pf).join("nodejs").join(exe)));
-        }
-        if let Ok(pf) = std::env::var("ProgramFiles(x86)") {
-            v.push(("已知".to_string(), PathBuf::from(&pf).join("nodejs").join(exe)));
-        }
-        if let Ok(pd) = std::env::var("ProgramData") {
-            v.push(("已知".to_string(), PathBuf::from(&pd).join("chocolatey").join("bin").join(exe)));
-        }
-        if let Ok(la) = std::env::var("LOCALAPPDATA") {
-            v.push(("已知".to_string(), PathBuf::from(&la).join("Programs").join("nodejs").join(exe)));
-            v.push(("已知".to_string(), PathBuf::from(&la).join("Volta").join("bin").join(exe)));
-            if let Some(p) = latest_versioned_node(PathBuf::from(&la).join("nvm")) {
-                v.push(("已知".to_string(), p));
-            }
-        }
-        if let Ok(ap) = std::env::var("APPDATA") {
-            if let Some(p) = latest_versioned_node(PathBuf::from(&ap).join("nvm")) {
-                v.push(("已知".to_string(), p));
-            }
-        }
-        if let Ok(nh) = std::env::var("NVM_HOME") {
-            if let Some(p) = latest_versioned_node(PathBuf::from(&nh)) {
-                v.push(("已知".to_string(), p));
-            }
-            v.push(("已知".to_string(), PathBuf::from(&nh).join(exe)));
-        }
-        if let Ok(link) = std::env::var("NVM_SYMLINK") {
-            v.push(("已知".to_string(), PathBuf::from(&link).join(exe)));
-        }
-        if let Ok(up) = std::env::var("USERPROFILE") {
-            v.push((
-                "已知".to_string(),
-                PathBuf::from(&up).join("scoop").join("apps").join("nodejs").join("current").join(exe),
-            ));
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        for p in ["/usr/local/bin/node", "/opt/homebrew/bin/node", "/usr/bin/node", "/bin/node"] {
-            v.push(("已知".to_string(), PathBuf::from(p)));
-        }
-        if let Ok(home) = std::env::var("HOME") {
-            let h = PathBuf::from(&home);
-            v.push(("已知".to_string(), h.join(".volta").join("bin").join("node")));
-            if let Some(p) = latest_versioned_node(h.join(".nvm").join("versions").join("node")) {
-                v.push(("已知".to_string(), p.join("bin").join("node")));
-            }
-            if let Some(p) = latest_versioned_node(h.join(".local").join("share").join("fnm").join("node-versions")) {
-                v.push(("已知".to_string(), p.join("installation").join("bin").join("node")));
-            }
-        }
-    }
-
-    v
-}
-
-/// 在版本目录（形如 v22.12.0）中挑**版本最高**的一个，返回其中 node 可执行文件的路径。
+/// 已知安装落点（**平台判定**）。
 ///
-/// ⚠ 本函数含 read_dir（可能落在漫游配置/慢速盘上），调用方必须先 stage。
-fn latest_versioned_node(root: PathBuf) -> Option<PathBuf> {
-    let rd = std::fs::read_dir(&root).ok()?;
-    let mut best: Option<(Vec<u64>, PathBuf)> = None;
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        let trimmed = name.trim_start_matches('v');
-        let nums: Vec<u64> = trimmed.split('.').map_while(|x| x.parse::<u64>().ok()).collect();
-        if nums.is_empty() {
-            continue;
-        }
-        let full = if cfg!(target_os = "windows") {
-            e.path().join(crate::env::node_exe())
-        } else {
-            e.path().join("bin").join(crate::env::node_exe())
-        };
-        let better = match &best {
-            None => true,
-            Some((bv, _)) => nums > *bv,
-        };
-        if better {
-            best = Some((nums, full));
-        }
-    }
-    best.map(|(_, p)| p)
+/// 实现已下沉到 platform 层（2026-09-11）：
+///   · Unix —— /usr/local、/opt/homebrew、/usr/bin + volta/nvm/fnm 布局
+///   · Windows —— ProgramFiles(x86)、Chocolatey、scoop、volta、nvm 三种布局
+///
+/// ⚠ Windows 不得硬编码 `C:\Program Files`：真实路径随**系统盘符**与
+///   **系统语言**变化（中文系统是本地化目录名），故一律经环境变量推导。
+///
+/// ⚠ 本函数会做 `read_dir`（版本管理器布局需要枚举版本目录），可能落在
+///   漫游配置/慢速盘上 —— 调用方必须先 `stage()` 上报。
+fn known_locations() -> Vec<(String, PathBuf)> {
+    crate::platform::current()
+        .node_candidate_paths()
+        .into_iter()
+        .map(|p| ("已知".to_string(), p))
+        .collect()
 }
 
 #[cfg(test)]

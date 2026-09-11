@@ -70,19 +70,17 @@ pub fn install_kind() -> String {
     .to_string()
 }
 
-/// 是否存在可用的提权通道（Linux deb/rpm 的 pkexec 更新需要）。
-/// **不主动执行提权**，只探测命令存在性，用于「不可自更新」的提前判定。
-#[cfg(target_os = "linux")]
+/// 是否存在可用的**提权通道**（用于「不可自更新」的提前判定）。
+///
+/// 实现已下沉到 platform 层（2026-09-11）：
+///   · Linux   —— 探测 `pkexec` / `sudo` 是否在 PATH（deb/rpm 更新需要）
+///   · macOS   —— osascript 管理员授权**恒可用**
+///   · Windows —— UAC（msiexec -Verb RunAs）**恒可用**
+///
+/// ⚠ **不主动执行提权**，只探测命令存在性。
 fn has_privilege_channel() -> bool {
-    ["pkexec", "sudo"].iter().any(|c| {
-        std::env::var("PATH")
-            .ok()
-            .map(|path| std::env::split_paths(&path).any(|d| d.join(c).is_file()))
-            .unwrap_or(false)
-    })
+    crate::platform::current().has_privilege_channel()
 }
-#[cfg(not(target_os = "linux"))]
-fn has_privilege_channel() -> bool { true }
 
 /// 能否自更新：形态受支持 且 有提权通道（Linux）。
 pub fn self_update_capable() -> bool {

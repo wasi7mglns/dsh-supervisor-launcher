@@ -300,25 +300,44 @@ fn b12_no_stale_desktop_update_wording() {
 /// 首启时壳是唯一在场组件；若壳只 start 不 create，全新机器上守卫永远起不来。
 #[test]
 fn b13_shell_owns_service_definition() {
-    let svc = fs::read_to_string(manifest_dir().join("src").join("service.rs"))
-        .expect("B13 FAIL 缺少 src/service.rs（服务定义模块）");
+    // ⚠ 2026-09-11：服务定义已从 `src/service.rs` 迁入 **platform 适配层**
+    //   （每个平台一个文件；`platform/service.rs` 是 trait 契约）。
+    //   断言随产权迁移 —— 否则测试会盯着一个已不存在的文件而**误报通过/失败**。
+    let dir = manifest_dir().join("src").join("platform");
+    assert!(dir.is_dir(), "B13 FAIL 缺少 src/platform/（平台适配层）");
+    let mut all = String::new();
+    for e in fs::read_dir(&dir).expect("B13 platform 目录").flatten() {
+        if e.path().extension().and_then(|x| x.to_str()) == Some("rs") {
+            all.push_str(&fs::read_to_string(e.path()).unwrap_or_default());
+        }
+    }
+    // ⚠ 断言须是**语义等价**而非字面量：macOS 的 plist 路径由常量拼接
+    //   （`format!("{}.plist", GUARD_LABEL)`），字面量 "com.dsh.supervisor.plist"
+    //   在源码里**并不存在**。照旧断言字面量会把正确的实现判为缺失。
     for needle in [
         "dsh-supervisor.service",            // Linux systemd unit
-        "com.dsh.supervisor.plist",          // macOS LaunchAgent
+        "com.dsh.supervisor",                // macOS LaunchAgent 标签
+        ".plist",                            // macOS plist 扩展
         "DSH-Supervisor",                    // Windows 计划任务
-        "pub fn ensure_defined",             // 建立入口
-        "pub fn spawn_daemon",               // spawn 兜底
+        "fn ensure_defined",                 // 建立入口（trait 方法）
+        "fn spawn_daemon",                   // spawn 兜底（trait 方法）
     ] {
-        assert!(svc.contains(needle), "B13 FAIL service.rs 缺少关键项: {}", needle);
+        assert!(all.contains(needle), "B13 FAIL platform 层缺少关键项: {}", needle);
     }
     // 模板必须**内嵌**（外部文件在 npm 包内不存在，正是旧实现静默跳过的根因）
-    assert!(svc.contains("WantedBy=default.target"), "B13 FAIL systemd 模板未内嵌");
-    assert!(svc.contains("RunAtLoad"), "B13 FAIL LaunchAgent plist 未内嵌");
+    assert!(all.contains("WantedBy=default.target"), "B13 FAIL systemd 模板未内嵌");
+    assert!(all.contains("RunAtLoad"), "B13 FAIL LaunchAgent plist 未内嵌");
 
     let m = main_rs();
-    assert!(m.contains("mod service;"), "B13 FAIL main.rs 未引入 service 模块");
-    assert!(m.contains("service::ensure_defined"), "B13 FAIL ensure_guard 未建立服务定义");
-    assert!(m.contains("service::spawn_daemon"), "B13 FAIL 缺少 spawn 兜底调用");
+    assert!(m.contains("mod platform;"), "B13 FAIL main.rs 未引入 platform 模块");
+    assert!(
+        m.contains("platform::service().ensure_defined"),
+        "B13 FAIL ensure_guard 未建立服务定义"
+    );
+    assert!(
+        m.contains("platform::service().spawn_daemon"),
+        "B13 FAIL 缺少 spawn 兜底调用"
+    );
     eprintln!("B13 PASS shell owns 3-platform service definition + spawn fallback");
 }
 
@@ -326,7 +345,9 @@ fn b13_shell_owns_service_definition() {
 /// 旧实现下载 .tar.gz 却交给 `installer -pkg` —— 格式不匹配，必然失败。
 #[test]
 fn b14_macos_node_installer_format_matches() {
-    let n = fs::read_to_string(manifest_dir().join("src").join("node.rs")).expect("read node.rs");
+    // 2026-09-11：macOS 安装逻辑已下沉到 platform/macos.rs（门禁 G1）——
+    //   断言随产权迁移，否则测试盯着一个已不含该逻辑的文件而误报。
+    let n = platform_sources();
     assert!(n.contains("node-v{}.pkg"), "B14 FAIL macOS 未改用官方 .pkg（安装命令要求 .pkg）");
     assert!(
         !n.contains("node-v{}-darwin-{}.tar.gz"),
@@ -617,21 +638,51 @@ fn b31_diagnostics_include_probe_trace_and_mirror() {
 // ═══════════════════════════════════════════════════════════════════
 
 /// 读取 src 下全部 Rust 源码（供全量源码扫描式断言使用）。
-fn all_rust_sources() -> Vec<(String, String)> {
-    let dir = manifest_dir().join("src");
-    let mut out = Vec::new();
+/// 平台适配层的全部源码拼接（供「逻辑已下沉」的断言使用）。
+///
+/// 2026-09-11：43 处平台分支收拢到 src/platform/ 后，
+/// 原先针对 node.rs / service.rs 的断言必须改为针对平台层 ——
+/// 否则测试会盯着不再含该逻辑的文件，产生假绿或假红。
+fn platform_sources() -> String {
+    let dir = manifest_dir().join("src").join("platform");
+    let mut out = String::new();
     if let Ok(rd) = fs::read_dir(&dir) {
         for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("rs") {
-                continue;
-            }
-            let name = p.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
-            if let Ok(s) = fs::read_to_string(&p) {
-                out.push((name, s));
+            if e.path().extension().and_then(|x| x.to_str()) == Some("rs") {
+                out.push_str(&fs::read_to_string(e.path()).unwrap_or_default());
             }
         }
     }
+    out
+}
+
+fn all_rust_sources() -> Vec<(String, String)> {
+    // ⚠ **必须递归**（2026-09-11 修复门禁盲区）：
+    //   原实现只读顶层 `src/`，而 `platform/` 是**子目录** ——
+    //   于是 B32「禁止无界外部命令」等按本函数遍历的门禁
+    //   对新建的平台适配层**完全不可见**（门禁看起来在跑，实际有盲区）。
+    //   路径以 `platform/xxx.rs` 形式给出（保留层级信息，便于报错定位）。
+    let dir = manifest_dir().join("src");
+    let mut out = Vec::new();
+    fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, String)>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if p.is_dir() {
+                // 只下潜一层就够了（当前结构：src/platform/）；仍用递归以便将来扩展。
+                walk(&p, &format!("{}{}/", prefix, name), out);
+                continue;
+            }
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            if let Ok(s) = fs::read_to_string(&p) {
+                out.push((format!("{}{}", prefix, name), s));
+            }
+        }
+    }
+    walk(&dir, "", &mut out);
     out
 }
 
@@ -860,12 +911,13 @@ fn b41_polling_loops_have_independent_heartbeat() {
 /// 而 `osx-arm64-pkg` 从不存在；通用 pkg 的标签就是 `osx-x64-pkg`。
 #[test]
 fn b42_macos_tag_matches_pkg_artifact() {
-    let n = fs::read_to_string(manifest_dir().join("src").join("node.rs")).expect("node.rs");
-    // 选了 .pkg 就必须用 pkg 的标签
+    // 2026-09-11：制品映射已下沉到 platform/macos.rs；标签与文件名现在同源
+    //   （同一个 NodeArtifact 结构一次给出），不再有判定用 tar、下载用 pkg 的错位。
+    let n = platform_sources();
     assert!(n.contains("node-v{}.pkg"), "B42 FAIL macOS 未选 .pkg");
     assert!(n.contains("osx-x64-pkg"), "B42 FAIL macOS 标签未与 .pkg 对齐");
     assert!(
-        !n.contains("return if std::env::consts::ARCH == \"aarch64\" { \"osx-arm64-tar\" }"),
+        !n.contains("osx-arm64-tar"),
         "B42 FAIL macOS 仍在用 tar 标签判定 pkg 产物"
     );
     eprintln!("B42 PASS macOS tag matches artifact");
@@ -877,7 +929,9 @@ fn b42_macos_tag_matches_pkg_artifact() {
 /// 旧写法 `.args(["/C", path, "daemon"])` 会让 cmd 拆错 → 守卫启动失败且错误难解读。
 #[test]
 fn b43_windows_cmd_quoting_handles_spaces() {
-    let s = fs::read_to_string(manifest_dir().join("src").join("service.rs")).expect("service.rs");
+    // 迁至平台层（2026-09-11）：Windows 的全部平台知识在 platform/windows.rs。
+    let s = fs::read_to_string(manifest_dir().join("src").join("platform").join("windows.rs"))
+        .expect("platform/windows.rs");
     assert!(s.contains("raw_arg(line)"), "B43 FAIL Windows 未用 raw_arg 精确控制引号");
     assert!(
         !s.contains(".args([\"/C\", &guard.display().to_string(), \"daemon\"])"),
@@ -1155,4 +1209,125 @@ fn b55_missing_ipc_must_fail_loudly() {
         "B55 FAIL boot() 缺 IPC 缺失时的明确错误信息"
     );
     eprintln!("B55 PASS missing IPC fails loudly");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// G1：平台分支只允许出现在 `platform/` 内（2026-09-11）
+//
+// == 背景（用户指正：「壳是乱的，没有架构」）==
+//
+// 改造前实测：平台分支 **43 处散落在 8 个文件**
+//   node.rs 11 / main.rs 10 / service.rs 9 / env.rs 6 / bounded.rs 2 /
+//   nodeprobe.rs 2 / update.rs 2 / core.rs 1
+//
+// 后果：
+//   · 加一个平台要翻 8 个文件（且容易漏掉某处）；
+//   · 查一个平台 bug 要先猜它在哪一层；
+//   · per-OS 知识互相耦合（main.rs 里同时有服务启停的 4 份 #[cfg]）。
+//
+// 对照：内核（JS）同口径 67 处平台判断，其中 **60 处在 platform/os/（90%）** ——
+// 即内核有这个层、而壳没有。本门禁保证壳保持这个形态。
+//
+// == 断言 ==
+//   G1-a 平台分支只出现在 platform/ 内（白名单：已声明并说明理由的例外）
+//   G1-b platform/ 必须存在，且每个平台一个文件
+//   G1-c `main.rs` 不得再定义平台相关的服务控制函数
+//
+// == 白名单政策 ==
+//
+// 例外必须**在下方显式登记并给出理由**，不允许悄悄加 `#[allow]` 绕过。
+// 目前唯一例外是 `bounded.rs`（infra 层）：它的 `CREATE_NO_WINDOW` 是
+// 「进程创建」这一**原语**的平台差异，属于 infra 而非业务平台知识 ——
+// 且平台层自身依赖它，若下沉会形成循环依赖。
+// ═══════════════════════════════════════════════════════════════════════════
+#[test]
+fn g1_platform_branches_only_in_platform_layer() {
+    // 例外：文件相对路径 → 理由
+    let allowed: &[(&str, &str)] = &[(
+        "bounded.rs",
+        "infra 原语：CREATE_NO_WINDOW 是进程创建的平台差异；平台层依赖它，下沉会循环",
+    )];
+
+    let mut offenders: Vec<String> = Vec::new();
+    for (name, src) in all_rust_sources() {
+        // platform/ 目录内是**合法**的平台分支所在地
+        if name.starts_with("platform/") {
+            continue;
+        }
+        if allowed.iter().any(|(f, _)| *f == name) {
+            continue;
+        }
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim();
+            // 只看**属性位置**的 cfg（注释里提到 cfg 不算）
+            if !t.starts_with("#[cfg(") {
+                continue;
+            }
+            if t.contains("cfg(test)") {
+                continue; // 测试门控不是平台分支
+            }
+            if t.contains("target_os") || t.contains("windows") || t.contains("unix") {
+                offenders.push(format!("{}:{} {}", name, i + 1, t));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "G1 FAIL 平台分支出现在 platform/ 之外（应迁入 platform/）：\n{}",
+        offenders.join("\n")
+    );
+
+    // G1-b：platform 层必须存在且结构完整
+    let pdir = manifest_dir().join("src").join("platform");
+    assert!(pdir.is_dir(), "G1 FAIL 缺少 src/platform/");
+    for f in [
+        "mod.rs",
+        "service.rs",
+        "linux.rs",
+        "macos.rs",
+        "windows.rs",
+        "unsupported.rs",
+    ] {
+        assert!(
+            pdir.join(f).is_file(),
+            "G1 FAIL platform/ 缺少 {}（每平台一文件：加平台=加文件，不改既有代码）",
+            f
+        );
+    }
+
+    // G1-c：main.rs 不得再定义跨平台的服务控制函数（原分层违规）
+    let m = main_rs();
+    for f in ["fn start_guard_service", "fn stop_guard_service"] {
+        assert!(
+            !m.contains(f),
+            "G1 FAIL main.rs 仍定义 {}（应与服务定义同属 platform::ServiceControl）",
+            f
+        );
+    }
+    eprintln!("G1 PASS platform branches confined to platform/");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// G1': `all_rust_sources` 必须**递归**（否则门禁对 platform/ 有盲区）
+//
+// 这是修门禁时发现的真实缺陷：原实现只读顶层 `src/`，
+// 于是 B32 / G1 等按它遍历的门禁**看不到子目录** ——
+// 门禁看起来在跑，实际有盲区。
+// ═══════════════════════════════════════════════════════════════════════════
+#[test]
+fn g1_all_rust_sources_is_recursive() {
+    let srcs = all_rust_sources();
+    assert!(
+        srcs.iter().any(|(n, _)| n.starts_with("platform/")),
+        "G1' FAIL all_rust_sources 未递归到 platform/（门禁盲区！）"
+    );
+    assert!(
+        srcs.iter().any(|(n, _)| n == "platform/linux.rs"),
+        "G1' FAIL 未枚举到 platform/linux.rs"
+    );
+    assert!(
+        srcs.iter().any(|(n, _)| n == "main.rs"),
+        "G1' FAIL 未枚举到顶层 main.rs"
+    );
+    eprintln!("G1' PASS all_rust_sources recursive ({} files)", srcs.len());
 }
