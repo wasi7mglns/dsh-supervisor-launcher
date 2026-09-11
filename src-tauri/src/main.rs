@@ -11,6 +11,9 @@ mod core;
 mod env;
 // 镜像源适配（壳自持）：装机时无内核，三处下载都必须自带镜像能力。
 mod mirror;
+// 有界 Node 探测（架构层修复）：分离线程 + 有界等待 + 缓存 + 追踪。
+// 根因：探测内含无界阻塞系统调用，且被命令 await —— 详见本文件根因说明。
+mod nodeprobe;
 mod node;
 // 守卫服务定义（三平台）+ spawn 兜底：首启时壳是唯一在场组件，服务定义只能由壳建立。
 mod service;
@@ -52,51 +55,78 @@ fn log(state: &RunState) -> serde_json::Value {
     })
 }
 
+/// 环境状态查询（**纯本地、有界、可轮询**）。
+///
+/// == 架构修复（2026-09-11 二次，根因见 nodeprobe.rs） ==
+///
+/// 1) **必须快速返回**，无论探测内部是否卡在阻塞型系统调用。旧实现直接
+///    await 阻塞任务 —— 探测一挂，本命令就永不返回，前端 45 秒超时后只能报
+///    node=unknown，且 Rust 侧那条线程永久悬挂（每次重试再添一条）。
+///    现改为：探测在分离线程中进行，本命令只在极短预算内等待；未完成即返回
+///    probing=true，由引导页轮询。**命令的返回时间与任何系统调用无关。**
+///
+/// 2) **不含任何网络 I/O**。旧实现会顺带触网查最新 LTS，使「本地环境判定」
+///    被网络质量左右 —— 而这两件事在因果上毫无关系。网络侧信息改由 node_latest
+///    单独提供（也便于把镜像选择显式呈现给用户）。
 #[tauri::command]
 async fn node_status(app: tauri::AppHandle) -> serde_json::Value {
-    // ⚠ 必须是 async（2026-09-11 修复）：同步命令由 Tauri 在**主线程**执行，
-    //   而本函数要跑一次「真实探针」（执行 node --version）。Windows 上探测可能很慢，
-    //   同步执行会把主线程/UI 一起拖住。改为 async 并把阻塞部分丢给阻塞线程池。
-    //   （探针本身在 env 层已有 8 秒硬上限，两层保证引导页不会永久卡住。）
-    // 每次查询都做一次真实探针（PATH 变化会即时反映）
-    let sys = tauri::async_runtime::spawn_blocking(env::probe_system_node)
-        .await
-        .ok()
-        .flatten();
+    // 首次调用会启动探测线程；此后每次调用都复用在飞结果（不会堆积线程）。
+    let budget = std::time::Duration::from_millis(900);
+    let out = match tauri::async_runtime::spawn_blocking(move || nodeprobe::status(budget)).await {
+        Ok(o) => o,
+        Err(_) => nodeprobe::partial(),
+    };
 
-    // 先取快照并释放锁，再决定是否补拉最新版（避免把锁带进线程）
-    let (mut o, need_latest) = {
+    let mut o = {
         let state = app.state::<Mutex<RunState>>();
         let st = state.lock().unwrap();
-        let installed = st.installed.clone().or_else(|| sys.as_ref().map(|x| x.1.clone()));
+        let installed = out.version.clone().or_else(|| st.installed.clone());
         let mut o = log(&st);
         o["installed"] = serde_json::json!(installed);
-        // DSH 最低门槛判定（>=22.12）：引导页据此决定是否需装 Node，outdated 仅展示不再阻塞
+        // DSH 最低门槛判定（>=22.12）：引导页据此决定是否需装 Node
         o["minOk"] = serde_json::json!(node::meets_minimum(installed.as_deref()));
-        // 一并回传最低要求，供前端在提示里显示（避免前端硬编码版本号而漂移）
         o["minRequired"] = serde_json::json!(node::MIN_NODE);
         if let Some(latest) = &st.latest {
             o["outdated"] = serde_json::json!(node::outdated(installed.as_deref(), latest));
         }
-        let need = st.latest.is_none() && !st.busy;
-        (o, need)
+        o
     };
-
-    // 后台未拉过最新版时，启动线程补一次
-    if need_latest {
-        let handle = app.clone();
-        std::thread::spawn(move || {
-            if let Ok(c) = node::latest_lts() {
-                let v = c.version.clone();
-                let state = handle.state::<Mutex<RunState>>();
-                let mut s = state.lock().unwrap();
-                s.latest = Some(v.clone());
-                let _ = handle.emit("env_status", serde_json::json!({ "latest": v }));
-            }
-        });
-    }
-    let _ = &mut o;
+    o["probing"] = serde_json::json!(!out.finished);
+    o["nodePath"] = serde_json::json!(out.path.as_ref().map(|p| p.display().to_string()));
+    o["elapsedMs"] = serde_json::json!(out.elapsed_ms);
+    o["candidates"] = serde_json::json!(nodeprobe::candidate_summary());
+    // 「当前卡在哪个候选多久」——环境特有问题无法靠读代码确定，必须靠这份追踪。
+    o["stuck"] = match nodeprobe::current_stuck() {
+        Some((d, ms)) => serde_json::json!({ "on": d, "ms": ms }),
+        None => serde_json::Value::Null,
+    };
+    o["trace"] = serde_json::json!(out
+        .trace
+        .iter()
+        .map(|t| serde_json::json!({
+            "source": t.source, "path": t.path, "ms": t.ms, "ok": t.ok, "note": t.note
+        }))
+        .collect::<Vec<_>>());
     o
+}
+
+/// 网络侧元数据：最新 LTS + **镜像选择结果**（与本地环境检测彻底分离）。
+#[tauri::command]
+async fn node_latest() -> serde_json::Value {
+    match tauri::async_runtime::spawn_blocking(node::latest_lts).await {
+        Ok(Ok(c)) => serde_json::json!({
+            "ok": true,
+            "version": c.version,
+            "file": c.file,
+            "mirror": c.source,
+            "latencyMs": c.latency_ms,
+            "probes": c.probes.iter().map(|(s, ok, ms)| serde_json::json!({
+                "source": s, "ok": ok, "latencyMs": ms
+            })).collect::<Vec<_>>(),
+        }),
+        Ok(Err(e)) => serde_json::json!({ "ok": false, "error": e }),
+        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+    }
 }
 
 
@@ -130,6 +160,9 @@ fn start_node_install(state: tauri::State<Mutex<RunState>>, app: tauri::AppHandl
                 s.status = format!("Node.js {} 就绪，正在启动守卫…", version);
                 s.logs.push(format!("安装完成: {} @ {}", version, node_path));
                 node::record_runtime_meta(&node_path, &version);
+                // 探测缓存必须失效：新装的 Node 只有重新探测才会被发现
+                // （否则引导页会在「已装好」之后仍报未检测到）。
+                nodeprobe::invalidate();
                 let _ = handle.emit("env_done", serde_json::json!({ "version": version }));
             }
             Err(e) => {
@@ -536,12 +569,43 @@ fn is_alive(port: u16) -> bool {
     false
 }
 
+/// 无头自检：**环境探测**（架构修复后的可诊断入口）。
+///
+/// 为什么需要：探测根因是「环境特有」的（某个候选上有阻塞型系统调用），
+/// 靠读代码无法确定。本入口在有界预算内跑完探测并打印**逐候选追踪**，
+/// 卡住时也能看到「卡在谁、多久」—— 这是定位该类问题唯一可靠的手段。
+/// 用法：dsh-supervisor-gui --env-plan
+fn cli_env_plan() -> i32 {
+    println!("== 环境探测自检 ==");
+    println!("平台          = {}", std::env::consts::OS);
+    println!("{}", nodeprobe::candidate_summary());
+    let out = nodeprobe::status(std::time::Duration::from_secs(60));
+    println!("完成          = {}", out.finished);
+    println!("耗时          = {} ms", out.elapsed_ms);
+    match (&out.path, &out.version) {
+        (Some(p), Some(v)) => println!("node          = {} @ {}", v, p.display()),
+        _ => println!("node          = （未找到）"),
+    }
+    if let Some((on, ms)) = nodeprobe::current_stuck() {
+        println!("⚠ 仍在探测    = {} （已 {} ms）", on, ms);
+    }
+    println!("逐候选追踪:");
+    print!("{}", nodeprobe::render_trace(&out.trace));
+    0
+}
+
 fn cli_plan() -> i32 {
-    let sys = env::probe_system_node();
+    let out = nodeprobe::status(std::time::Duration::from_secs(30));
+    let sys = match (&out.path, &out.version) {
+        (Some(p), Some(v)) => Some((p.clone(), v.clone())),
+        _ => None,
+    };
     match &sys {
         Some((p, v)) => println!("node=present {} @ {}", v, p.display()),
-        None => println!("node=missing"),
+        None => println!("node=missing（finished={}）", out.finished),
     }
+    println!("node_probe_candidates={}", nodeprobe::candidate_summary());
+    print!("{}", nodeprobe::render_trace(&out.trace));
     match node::latest_lts() {
         Ok(c) => {
             println!("latest_lts={} file={}", c.version, c.file);
@@ -950,7 +1014,7 @@ fn shell_restart(app: tauri::AppHandle) {
 ///   dsh-supervisor-gui --service-plan              # 只报告，不写盘
 ///   dsh-supervisor-gui --service-plan --service-apply   # 实际建立服务定义
 fn cli_service_plan() -> i32 {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     println!("== 守卫服务定义自检 ==");
     println!("平台          = {}", std::env::consts::OS);
     println!("服务定义路径  = {}", service::definition_path().display());
@@ -996,6 +1060,10 @@ fn cli_service_plan() -> i32 {
     }
 }
 fn main() {
+    // 无头自检：环境探测（架构修复后的可诊断入口）。
+    if std::env::args().any(|a| a == "--env-plan") {
+        std::process::exit(cli_env_plan());
+    }
     // 无头自检：守卫服务定义（P0 修复的功能验证入口，任何平台可用）。
     if std::env::args().any(|a| a == "--service-plan") {
         std::process::exit(cli_service_plan());
@@ -1028,7 +1096,7 @@ fn main() {
         // app.restart()：更新安装后重启进入新版本（旧进程装、新进程跑）。
         .plugin(tauri_plugin_process::init())
         .manage(Mutex::new(RunState::default()))
-        .invoke_handler(tauri::generate_handler![node_status, core_status, core_plan, core_apply, guard_start, guard_ready, start_node_install, finish_boot, win_ctl, shell_identity, shell_update_check, shell_update_apply, shell_restart, shell_set_phase, mirror_status, mirror_set])
+        .invoke_handler(tauri::generate_handler![node_status, core_status, core_plan, core_apply, guard_start, guard_ready, start_node_install, finish_boot, win_ctl, shell_identity, shell_update_check, shell_update_apply, shell_restart, shell_set_phase, mirror_status, mirror_set, node_latest])
         .setup(|app| {
             // 托盘直发本地 API 的端口：显式 DSH_SUPERVISOR_TRAY_PORT 优先，否则从用户 config.apiPort 解析
             let port: u16 = std::env::var("DSH_SUPERVISOR_TRAY_PORT")
@@ -1042,10 +1110,25 @@ fn main() {
 
             // 环境判定（2026-09 改）：Node 缺失或低于最低标准(>=22.12, DSH commander 硬门槛) → 引导页安装；
             // 达标（即使不是最新 LTS）→ 直接拉起守卫进入面板，不卡升级。初始 url 即 bootstrap.html。
-            let have = env::probe_system_node();
+            // ⚠ **不得在此阻塞**（架构修复 2026-09-11）：
+            //   旧实现在这里同步调用探测。setup 在**窗口创建之前**运行，
+            //   而探测内含无界阻塞系统调用（CreateProcessW / GetFileAttributesW
+            //   在网络路径上无上限）—— 一旦挂起，连窗口都会被推迟出现，
+            //   且失败现象是「启动慢/无窗口」，与真正的病因相距极远。
+            //   现改为：仅**触发**探测（分离线程），结果由引导页异步等待。
+            //   UI 立即可见是硬要求 —— 检测再慢也不能挡住界面。
+            nodeprobe::start();
             {
-                let st = handle.state::<Mutex<RunState>>();
-                if let Some((_p, v)) = have.as_ref() { st.lock().unwrap().installed = Some(v.clone()); }
+                let h = handle.clone();
+                std::thread::spawn(move || {
+                    // 在飞探测最多等 45 秒（与引导页预算一致）；未完成则放弃本次回填，
+                    // 下次 node_status 轮询仍会拿到结果。
+                    let out = nodeprobe::status(std::time::Duration::from_secs(45));
+                    if let Some(v) = out.version {
+                        let st = h.state::<Mutex<RunState>>();
+                        st.lock().unwrap().installed = Some(v);
+                    }
+                });
             }
             // 单一引导流程（K3 修复）：壳启动只做「环境信息探测」，**不再并行拉起守卫**。
             // 守卫的安装/升级/启动全部由引导页显式驱动

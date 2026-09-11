@@ -346,20 +346,10 @@ fn b16_min_node_gate_is_enforced_in_frontend() {
     eprintln!("B16 PASS min-node gate enforced");
 }
 
-/// B17：npm 形态的包根解析必须正确（launcher 后 __dirname 是包根，
-/// 旧实现 path.join(__dirname, ..) 指向包外，导致模板与 bin 路径错位）。
-#[test]
-fn b17_package_root_resolution_is_form_agnostic() {
-    let bin = fs::read_to_string(manifest_dir().join("..").join("..").join("bin").join("dsh-supervisor"))
-        .expect("read bin/dsh-supervisor");
-    assert!(bin.contains("findPackageRoot"), "B17 FAIL 未按 package.json 定位包根");
-    assert!(
-        !bin.contains("const ROOT = path.join(__dirname, '..')"),
-        "B17 FAIL 仍用 __dirname/.. 硬推包根（发行态会指向包外）"
-    );
-    assert!(bin.contains("path.join(ROOT, 'bin', 'dsh-supervisor')"), "B17 FAIL bin 目标未按包根解析");
-    eprintln!("B17 PASS package root resolution form-agnostic");
-}
+// B17 已移除（2026-09-11 双仓隔离收尾）：它断言的是**内核仓**的 `bin/dsh-supervisor`
+//（经 `../../` 跨仓读取），壳仓独立后该路径不存在。
+// 等价覆盖已迁至内核仓 `test/package-root-test.js`（P1 系列）——
+// 断言应与它验证的代码同仓，而不是靠目录布局巧合成立。
 
 /// B18：镜像适配必须由壳自持（装机时无内核，面板不可用）。
 #[test]
@@ -455,21 +445,28 @@ fn b22_mirror_presets_are_verified() {
     eprintln!("B22 PASS mirror presets are verified");
 }
 
-/// B23：三处预设集合必须一致（壳 mirror.rs / 壳 core.rs / 内核 config）。
+/// B23：**壳侧**预设集合必须自洽（mirror.rs 主路径与 core.rs 兜底路径一致）。
+///
+/// 注（2026-09-11 双仓隔离收尾）：原断言还跨仓读取**内核** `src/platform/config.js`，
+/// 壳仓独立后该路径不存在。内核侧集合由其自身 `test/package-root-test.js`（P2 系列）保证；
+/// 本测试只负责**壳仓内部**一致性（两处不一致会导致主路径与兜底路径选出不同源）。
 #[test]
-fn b23_preset_sets_are_consistent() {
+fn b23_shell_preset_sets_are_consistent() {
     let core = fs::read_to_string(manifest_dir().join("src").join("core.rs")).expect("core.rs");
     assert!(
         core.contains("const DEFAULT_ORIGINS: [&str; 6]"),
         "B23 FAIL 壳 core.rs 的 DEFAULT_ORIGINS 未同步到 6 个"
     );
-    // 内核 config.js 也应含新增的两个源
-    let cfg_path = manifest_dir().join("..").join("..").join("src").join("platform").join("config.js");
-    let cfg = fs::read_to_string(&cfg_path).expect("config.js");
+    let m = fs::read_to_string(manifest_dir().join("src").join("mirror.rs")).expect("mirror.rs");
+    assert!(
+        m.contains("pub const NPM_PRESETS: [&str; 6]"),
+        "B23 FAIL 壳 mirror.rs 的 NPM_PRESETS 未同步到 6 个"
+    );
     for needle in ["npmreg.proxy.ustclug.org", "r.cnpmjs.org"] {
-        assert!(cfg.contains(needle), "B23 FAIL 内核 config.registries 缺 {}", needle);
+        assert!(core.contains(needle), "B23 FAIL core.rs DEFAULT_ORIGINS 缺 {}", needle);
+        assert!(m.contains(needle), "B23 FAIL mirror.rs NPM_PRESETS 缺 {}", needle);
     }
-    eprintln!("B23 PASS preset sets consistent");
+    eprintln!("B23 PASS shell preset sets consistent");
 }
 
 /// B24：服务定义自检入口必须存在（P0 修复的可诊断性）。
@@ -496,4 +493,102 @@ fn b25_candidates_work_without_apphandle() {
     let c = fs::read_to_string(manifest_dir().join("src").join("core.rs")).expect("core.rs");
     assert!(c.contains("locate_core_for_cli"), "B25 FAIL 缺 CLI 专用定位函数");
     eprintln!("B25 PASS candidates usable without AppHandle");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 架构级回归（2026-09-11 二次修复）：环境探测不得被无界系统调用卡死
+//
+// 背景：1.0.3/1.0.4 都卡在「检测环境」，说明首轮修复（加超时）没触及根因。
+//   根因是「探测内含无界阻塞系统调用」+「命令 await 该探测」，
+//   于是「探测挂起」等价于「命令永不返回」，前端超时只是停止等待、并不解除挂起。
+// ═══════════════════════════════════════════════════════════════════
+
+/// B26：必须有独立的有界探测运行时（分离线程 + 有界等待 + 缓存 + 追踪）。
+/// 这是唯一能给 CreateProcessW / GetFileAttributesW 加界的手段。
+#[test]
+fn b26_bounded_probe_runtime_exists() {
+    let p = fs::read_to_string(manifest_dir().join("src").join("nodeprobe.rs"))
+        .expect("B26 FAIL 缺少 src/nodeprobe.rs（有界探测运行时）");
+    assert!(p.contains("recv_timeout"), "B26 FAIL 未用 recv_timeout（无法给阻塞调用加界）");
+    assert!(p.contains("spawn_worker"), "B26 FAIL 探测未在分离线程中执行");
+    assert!(p.contains("STALE_AFTER"), "B26 FAIL 缺陈旧判定（阻塞永久挂起会永久剥夺探测能力）");
+    assert!(p.contains("pub fn status"), "B26 FAIL 缺有界查询入口");
+    assert!(p.contains("pub fn invalidate"), "B26 FAIL 缺缓存失效（装完 Node 后必须能重新发现）");
+    assert!(p.contains("pub fn current_stuck"), "B26 FAIL 缺「卡在谁」诊断");
+    assert!(p.contains("trace"), "B26 FAIL 缺逐候选追踪");
+    eprintln!("B26 PASS bounded probe runtime present");
+}
+
+/// B27：node_status 必须**立即返回**并支持轮询 —— 不得 await 探测到底。
+#[test]
+fn b27_node_status_is_pollable_not_blocking() {
+    let m = main_rs();
+    // 必须暴露轮询所需字段
+    assert!(m.contains("\"probing\""), "B27 FAIL node_status 未回传 probing（前端无法轮询）");
+    assert!(m.contains("\"stuck\""), "B27 FAIL node_status 未回传 stuck（无法显示卡在哪）");
+    assert!(m.contains("\"trace\""), "B27 FAIL node_status 未回传 trace");
+    // 探测预算必须很短（命令本身不得长时间占用）
+    assert!(
+        m.contains("from_millis(900)"),
+        "B27 FAIL node_status 的等待预算过长（应短到可轮询）"
+    );
+    // 网络侧必须与本地判定分离
+    assert!(m.contains("async fn node_latest"), "B27 FAIL 缺独立 node_latest（网络与本地判定必须解耦）");
+    eprintln!("B27 PASS node_status pollable and local-only");
+}
+
+/// B28：PATH 扫描必须有界，且过滤可能阻塞的非固定盘/UNC。
+#[test]
+fn b28_path_scan_bounded_and_local_only() {
+    let e = fs::read_to_string(manifest_dir().join("src").join("env.rs")).expect("env.rs");
+    assert!(e.contains("PATH_SCAN_BUDGET"), "B28 FAIL PATH 扫描无预算");
+    assert!(e.contains("pub fn path_dirs_local_only"), "B28 FAIL 缺本地盘过滤");
+    assert!(e.contains("GetDriveTypeW"), "B28 FAIL 未做磁盘类型判定（网络盘会阻塞）");
+    assert!(e.contains("pub fn recorded_node_path"), "B28 FAIL 未回读 runtime.json（最廉价的探测来源）");
+    eprintln!("B28 PASS path scan bounded and local-only");
+}
+
+/// B29：引导页必须**轮询**环境状态，且探测超时后给出可操作出口。
+#[test]
+fn b29_bootstrap_polls_and_offers_escape() {
+    let h = bootstrap_html();
+    assert!(h.contains("st.probing"), "B29 FAIL 引导页未处理 probing（无法轮询）");
+    assert!(h.contains("failEnvTimeout"), "B29 FAIL 缺环境超时的专门处理");
+    // 关键可用性：装 Node 不需要已有 Node → 检测失败不得是死胡同
+    assert!(h.contains("btnForceNode"), "B29 FAIL 缺「跳过检测直接安装」出口");
+    assert!(h.contains("probeMirrorThen"), "B29 FAIL 镜像选择未显式可见化");
+    eprintln!("B29 PASS bootstrap polls and offers escape");
+}
+
+/// B30：启动路径**不得同步**调用探测（否则窗口创建会被推迟）。
+#[test]
+fn b30_setup_must_not_block_on_probe() {
+    let m = main_rs();
+    // 定位 setup 段，确认其中无同步探测调用
+    let setup_start = m.find(".setup(|app| {").expect("B30 FAIL 未找到 setup");
+    let tail = &m[setup_start..];
+    let setup_end = tail.find("\n        })").map(|i| setup_start + i).unwrap_or(m.len());
+    let setup = &m[setup_start..setup_end];
+    assert!(
+        !setup.contains("let have = env::probe_system_node()"),
+        "B30 FAIL setup 仍同步调用探测（会推迟窗口创建）"
+    );
+    assert!(setup.contains("nodeprobe::start()"), "B30 FAIL setup 未改为仅触发探测");
+    eprintln!("B30 PASS setup does not block on probe");
+}
+
+/// B31：诊断串必须携带环境探测追踪与镜像选择结果。
+#[test]
+fn b31_diagnostics_include_probe_trace_and_mirror() {
+    let h = bootstrap_html();
+    assert!(h.contains("env_trace="), "B31 FAIL 诊断缺 env_trace");
+    assert!(h.contains("env_stuck="), "B31 FAIL 诊断缺 env_stuck");
+    assert!(h.contains("env_candidates="), "B31 FAIL 诊断缺 env_candidates");
+    assert!(h.contains("mirror_probes="), "B31 FAIL 诊断缺镜像逐源延迟");
+    // 环境超时不得被误判为网络问题（曾据此展开镜像设置，误导用户）
+    assert!(
+        !h.contains("/网络|镜像|超时|下载|不可达|timeout|network|mirror/i"),
+        "B31 FAIL fail() 仍把「超时」当网络问题（环境超时会误导性展开镜像设置）"
+    );
+    eprintln!("B31 PASS diagnostics include trace and mirror");
 }

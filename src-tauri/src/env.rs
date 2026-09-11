@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 ///   执行该存根会尝试唤起 Store 并**永不返回**，引导页从此永久停住。
 const NODE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 整个 PATH 扫描的全局上限：即使 PATH 里有多个坏候选，也不会把启动拖成分钟级。
+/// 兼容包装 probe_system_node 的有界预算（真正执行在 nodeprobe 的分离线程里）。
 const NODE_PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(20);
 
 pub fn node_exe() -> &'static str {
@@ -20,7 +20,7 @@ pub fn node_exe() -> &'static str {
 
 /// 候选是否可用：过滤 Windows 上的应用执行别名存根与空文件。
 /// （别名存根不是可执行程序，执行它会挂起或唤起 Store；0 字节文件同理不可用。）
-fn is_usable_candidate(cand: &Path) -> bool {
+pub fn is_usable_candidate(cand: &Path) -> bool {
     if !cand.is_file() { return false; }
     #[cfg(target_os = "windows")]
     {
@@ -31,13 +31,83 @@ fn is_usable_candidate(cand: &Path) -> bool {
     true
 }
 
+/// PATH 扫描的总预算：即使 PATH 里存在会阻塞的路径，也不会把调用方拖成分钟级。
+/// 说明：这是「快速失败」，不是唯一防线 —— nodeprobe 的分离线程机制才是硬保证。
+const PATH_SCAN_BUDGET: Duration = Duration::from_secs(10);
+
+/// PATH 扫描（**有界 + 安全过滤**）。
+///
+/// ⚠ 两处工程性修正（2026-09-11 架构修复）：
+///   1. 原实现**没有任何时间上限** —— PATH 中若含断开的网络盘或 UNC，一次 is_file()
+///      就可能阻塞数十秒；而本函数在**核心定位路径**上被调用（无 GUI 的 CLI 自检同样受影响）。
+///   2. 增加磁盘类型过滤：Windows 上跳过非固定盘与 UNC。GetDriveTypeW 是**本地**判定，
+///      不会像 exists()/metadata() 那样触网，故对断开的映射盘也安全。
 pub fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    let started = Instant::now();
+    for dir in path_dirs_local_only() {
+        if started.elapsed() >= PATH_SCAN_BUDGET { break; }
         let cand = dir.join(name);
         if is_usable_candidate(&cand) { return Some(cand); }
     }
     None
+}
+
+/// PATH 中的目录，已过滤掉「可能阻塞」的项（非固定盘 / UNC）。
+/// 供 nodeprobe 与 find_in_path 共用，保证探测与定位走同一套安全判定。
+pub fn path_dirs_local_only() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(path) = std::env::var_os("PATH") else { return out };
+    for dir in std::env::split_paths(&path) {
+        if !is_local_fixed_dir(&dir) { continue; }
+        out.push(dir);
+    }
+    out
+}
+
+/// 该目录是否位于「本地固定磁盘」。
+///
+/// 为什么需要：Windows 的 PATH 常含映射盘或 UNC；当网络盘断开时，
+/// GetFileAttributesW / CreateProcessW 会阻塞到 SMB 超时（数十秒，且可能重试）。
+/// 本判定在**执行任何可能触网的操作之前**完成，且自身不触网。
+pub fn is_local_fixed_dir(dir: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let w: Vec<u16> = dir.as_os_str().encode_wide().collect();
+        // UNC（以两个反斜杠开头，ASCII 92）→ 跳过
+        if w.len() >= 2 && w[0] == 92 && w[1] == 92 { return false; }
+        // 无盘符（相对路径等）→ 保守放行
+        if w.len() < 2 || w[1] != 58 { return true; }
+        let mut root = [0u16; 4];
+        root[0] = w[0];
+        root[1] = 58;   // 冒号
+        root[2] = 92;   // 反斜杠
+        root[3] = 0;
+        extern "system" {
+            fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+        }
+        // DRIVE_FIXED = 3；其余（REMOTE=4 / NO_ROOT_DIR=1 / UNKNOWN=0）一律跳过
+        return unsafe { GetDriveTypeW(root.as_ptr()) } == 3;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = dir;
+        true
+    }
+}
+
+/// 我们自己记录的 Node 路径（runtime.json）—— **最廉价的探测来源**。
+///
+/// 架构要点：壳安装 Node 后已把落点写入 runtime.json，但此前**从未回读**，
+/// 每次启动仍去猜 PATH。回读它可跳过全部外部进程探测，也避免「装了却找不到」。
+pub fn recorded_node_path() -> Option<PathBuf> {
+    let p = supervisor_dir().join("runtime.json");
+    let s = std::fs::read_to_string(&p).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let node = v.get("nodePath").and_then(|x| x.as_str())?;
+    if node.is_empty() { return None; }
+    let cand = PathBuf::from(node);
+    if is_usable_candidate(&cand) { Some(cand) } else { None }
 }
 
 /// 有界执行 `<node> --version`。
@@ -85,21 +155,15 @@ pub fn node_version(node: &Path) -> Option<String> {
 ///
 /// ⚠ 必须**遍历全部候选**而非取第一个：PATH 靠前的候选可能是不可用的存根，
 ///   若直接返回它就会掩盖后面真正可用的 Node 安装。
+/// 兼容入口：委托给**有界探测运行时**（nodeprobe）。
+///
+/// 架构说明（2026-09-11 二次修复）：原先本函数自行扫描 PATH 并执行候选二进制，
+/// 而它内含无法被自身预算约束的阻塞系统调用（见 env.rs 顶部与 nodeprobe.rs 的根因分析），
+/// 且被 setup() 同步调用 —— 一旦挂起，窗口创建都会被推迟。
+/// 现统一走 nodeprobe：分离线程执行 + 有界等待 + 结果缓存 + 全程追踪。
+/// 保留本函数是为了让所有既有调用点**自动**获得该保证，无需逐个改写。
 pub fn probe_system_node() -> Option<(PathBuf, String)> {
-    let started = Instant::now();
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if started.elapsed() >= NODE_PROBE_TOTAL_BUDGET { break; }
-            let cand = dir.join(node_exe());
-            if !is_usable_candidate(&cand) { continue; }
-            if let Some(v) = node_version(&cand) { return Some((cand, v)); }
-        }
-    }
-    // PATH 未命中 → 官方安装的标准落点（同样走有界探测）
-    if let Some(p) = known_install_node_path() {
-        if let Some(v) = node_version(&p) { return Some((p, v)); }
-    }
-    None
+    crate::nodeprobe::resolve(NODE_PROBE_TOTAL_BUDGET)
 }
 
 /// 安装后已知候选路径（官方安装的标准落点）。

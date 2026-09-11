@@ -128,6 +128,10 @@
         <div class="fail-msg" id="failMsg"></div>
         <div class="fail-actions">
           <button id="btnRetry">重试</button>
+          <!-- 环境探测失败时的**关键出口**（架构修复 2026-09-11）：
+               下载 Node 并不需要本机已有 Node —— 故「检测不出来」不应是死胡同。
+               仅在环境超时后出现，避免普通用户误用。 -->
+          <button id="btnForceNode" style="display:none">跳过检测，直接安装 Node</button>
           <button id="btnDiag" class="ghost">复制诊断</button>
           <button id="btnMirror" class="ghost">网络/镜像设置</button>
         </div>
@@ -182,6 +186,9 @@
   var stepNames = ['st-env', 'st-node', 'st-shell', 'st-core', 'st-guard', 'st-panel'];
   var cur = -1;
   var nodeVer = null;      // 当前 Node 版本
+  var lastEnv = null;      // 最近一次 node_status 快照（诊断用：含候选追踪与「卡在谁」）
+  var lastMirror = null;   // 最近一次镜像测速结果（诊断用：选了哪个源、延迟）
+  var envStuck = null;     // 环境探测卡住的候选（诊断用）
   var coreFrom = null;     // 更新前内核版本
   var coreTo = null;       // 更新后内核版本
   var lastPlan = null;     // 最近一次 core_plan（诊断用）
@@ -262,7 +269,8 @@
     $('fail').style.display = '';
     // 网络/镜像类失败 → **自动展开**镜像设置，让用户一眼看到自助出口；
     // 其余失败（如内核安装报错）不展开，避免噪声。
-    if (/网络|镜像|超时|下载|不可达|timeout|network|mirror/i.test(String(msg))) {
+    // 注意：**不含「超时」** —— 环境检测超时并非网络问题，展开镜像设置会误导用户。
+    if (/网络|镜像|下载|不可达|network|mirror/i.test(String(msg))) {
       showMirror();
     }
   }
@@ -276,6 +284,13 @@
       'shell_attempt=' + (shellId ? shellId.attempt : '?'),
       'shell_pinned=' + (shellId && shellId.pinned ? JSON.stringify(shellId.pinned) : '[]'),
       'shell_update=' + (updPlan ? JSON.stringify({ available: updPlan.available, latest: updPlan.latest, skipped: updPlan.skipped, error: updPlan.error }) : 'none'),
+      // ── 环境探测追踪（架构修复 2026-09-11）：探测根因是**环境特有**的，
+      //    靠读代码无法确定；这份追踪是定位该类问题唯一可靠的手段。 ──
+      'env_candidates=' + ((lastEnv && lastEnv.candidates) || 'none'),
+      'env_stuck=' + (envStuck ? (envStuck.on + '/' + envStuck.ms + 'ms') : 'none'),
+      'env_trace=' + ((lastEnv && lastEnv.trace && lastEnv.trace.length) ? lastEnv.trace.map(function (t) { return t.path + '(' + t.ms + 'ms,' + (t.ok ? 'ok' : 'no') + ',' + (t.note || '') + ')'; }).join(' > ') : 'none'),
+      'mirror=' + (lastMirror && lastMirror.mirror ? (lastMirror.mirror + '/' + lastMirror.latencyMs + 'ms') : 'none'),
+      'mirror_probes=' + ((lastMirror && lastMirror.probes && lastMirror.probes.length) ? lastMirror.probes.map(function (p) { return p.source + (p.ok ? '(' + p.latencyMs + 'ms)' : '(x)'); }).join(' > ') : 'none'),
       'error=' + (lastError || 'none'),
     ].join(' | ');
   }
@@ -383,35 +398,111 @@
   }
 
   // ── 步骤 0：环境检测（**第一步**：本地、快、确定）──
+  // 环境检测（**架构修复 2026-09-11 二次 —— 上一轮没解决根因**）。
+  //
+  // 根因：探测内部存在**无法被自身预算约束的阻塞系统调用**
+  //   （GetFileAttributesW / CreateProcessW 在网络路径与应用执行别名上无上限），
+  //   而旧实现是「invoke 一次 + 等 45 秒」。于是：
+  //     · Rust 侧探测挂起 → 那次 invoke 永不 resolve；
+  //     · 前端 45 秒后只能报「超时」，**重试仍是同样结果**（用户被永久挡住）；
+  //     · Rust 侧那条线程还永久悬挂，每次重试再添一条。
+  //
+  // 现改为**轮询式**（Rust 侧已改为立即返回、探测在分离线程中）：
+  //   · 每 400ms 查一次，把「当前卡在哪个候选、已多久」实时显示 —— 这是用户唯一能提供的线索；
+  //   · 达到预算仍未完成 → 给出**可操作出口**（含「跳过检测直接安装」，因为装 Node 不需要已有 Node）。
   function stepEnv() {
     setStep(0);
     phase('env');
     status('正在检测系统环境…');
-    // ⚠ 必须有界（2026-09-11 用户 Windows 真机事故：1.0.3 卡在「检测环境」不动）。
-    //   此前只给桌面/内核步骤加了超时，**漏了第一步**，而第一步恰恰最容易卡
-    //   （要执行 node --version，Windows PATH 里可能有应用别名存根）。
-    return withTimeout(core.invoke('node_status'), ENV_PROBE_BUDGET_MS, '环境检测超时').then(function (st) {
-      if (st && st.__timeout) { fail('环境检测超时（探针无响应，可能有异常的可执行文件占位）'); return null; }
-      if (st && st.__error) { fail('环境检测异常：' + st.__error); return null; }
-      st = st || {};
-      if (st.busy) { setStep(1); status(st.status || '正在准备 Node.js 运行环境…'); return stepNodeWait(); }
-      if (!st.installed) {
-        setStep(1);
+    var deadline = Date.now() + ENV_PROBE_BUDGET_MS;
+    return new Promise(function (resolve) {
+      var settled = false;
+      function poll() {
+        if (settled) return;
+        core.invoke('node_status').then(function (st) {
+          if (settled) return;
+          st = st || {};
+          lastEnv = st;
+          if (st.probing) {
+            var s = st.stuck;
+            if (s && s.on) {
+              envStuck = s;
+              status('正在检测系统环境…（' + s.on + ' · 已 ' + Math.round((s.ms || 0) / 1000) + 's 无响应）');
+            }
+            if (Date.now() >= deadline) {
+              settled = true;
+              failEnvTimeout(st);
+              resolve(null);
+              return;
+            }
+            setTimeout(poll, 400);
+            return;
+          }
+          settled = true;
+          var p = afterEnv(st);
+          if (p && p.then) { p.then(function () { resolve(null); }, function () { resolve(null); }); } else { resolve(null); }
+        }).catch(function (e) {
+          if (settled) return;
+          settled = true;
+          fail('环境检测异常：' + e);
+          resolve(null);
+        });
+      }
+      poll();
+    });
+  }
+
+  function failEnvTimeout(st) {
+    envStuck = (st && st.stuck) || null;
+    var extra = (envStuck && envStuck.on)
+      ? ' · 卡在：' + envStuck.on + '（已 ' + Math.round((envStuck.ms || 0) / 1000) + 's 无响应）'
+      : '';
+    fail('环境检测超时（探针无响应，可能有异常的可执行文件占位）' + extra);
+    // 给出「跳过检测直接安装」出口：这是**唯一**能让用户自救的路径
+    // （下载 Node 不需要本机已有 Node）。
+    $('btnForceNode').style.display = '';
+  }
+
+  // 探测完成后的判定（原 stepEnv 的后半段，语义未变）。
+  function afterEnv(st) {
+    if (st.busy) { setStep(1); status(st.status || '正在准备 Node.js 运行环境…'); return stepNodeWait(); }
+    if (!st.installed) {
+      setStep(1);
+      return probeMirrorThen(function () {
         status('未检测到 Node.js · 正在补全运行环境…');
         return core.invoke('start_node_install').then(function () { return stepNodeWait(); });
-      }
-      // ⚠ 必须校验**最低门槛**（2026-09-11 修复）：
-      //   后端一直回传 minOk（DSH 要求 Node >= v22.12），但前端从未使用 ——
-      //   于是用户机器上装了旧版 Node（如 v18）时流程照常放行，
-      //   直到内核真正启动才失败，错误现象离根因很远、极难排查。
-      if (st.minOk === false) {
-        setStep(1);
+      });
+    }
+    // ⚠ 必须校验**最低门槛**：后端一直回传 minOk（DSH 要求 Node >= v22.12），
+    //   而前端曾长期忽略它 —— 装了旧版 Node 也照常放行，直到内核启动才失败。
+    if (st.minOk === false) {
+      setStep(1);
+      return probeMirrorThen(function () {
         status('Node.js ' + st.installed + ' 低于最低要求（' + (st.minRequired || 'v22.12') + '）· 正在升级…');
         return core.invoke('start_node_install').then(function () { return stepNodeWait(); });
+      });
+    }
+    nodeVer = st.installed;
+    return stepNodeDone();
+  }
+
+  // 镜像源适配的**显式可见化**。
+  // 此前镜像探测藏在下载内部，用户无从得知「有没有选、选了谁」 ——
+  // 于是「完全没有自动适配最佳镜像源」成为无法证伪的观感。
+  // 现独立成一步：先并行测速选出最快源并**明确展示**，再开始下载。
+  function probeMirrorThen(fn) {
+    status('正在测速并选择最佳镜像源…');
+    return withTimeout(core.invoke('node_latest'), 45000, '镜像测速超时').then(function (m) {
+      if (m && !m.__timeout && !m.__error && m.ok) {
+        lastMirror = m;
+        var host = String(m.mirror || '').replace(/^https?:\/\//, '').split('/')[0];
+        status('镜像已选：' + host + '（' + m.latencyMs + 'ms）· 目标 Node ' + m.version);
+      } else {
+        lastMirror = m || null;
+        status('镜像测速未完成 · 将使用内置候选继续');
       }
-      nodeVer = st.installed;
-      return stepNodeDone();
-    });
+      return wait(600);
+    }).then(fn);
   }
   function stepNodeWait() {
     phase('node');
@@ -535,6 +626,10 @@
     hideFail();
     hideUpdChoice();
     cur = -1; nodeVer = null; coreFrom = null; coreTo = null; lastError = null; updPlan = null;
+    // 诊断状态一并重置：重试后不应残留上一次的追踪（否则诊断会误导排障）。
+    // lastMirror 不重置（镜像选择结果与本次重试无关，保留可对比）。
+    lastEnv = null; envStuck = null;
+    $('btnForceNode').style.display = 'none';
     // 从**环境检测**开始（本地快检查在前）；随后 Node → 桌面版本 → 内核 → 守卫 → 控制面板。
     stepEnv().catch(function (e) { fail('引导异常：' + e); });
   }
@@ -612,7 +707,23 @@
   });
 
   // 交互：重试 / 诊断
-  $('btnRetry').addEventListener('click', function () { boot(); });
+  $('btnRetry').addEventListener('click', function () {
+    $('btnForceNode').style.display = 'none';
+    boot();
+  });
+  // 「跳过检测，直接安装」：仅在环境探测超时后出现。
+  // 存在理由：下载 Node 不需要本机已有 Node —— 检测失败不应是死胡同。
+  $('btnForceNode').addEventListener('click', function () {
+    hideFail();
+    $('btnForceNode').style.display = 'none';
+    $('mirrorBox').style.display = 'none';
+    setStep(1);
+    phase('node');
+    status('已跳过环境检测 · 正在准备安装 Node.js…');
+    probeMirrorThen(function () {
+      return core.invoke('start_node_install').then(function () { return stepNodeWait(); });
+    });
+  });
   $('btnDiag').addEventListener('click', function () {
     var t = diagText();
     try { if (navigator.clipboard) navigator.clipboard.writeText(t); } catch (e) {}
