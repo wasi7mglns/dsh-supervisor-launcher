@@ -132,6 +132,41 @@ fn b6_rust_check_timeout_and_pending_before_install() {
     eprintln!("B6 PASS timeout present, mark_pending before install");
 }
 
+/// B8：内核步骤同样受网络支配，必须也有界。
+/// 与壳更新同类：registry 查询与 npm install 都可能因网络停滞而永久阻塞。
+#[test]
+fn b8_core_steps_are_bounded() {
+    let html = bootstrap_html();
+    assert!(html.contains("CORE_PLAN_BUDGET_MS"), "B8 FAIL 内核版本检查缺前端超时预算");
+    assert!(html.contains("CORE_APPLY_BUDGET_MS"), "B8 FAIL 内核安装缺前端超时预算");
+    assert!(
+        html.contains("withTimeout(core.invoke('core_plan')"),
+        "B8 FAIL core_plan 未用 withTimeout 包裹"
+    );
+    assert!(
+        html.contains("withTimeout(core.invoke('core_apply'"),
+        "B8 FAIL core_apply 未用 withTimeout 包裹"
+    );
+    // Rust 侧：npm install 不得无限阻塞
+    let core = fs::read_to_string(manifest_dir().join("src").join("core.rs")).expect("read core.rs");
+    assert!(core.contains("NPM_INSTALL_TIMEOUT"), "B8 FAIL npm install 无超时常量");
+    assert!(core.contains("run_command_bounded"), "B8 FAIL npm install 未走有界执行");
+    // 只检查**代码行**，注释里对旧实现的说明不算违规
+    let code_only: String = core
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !(t.starts_with("//") || t.starts_with("///") || t.starts_with("*"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code_only.contains("cmd.output()"),
+        "B8 FAIL 仍存在无限阻塞的 cmd.output()（npm 挂起即永久卡住）"
+    );
+    eprintln!("B8 PASS core steps bounded (frontend + rust)");
+}
+
 #[test]
 fn b7_no_stale_door0_concept_in_user_facing_text() {
     let html = bootstrap_html();

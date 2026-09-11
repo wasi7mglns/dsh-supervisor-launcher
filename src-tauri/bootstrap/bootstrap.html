@@ -190,6 +190,10 @@
   // 这里再加一层 JS 超时，保证任何情况下都有明确结论（宁可失败放行，绝不静默卡住）。
   var SHELL_CHECK_BUDGET_MS = 45000;   // 检查（Rust 侧 20s + 余量）
   var SHELL_DOWNLOAD_BUDGET_MS = 300000; // 下载前 5 分钟若毫无进展即判定失败（下载本身可更长）
+  // 内核步骤同样受网络支配（registry 查询 + npm install），必须同样有界。
+  // Rust 侧 http_json 有单请求超时、npm install 现有 15 分钟上限；这里是前端兜底。
+  var CORE_PLAN_BUDGET_MS = 90000;      // 多镜像回退查询
+  var CORE_APPLY_BUDGET_MS = 1020000;   // 17 分钟（Rust 侧 npm install 上限 15 分钟）
   function withTimeout(promise, ms, onTimeoutMsg) {
     return new Promise(function (resolve) {
       var done = false;
@@ -382,7 +386,9 @@
     setStep(3);
     phase('kernel');
     status('正在检查内核版本…');
-    return core.invoke('core_plan').then(function (p) {
+    return withTimeout(core.invoke('core_plan'), CORE_PLAN_BUDGET_MS, '内核版本检查超时（网络不可达？）').then(function (p) {
+      if (p && p.__timeout) { fail('内核版本检查超时（网络不可达？）'); return null; }
+      if (p && p.__error) { fail('内核版本检查异常：' + p.__error); return null; }
       lastPlan = p || {};
       coreFrom = p.installed || null;
       if (!p.installed) {
@@ -401,7 +407,10 @@
 
   // 执行安装/升级/回退；成功返回 true，失败走 fail() 并返回 false
   function coreApply(version) {
-    return core.invoke('core_apply', { version: version }).then(function (r) {
+    // 有界：Rust 侧 npm install 上限 15 分钟，此处 17 分钟兜底（含镜像回退与解包）。
+    return withTimeout(core.invoke('core_apply', { version: version }), CORE_APPLY_BUDGET_MS, '内核安装超时（已中止等待）').then(function (r) {
+      if (r && r.__timeout) { fail('内核安装超时（超过 17 分钟未完成）'); return false; }
+      if (r && r.__error) { fail('内核安装异常：' + r.__error); return false; }
       if (!r || r.ok !== true) {
         fail('内核' + (coreFrom ? '更新' : '安装') + '失败：' + ((r && r.error) || '未知错误'));
         return false;

@@ -252,12 +252,103 @@ pub fn install_version(pkg: &str, version: &str, prefix: Option<&Path>, registry
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW：GUI 进程调 npm 不弹控制台
     }
-    let out = cmd.output().map_err(|e| format!("npm 启动失败: {}（Node 就绪后才能安装内核）", e))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    if out.status.success() { return Ok(tail(&stdout, 500)); }
-    let code = out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "killed".into());
-    Err(format!("npm 退出码 {}：{}", code, tail(&stderr, 800)))
+    // ⚠ 必须有界（2026-09-11 修复，与引导页「网络步骤无超时 → 永久卡住」属同一类缺陷）：
+    //   原实现用 `cmd.output()` **无限阻塞** —— npm 因网络停滞/registry 无响应而挂起时，
+    //   引导页会永久停在「正在安装内核…」，用户除了杀进程别无选择。
+    //   实现要点：输出重定向到**临时文件**而非管道 —— 若用 Stdio::piped() 且不读取，
+    //   冗长的 npm 输出（npm 会打印大量进度）填满 OS 管道缓冲区（约 64KB）后子进程会阻塞，
+    //   反而制造死锁。临时文件无此问题，且便于超时后保留现场。
+    let out = run_command_bounded(cmd, NPM_INSTALL_TIMEOUT)?;
+    if out.success { return Ok(tail(&out.stdout, 500)); }
+    let code = out.code.unwrap_or_else(|| "killed".into());
+    Err(format!("npm 退出码 {}：{}", code, tail(&out.stderr, 800)))
+}
+
+/// npm install 的时间上限。npm 在慢网下确实可能耗时数分钟，故给足预算；
+/// 但绝不无限等待 —— 超时即杀进程并如实报错（引导页据此给出重试/回退）。
+const NPM_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+struct BoundedOutput {
+    success: bool,
+    code: Option<String>,
+    stdout: String,
+    stderr: String,
+}
+
+/// 有界执行子进程：超出 timeout 即 kill 并返回错误（绝不无限阻塞调用方）。
+fn run_command_bounded(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<BoundedOutput, String> {
+    use std::process::Stdio;   // std::io::Read 已在文件顶部导入
+
+    let dir = std::env::temp_dir();
+    let stamp = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let out_path = dir.join(format!("dsh-npm-out-{}.log", stamp));
+    let err_path = dir.join(format!("dsh-npm-err-{}.log", stamp));
+
+    let out_file = std::fs::File::create(&out_path).map_err(|e| format!("创建临时日志失败: {}", e))?;
+    let err_file = std::fs::File::create(&err_path).map_err(|e| format!("创建临时日志失败: {}", e))?;
+    cmd.stdout(Stdio::from(out_file));
+    cmd.stderr(Stdio::from(err_file));
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("npm 启动失败: {}（Node 就绪后才能安装内核）", e))?;
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let partial = read_log(&err_path);
+                    let _ = std::fs::remove_file(&out_path);
+                    let _ = std::fs::remove_file(&err_path);
+                    return Err(format!(
+                        "安装超时（超过 {} 分钟未完成）{}",
+                        timeout.as_secs() / 60,
+                        if partial.is_empty() { String::new() } else { format!("；最后输出：{}", tail(&partial, 400)) }
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&out_path);
+                let _ = std::fs::remove_file(&err_path);
+                return Err(format!("等待 npm 进程失败: {}", e));
+            }
+        }
+    };
+
+    let stdout = read_log(&out_path);
+    let stderr = read_log(&err_path);
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&err_path);
+
+    Ok(BoundedOutput {
+        success: status.success(),
+        code: status.code().map(|c| c.to_string()),
+        stdout,
+        stderr,
+    })
+}
+
+fn read_log(p: &Path) -> String {
+    let mut s = String::new();
+    if let Ok(mut f) = std::fs::File::open(p) {
+        let _ = f.read_to_string(&mut s);
+    }
+    s
 }
 
 
