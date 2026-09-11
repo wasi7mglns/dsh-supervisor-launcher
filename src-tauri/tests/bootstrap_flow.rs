@@ -125,7 +125,7 @@ fn b5_download_progress_is_wired() {
         "B5 FAIL 前端未监听下载进度事件（下载阶段将零反馈）"
     );
     assert!(html.contains("progBar"), "B5 FAIL 缺少进度条元素");
-    let m = main_rs();
+    let m = crate_sources();
     assert!(
         m.contains("shell_update_progress"),
         "B5 FAIL Rust 侧未上报下载进度"
@@ -135,7 +135,7 @@ fn b5_download_progress_is_wired() {
 
 #[test]
 fn b6_rust_check_timeout_and_pending_before_install() {
-    let m = main_rs();
+    let m = crate_sources();
     assert!(m.contains("SHELL_CHECK_TIMEOUT"), "B6 FAIL 缺少检查超时常量");
     assert!(m.contains("SHELL_DOWNLOAD_TIMEOUT"), "B6 FAIL 缺少下载超时常量");
     assert!(m.contains("tokio::time::timeout"), "B6 FAIL 未使用 tokio 超时包裹网络调用");
@@ -379,7 +379,7 @@ fn b16_min_node_gate_is_enforced_in_frontend() {
     let html = bootstrap_html();
     assert!(html.contains("st.minOk === false"), "B16 FAIL 前端未校验 Node 最低门槛");
     assert!(html.contains("minRequired"), "B16 FAIL 前端未使用后端回传的最低要求");
-    let m = main_rs();
+    let m = crate_sources();
     assert!(m.contains("minRequired"), "B16 FAIL 后端未回传 minRequired");
     eprintln!("B16 PASS min-node gate enforced");
 }
@@ -560,7 +560,7 @@ fn b26_bounded_probe_runtime_exists() {
 /// B27：node_status 必须**立即返回**并支持轮询 —— 不得 await 探测到底。
 #[test]
 fn b27_node_status_is_pollable_not_blocking() {
-    let m = main_rs();
+    let m = crate_sources();
     // 必须暴露轮询所需字段
     assert!(m.contains("\"probing\""), "B27 FAIL node_status 未回传 probing（前端无法轮询）");
     assert!(m.contains("\"stuck\""), "B27 FAIL node_status 未回传 stuck（无法显示卡在哪）");
@@ -668,11 +668,14 @@ fn platform_sources() -> String {
 ///   故本助手只用于「逻辑存在性」，不用于「位于哪一层」。
 fn crate_sources() -> String {
     let mut out = main_rs();
-    let dir = manifest_dir().join("src").join("domain");
-    if let Ok(rd) = fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            if e.path().extension().and_then(|x| x.to_str()) == Some("rs") {
-                out.push_str(&fs::read_to_string(e.path()).unwrap_or_default());
+    // 命令已迁入 src/commands/mod.rs（2026-09-11 分层），一并纳入。
+    for sub in ["domain", "commands"] {
+        let dir = manifest_dir().join("src").join(sub);
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                if e.path().extension().and_then(|x| x.to_str()) == Some("rs") {
+                    out.push_str(&fs::read_to_string(e.path()).unwrap_or_default());
+                }
             }
         }
     }
@@ -743,7 +746,7 @@ fn b32_no_bare_blocking_command_calls() {
 /// B33：`guard_start` 必须两侧都有超时（服务管理器挂起 → 引导页永久停住）。
 #[test]
 fn b33_guard_start_has_timeout() {
-    let m = main_rs();
+    let m = crate_sources();
     assert!(m.contains("GUARD_TOTAL_BUDGET"), "B33 FAIL guard_start 缺总预算");
     assert!(
         m.contains("tokio::time::timeout(GUARD_TOTAL_BUDGET"),
@@ -770,7 +773,7 @@ fn b34_guard_progress_is_reported() {
 /// B35：阻塞工作不得留在主线程（同步命令执行二进制会占住 UI 数十秒）。
 #[test]
 fn b35_blocking_work_not_on_main_thread() {
-    let m = main_rs();
+    let m = crate_sources();
     assert!(
         m.contains("async fn core_status"),
         "B35 FAIL core_status 仍是同步命令（会占主线程执行二进制）"
@@ -786,7 +789,7 @@ fn b35_blocking_work_not_on_main_thread() {
 #[test]
 fn b36_tray_io_off_ui_thread() {
     // 派发函数已迁 domain/localhttp.rs；「托盘回调是否用它」仍看 main.rs。
-    let m = main_rs();
+    let m = crate_sources();
     assert!(crate_sources().contains("spawn_local_post"), "B36 FAIL 缺 off-thread 派发函数");
     assert!(
         m.contains(r#""start" => domain::localhttp::spawn_local_post("#),
@@ -1356,4 +1359,72 @@ fn g1_all_rust_sources_is_recursive() {
         "G1' FAIL 未枚举到顶层 main.rs"
     );
     eprintln!("G1' PASS all_rust_sources recursive ({} files)", srcs.len());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// G2：命令层只做校验与委托（不得直接执行外部命令 / 不得有平台分支）
+//
+// 背景：`main.rs` 改造前 1420 行，混装 IPC 命令 + 平台逻辑 + 业务逻辑。
+// 拆出 `commands/` 后，必须**防回潮** —— 否则第一万次「就加一行」会把它变回去。
+//
+// G1 已单独禁止 `commands/` 出现平台分支；此处补「不得直接 spawn」。
+// ═══════════════════════════════════════════════════════════════════════════
+#[test]
+fn g2_commands_layer_only_delegates() {
+    let dir = manifest_dir().join("src").join("commands");
+    let mut offenders: Vec<String> = Vec::new();
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if e.path().extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            let src = fs::read_to_string(e.path()).unwrap_or_default();
+            for (i, line) in src.lines().enumerate() {
+                let t = line.trim();
+                if t.starts_with("//") {
+                    continue;
+                }
+                // 直接构造外部命令 = 业务/平台逻辑泄漏
+                if t.contains("std::process::Command::new") || t.contains("process::Command::new") {
+                    offenders.push(format!("{}:{} {}", name, i + 1, t));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "G2 FAIL 命令层出现外部命令调用（应经 domain/platform）：\n{}",
+        offenders.join("\n")
+    );
+    eprintln!("G2 PASS commands layer only delegates");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// G3：`main.rs` 必须保持「只做组装」（防单体回潮）
+//
+// 改造前 1420 行；拆出 domain/ + commands/ 后 469 行。
+// 上限设为 **550** 行：给出合理余量（新增一个命令约 10 行），
+// 但一旦有人把业务写回 main.rs 就会触发。
+//
+// ⚠ 为什么不设 150（目标值）：目标值需要把 `setup()` 内的窗口/托盘装配也拆出，
+//   那属于后续工作；**门禁应当锁定当前已达成的水平并能防止退化**，
+//   而不是设一个当下即红的数字（红了就会被 `#[ignore]` 掉，门禁形同虚设）。
+// ═══════════════════════════════════════════════════════════════════════════
+#[test]
+fn g3_main_rs_stays_assembly_only() {
+    let src = main_rs();
+    let n = src.lines().count();
+    assert!(
+        n <= 550,
+        "G3 FAIL main.rs 已 {} 行（上限 550）—— 业务应下沉到 domain/，命令应放入 commands/",
+        n
+    );
+    // 强断言：main.rs 不得再定义 `#[tauri::command]`（命令必须全在 commands/）
+    let cmd_count = src.matches("#[tauri::command]").count();
+    assert_eq!(cmd_count, 0, "G3 FAIL main.rs 仍在定义 IPC 命令（{} 个）", cmd_count);
+    // 强断言：命令层必须真的存在
+    let cdir = manifest_dir().join("src").join("commands");
+    assert!(cdir.join("mod.rs").is_file(), "G3 FAIL 缺少 src/commands/mod.rs");
+    eprintln!("G3 PASS main.rs is assembly-only ({} lines)", n);
 }
