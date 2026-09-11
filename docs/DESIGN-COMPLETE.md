@@ -21,7 +21,7 @@
 | **C** | 结构化错误 `ShellError` | ✅ 完成（曾因 `mod error;` 丢失成孤儿文件，已修复并接线）|
 | **D** | 契约层 M1–M5（镜像目录归壳 / 探测统一 / Node 门槛 / 版本向量）| ✅ 完成 |
 | **E** | 前端：全局错误上报 + IPC 自检 + 门禁 G5 | ⚠ **部分** —— 802 行单块脚本尚未拆为 8 模块 |
-| **F** | 内核缺陷 K1–K10 + M6 有界执行 | ⚠ **部分** —— 见下表 K3/K4/K5 |
+| **F** | 内核缺陷 K1–K10 + M6 有界执行 | ✅ K1–K10 全部处理（K3 仅做到「相位不谎报」，状态源合并留待后续）|
 
 ### 壳侧缺陷 S1–S5
 
@@ -39,9 +39,9 @@
 |---|---|---|
 | **K1** | daemon 脚本路径全断（生产致命）| ✅ 修（`platform/srcpath.js` + 门禁 G10）|
 | **K2** | `platform/exec.js` 零引用 + 23 处无 timeout | ✅ 修（18 处绕过执行器的调用全部迁入 + 门禁 G9）|
-| **K3** | 双生命周期状态源（`managed.js` vs `objects.js`）| ❌ **未修**（两套 PHASES 仍并存）|
-| **K4** | `ManagedLifecycle.start` 忽略回调 `ok:false` | ❌ **未修**（`managed.js` 仍无条件置 running/healthy）|
-| **K5** | 影子决策未建模 `_crashHalted` | ❌ **未修** |
+| **K3** | 双生命周期状态源 | ⚠ **部分**：两套 PHASES 仍并存（视图从权威单向镜像，方向正确）；**但修掉了用户可见的相位谎报** —— `_syncRouterLifecycleView` 曾无条件置 `running`，现按观测 `ok` 区分 running/starting |
+| **K4** | `ManagedLifecycle.start` 忽略回调 `ok:false` | ✅ 修（`start`/`stop` 均尊重显式失败；保留「无 ok 字段=成功」兼容）；回归 `test/managed-lifecycle-failure-test.js`（13 项）|
+| **K5** | 影子决策未建模 `_crashHalted` | ✅ 修（快照补 `crashHalted`/`sessionHalting`，与 `_shouldRun()` 同序）；回归 `test/shadow-decision-test.js`（9 项）|
 | **K6** | `originAllowed` 只比端口不校验 host | ✅ 修（补 Host 闸 + 壳 origin；行为级断言）|
 | **K7** | `ports.js` 用 `HOME` 兜底 `/tmp` | ✅ 修（改 `os.homedir()`）|
 | **K8** | 平台命令泄漏到业务层 | ✅ 修（下沉 `platform/os/netinfo.js`）|
@@ -70,7 +70,8 @@
 | G9 | 仅 `platform/exec.js` 可调用 `execFileSync` | 内核 |
 | G10 | 受管 daemon 脚本路径必须可解析 | 内核 |
 
-**明确未执行**：K3 / K4 / K5，以及批 E 的前端模块拆分。
+**明确未执行**：K3 的**状态源合并**（两套 PHASES 仍并存；但视图镜像方向正确且相位不再谎报），
+以及批 E 的前端模块拆分（802 行单块脚本）。
 
 
 ---
@@ -627,7 +628,7 @@ bootstrap/
 | F3 | **K2**：`platform/exec.js` 接入全部 `execFileSync`（或删除并统一到 `bounded` 等价物）+ 加「禁裸 exec」门禁 | 无 timeout 的 `execFileSync` 归零 |
 | F4 | K6：`originAllowed` 增加 host 校验（补上 `identity.js` 声称的 Host 闸）| 新增 rebinding 测试 |
 | F5 | K7/K8/K9/K10：`ports.js` HOME 兜底 / 平台命令下沉 / 正则修正 / manifest 保留 | 逐条断言 |
-| F6 | K3/K4/K5：生命周期双源收敛、`start` 尊重 `ok:false`、影子建模 `crashHalted` | `/lifecycle/status` 不再谎报 |
+| F6 | K3/K4/K5：生命周期双源收敛、`start` 尊重 `ok:false`、影子建模 `crashHalted` | ✅ K4/K5 完成；K3 仅完成「相位不谎报」 |
 
 ## 21. 门禁清单（规范的可执行化）
 
