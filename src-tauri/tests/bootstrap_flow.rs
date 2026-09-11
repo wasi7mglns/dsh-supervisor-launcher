@@ -939,7 +939,7 @@ fn b41_polling_loops_have_independent_heartbeat() {
     eprintln!("B41 PASS polling loops have heartbeat");
 }
 
-/// B42：macOS 的平台标签必须与 `platform_file()` 选定的产物**语义一致**。
+/// B42：macOS 的平台标签必须与 `platform_artifact()` 选定的产物**语义一致**。
 ///
 /// 原实现 arm64 用 `osx-arm64-tar` 判定、却下载 `.pkg` —— 靠两者恰好都存在而侥幸可用。
 /// 实测（逐版本核对官方 index.json）：`osx-x64-pkg` 所有 LTS 都存在，

@@ -11,8 +11,8 @@
 //!
 //! == 关键的分层违规（本层存在的直接动因）==
 //!
-//! 「服务定义」曾在顶层 `service.rs`（`ensure_defined`），而「服务启停」(`start_guard_service`
-//! / `stop_guard_service`) 在 `main.rs` —— **同一个概念的 per-OS 知识分居两层**，
+//! 「服务定义」曾在顶层 `service.rs`（`ensure_defined`），而「服务启停」
+//! (`start_guard_service` / `stop_guard_service`) 曾在 `main.rs` —— **同一个概念的 per-OS 知识分居两层**，
 //! 各自带 4 份 `#[cfg]`。加一个平台要改两处**不同层**，且很容易只改一处。
 //!
 //! 现合并进同一个 [`service::ServiceControl`]：**定义与启停永远是同一个对象**。
