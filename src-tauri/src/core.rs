@@ -227,6 +227,15 @@ pub fn latest_version(pkg: &str) -> Result<(String, String), String> {
     }
 }
 
+/// 无 GUI 场景下定位内核可执行文件（与 main.rs 的 locate_core 同一候选集）。
+/// 供 --service-plan 等 CLI 自检使用：它们没有 AppHandle。
+pub fn locate_core_for_cli() -> Option<std::path::PathBuf> {
+    // CLI 无 AppHandle → 不提供资源目录兜底（那是 GUI 形态的最后一层）
+    crate::locate_core_candidates(None)
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
 /// 内核包目录（<pkg>/bin/<exe> → <pkg>）。
 fn package_dir_of(bin: &Path) -> Option<PathBuf> {
     let bin_dir = bin.parent()?;              // <pkg>/bin

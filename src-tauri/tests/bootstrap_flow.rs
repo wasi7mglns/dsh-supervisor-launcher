@@ -471,3 +471,29 @@ fn b23_preset_sets_are_consistent() {
     }
     eprintln!("B23 PASS preset sets consistent");
 }
+
+/// B24：服务定义自检入口必须存在（P0 修复的可诊断性）。
+/// 若服务定义建立失败，用户会卡在「守卫就绪」却无从自查；本入口提供无 GUI 的自检与建立。
+#[test]
+fn b24_service_plan_cli_exists() {
+    let m = main_rs();
+    assert!(m.contains("--service-plan"), "B24 FAIL 缺 --service-plan 自检入口");
+    assert!(m.contains("--service-apply"), "B24 FAIL 缺 --service-apply 实际建立开关");
+    assert!(m.contains("cli_service_plan"), "B24 FAIL 缺 cli_service_plan 实现");
+    assert!(m.contains("DSH_GUARD_BIN"), "B24 FAIL 缺守卫路径覆盖（诊断/测试隔离用）");
+    assert!(m.contains("definition_path"), "B24 FAIL 未报告服务定义路径");
+    eprintln!("B24 PASS service-plan CLI present");
+}
+
+/// B25：无 GUI 定位守卫时不得要求 AppHandle（CLI 路径必须可独立工作）。
+#[test]
+fn b25_candidates_work_without_apphandle() {
+    let m = main_rs();
+    assert!(
+        m.contains("fn locate_core_candidates(resource_dir: Option<PathBuf>)"),
+        "B25 FAIL 候选定位仍要求 AppHandle（CLI 无法复用）"
+    );
+    let c = fs::read_to_string(manifest_dir().join("src").join("core.rs")).expect("core.rs");
+    assert!(c.contains("locate_core_for_cli"), "B25 FAIL 缺 CLI 专用定位函数");
+    eprintln!("B25 PASS candidates usable without AppHandle");
+}

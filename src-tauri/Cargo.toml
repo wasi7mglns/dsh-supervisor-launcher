@@ -1,6 +1,6 @@
 [package]
 name = "dsh-supervisor-gui"
-version = "1.0.3"
+version = "1.0.4"
 description = "DSH lifecycle guard desktop shell (env bootstrap + panel)"
 edition = "2021"
 

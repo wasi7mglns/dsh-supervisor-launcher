@@ -197,7 +197,9 @@ fn core_exe_names() -> &'static [&'static str] {
 ///   - macOS:   /opt/homebrew/bin（Apple Silicon）、/usr/local/bin（Intel）
 ///   - Unix:    ~/.npm-global/bin、~/.local/bin（内核 install 写入的软链）
 ///   - 资源目录内嵌兜底（旧版过渡）
-fn locate_core_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
+///
+/// `resource_dir` 为 None 时跳过「资源目录内嵌兜底」——CLI 自检（无 AppHandle）走这条。
+fn locate_core_candidates(resource_dir: Option<PathBuf>) -> Vec<PathBuf> {
     let home = env::home();
     let mut out: Vec<PathBuf> = Vec::new();
     let mut add = |p: PathBuf, out: &mut Vec<PathBuf>| {
@@ -237,7 +239,7 @@ fn locate_core_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
         add(home.join(".npm-global").join("bin").join(name), &mut out);
         add(home.join(".local").join("bin").join(name), &mut out);
     }
-    if let Ok(res) = app.path().resource_dir() {
+    if let Some(res) = resource_dir {
         for name in core_exe_names().iter().copied() { add(res.join("bin").join(name), &mut out); }
     }
     out
@@ -245,7 +247,7 @@ fn locate_core_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
 
 /// 定位已安装内核：多候选**按版本最高**仲裁（K5 修复）——旧内核不得遮蔽新内核。
 fn locate_core(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let cands = locate_core_candidates(app);
+    let cands = locate_core_candidates(app.path().resource_dir().ok());
     if cands.is_empty() { return None; }
     let mut best: Option<(PathBuf, String)> = None;
     for c in &cands {
@@ -935,7 +937,69 @@ fn shell_restart(app: tauri::AppHandle) {
     app.restart();
 }
 
+/// 无头自检：**守卫服务定义**（P0 关键修复的功能验证入口）。
+///
+/// 为什么需要它：服务定义由壳在首启时建立，若失败，用户会卡在「守卫就绪」而**无法自查**
+/// （GUI 进不去、日志分散）。本入口让你在任何平台无 GUI 地确认：
+///   · 服务定义将写到哪个路径；
+///   · 当前是否存在；
+///   · 守卫可执行文件是否已定位；
+///   · `--service-apply` 时**实际建立**并报告结果。
+///
+/// 用法：
+///   dsh-supervisor-gui --service-plan              # 只报告，不写盘
+///   dsh-supervisor-gui --service-plan --service-apply   # 实际建立服务定义
+fn cli_service_plan() -> i32 {
+    use std::path::{Path, PathBuf};
+    println!("== 守卫服务定义自检 ==");
+    println!("平台          = {}", std::env::consts::OS);
+    println!("服务定义路径  = {}", service::definition_path().display());
+    println!("现存          = {}", if service::definition_path().is_file() { "是" } else { "否" });
+    println!("HOME          = {}", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| "(未设置)".into()));
+
+    // 守卫可执行文件定位（与实际 ensure_guard 同一路径推导，避免「自检通过但运行时找不到」）。
+    // DSH_GUARD_BIN 可显式覆盖：用于①自动定位失败的机器做诊断 ②测试隔离 HOME。
+    let guard: Option<PathBuf> = std::env::var("DSH_GUARD_BIN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(core::locate_core_for_cli);
+    match &guard {
+        Some(p) => {
+            println!("守卫可执行    = {}", p.display());
+            println!("守卫存在      = {}", if p.is_file() { "是" } else { "否" });
+        }
+        None => println!("守卫可执行    = （未定位到，请先安装内核）"),
+    }
+
+    let apply = std::env::args().any(|a| a == "--service-apply");
+    if !apply {
+        println!("");
+        println!("（未写盘。加 --service-apply 实际建立服务定义）");
+        return 0;
+    }
+    let Some(g) = guard else {
+        eprintln!("无法建立：未定位到守卫可执行文件（先安装内核）");
+        return 2;
+    };
+    match service::ensure_defined(&g) {
+        Ok(desc) => {
+            println!("");
+            println!("建立结果      = {}", desc);
+            println!("建立后现存    = {}", if service::definition_path().is_file() { "是" } else { "否" });
+            0
+        }
+        Err(e) => {
+            eprintln!("建立失败      = {}", e);
+            1
+        }
+    }
+}
 fn main() {
+    // 无头自检：守卫服务定义（P0 修复的功能验证入口，任何平台可用）。
+    if std::env::args().any(|a| a == "--service-plan") {
+        std::process::exit(cli_service_plan());
+    }
     // 无头冒烟入口：--node-plan 仅打印环境探针 + 官方最新 LTS，不启动窗口。
     if std::env::args().any(|a| a == "--node-plan") {
         std::process::exit(cli_plan());

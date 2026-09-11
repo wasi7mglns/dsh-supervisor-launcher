@@ -4,7 +4,69 @@
 
 ## [未发布]
 
-以下修复**已完成代码与测试，尚未构建/发布**（按用户要求：先逐项确认后再构建）。
+（下一版本待记）
+
+## [1.0.4]（2026-09-11）
+
+### 新增：守卫服务定义自检入口（P0 修复的可诊断性）
+
+P0（壳自持服务定义）是本版最关键的修复，但若它在某台机器上失败，用户会卡在「守卫就绪」
+却**无从自查** —— GUI 进不去、日志分散、也没有命令行入口。
+
+故新增两个无 GUI 自检入口（任何平台可用）：
+
+```
+dsh-supervisor-gui --service-plan                # 只报告，不写盘
+dsh-supervisor-gui --service-plan --service-apply # 实际建立服务定义
+```
+
+输出服务定义路径、是否现存、守卫可执行文件定位结果；`--service-apply` 时实际建立并报告结果。
+
+另新增 `DSH_GUARD_BIN` 环境变量覆盖守卫路径 —— 用于①自动定位失败的机器做诊断 ②测试隔离 HOME。
+
+**功能验证**（干净 HOME + 真实守卫路径）：
+
+```
+平台          = linux
+服务定义路径  = ~/.config/systemd/user/dsh-supervisor.service
+现存          = 否
+守卫可执行    = /home/bowen/.npm-global/lib/node_modules/@dsh-sup/dsh-core-linux-x64/bin/dsh-supervisor
+守卫存在      = 是
+
+建立结果      = 已建立并启用 ~/.config/systemd/user/dsh-supervisor.service
+建立后现存    = 是
+```
+
+生成的 unit 正文（`ExecStart` 指向真实守卫路径）：
+
+```ini
+[Unit]
+Description=dsh-supervisor - DSH lifecycle guard
+After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/home/bowen/.npm-global/lib/node_modules/@dsh-sup/dsh-core-linux-x64/bin/dsh-supervisor daemon
+Restart=always
+RestartSec=5
+KillMode=process
+
+[Install]
+WantedBy=default.target
+```
+
+幂等性验证：第二次执行返回「已存在」，不重复写入。
+`--service-plan`（不带 `--service-apply`）**不写盘**（已断言）。
+
+**这同时修复了一个结构性问题**：`locate_core_candidates` 原先要求 `AppHandle`，
+导致无 GUI 场景无法复用同一套内核定位逻辑。现改为 `Option<PathBuf>` 资源目录参数，
+CLI 路径传 `None` —— 保证「自检」与「运行时」走**同一套路径推导**，避免自检通过但运行时找不到。
+
+回归防护：B24（自检入口存在）、B25（无 AppHandle 可定位）。
+
+本次为**架构级修复 + 镜像适配**，按用户要求逐项确认后才构建。
 
 ### 新功能：壳内镜像源适配（三条下载链路全覆盖，用户要求）
 
