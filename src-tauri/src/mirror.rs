@@ -224,11 +224,36 @@ pub struct Probe {
     pub body: Option<String>,
 }
 
+/// npm registry 的探测探针包名（**必须是一个真实存在的包**）。
+///
+/// ⚠ 为什么不能用空路径或根路径（2026-09-11 修复）：
+///   原实现对 npm 源传 `""`，实际请求 `https://<源>/`—— 而多数 registry 根路径返回
+///   **404**（它们只服务包元数据 API）。于是**健康的源被判为「不可达」**：
+///   实测腾讯云 npm 镜像连测 3 次均 HTTP 200、能正确返回我们的包，
+///   却因为根路径 404 而在测速中显示「不可达」，进而被排除在选择之外。
+///   这是**探测方法错误**，不是源失效 —— 会让壳无谓地少一个可用镜像。
+///
+/// 改用我们自己的平台包做探针：它是真实存在的包，且与最终用途一致。
+fn npm_probe_path() -> String {
+    // 探测用包：优先内核平台包（真实存在）；失败时退回一个必然存在的小包。
+    crate::core::package_name().unwrap_or_else(|_| "@dsh-sup/dsh-core-linux-x64".to_string())
+}
+
 /// **并行**探测全部候选：对每个源请求 path，记录延迟与响应体。
 ///
 /// 用 std::thread::scope（std 自带，无需新依赖）实现并发；
 /// 单源超时 PROBE_TIMEOUT，整体耗时约为其中最慢者而非累加。
+///
+/// `path` 为空时视为 **npm registry 探测**：自动使用真实包名而非根路径。
 pub fn probe_all(sources: &[String], path: &str) -> Vec<Probe> {
+    // 空 path → npm 探测：用真实包名（根路径会 404，导致健康源被误判不可达）。
+    let owned;
+    let path = if path.is_empty() {
+        owned = npm_probe_path();
+        owned.as_str()
+    } else {
+        path
+    };
     let out: Mutex<Vec<Probe>> = Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for src in sources {
@@ -279,4 +304,98 @@ pub fn cache_fresh(m: &Mirrors) -> bool {
         Some(t) => now_secs().saturating_sub(t) < CACHE_TTL_SECS,
         None => false,
     }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 镜像「一等公民」：全程可见 + 预热缓存（2026-09-11 架构修复）
+//
+// == 问题（用户实测指出） ==
+//
+// 用户反馈「连镜像源都看不到，根本不会去选择镜像源」。查代码后确证：
+//   `afterEnv` 只在「未装 Node」或「Node 版本过低」时才调 probeMirrorThen ——
+//   **Node 达标的用户（主力用户）永远看不到镜像**，诊断串必然 mirror=none。
+//   而 `core_plan` / `core_apply` 内部算了镜像源，却**完全不回传** ——
+//   用户看着「正在检查内核版本」，无从知晓壳选了哪个源。
+//
+// == 修复思路 ==
+//
+// 镜像不是「下载 Node 的辅助」，而是**壳所有网络动作的基础设施**。
+// 故把它提升为一等公民：
+//   1) **预热**：引导开始即在后台并行测速（不阻塞任何步骤）；
+//   2) **全程可读**：任何时刻查询都返回缓存结果（无网络 I/O）；
+//   3) **写透诊断**：诊断串始终带 mirror / mirror_probes。
+//
+// 这样「有没有选镜像、选了谁、延迟多少」在任何情况下都是**事实**，而不是观感。
+// ════════════════════════════════════════════════════════════════════
+
+/// 预热结果缓存：`None` 表示尚未测速完成。
+static WARM: std::sync::OnceLock<Mutex<Option<ProbeSnapshot>>> = std::sync::OnceLock::new();
+
+fn warm() -> &'static Mutex<Option<ProbeSnapshot>> {
+    WARM.get_or_init(|| Mutex::new(None))
+}
+
+/// 一次预热的结果快照（含逐源延迟，供诊断展示）。
+#[derive(Clone)]
+pub struct ProbeSnapshot {
+    /// 选中的 Node 源（最快且提供目标版本者；预热阶段仅取最快可达）。
+    pub node_best: Option<String>,
+    pub node_latency_ms: Option<u128>,
+    pub node_probes: Vec<(String, bool, u128)>,
+    pub npm_best: Option<String>,
+    pub npm_latency_ms: Option<u128>,
+    pub npm_probes: Vec<(String, bool, u128)>,
+    pub at: u64,
+}
+
+/// 读预热缓存（**无 I/O**，任何时刻可安全调用）。
+pub fn cached() -> Option<ProbeSnapshot> {
+    match warm().lock() {
+        Ok(g) => g.clone(),
+        Err(e) => e.into_inner().clone(),
+    }
+}
+
+/// 是否已在飞（避免重复预热）。
+static WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 后台预热镜像测速：**立即返回**，结果稍后经 `cached()` 读取。
+///
+/// 设计要点：预热在独立线程中做全部网络 I/O，故调用方（引导页）**绝不阻塞**；
+/// 这使「镜像全程可见」不再与「是否需要下载 Node」耦合。
+pub fn warmup_async() {
+    if WARMING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return; // 已有在飞预热
+    }
+    let _ = std::thread::Builder::new()
+        .name("mirror-warmup".to_string())
+        .spawn(|| {
+            let m = load();
+            // 两组并行探测（各自内部已并行）
+            let node_p = probe_all(&m.node, "index.json");
+            let npm_p = probe_all(&m.npm, "");
+            let pick = |v: &[Probe]| -> (Option<String>, Option<u128>, Vec<(String, bool, u128)>) {
+                let best = v.iter().find(|p| p.ok);
+                (
+                    best.map(|p| p.source.clone()),
+                    best.map(|p| p.latency_ms),
+                    v.iter().map(|p| (p.source.clone(), p.ok, p.latency_ms)).collect(),
+                )
+            };
+            let (nb, nl, np) = pick(&node_p);
+            let (mb, ml, mp) = pick(&npm_p);
+            let snap = ProbeSnapshot {
+                node_best: nb,
+                node_latency_ms: nl,
+                node_probes: np,
+                npm_best: mb,
+                npm_latency_ms: ml,
+                npm_probes: mp,
+                at: now_secs(),
+            };
+            if let Ok(mut g) = warm().lock() {
+                *g = Some(snap);
+            }
+            WARMING.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
 }

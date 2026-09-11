@@ -118,6 +118,35 @@ async fn node_status(app: tauri::AppHandle) -> serde_json::Value {
     o
 }
 
+/// 预热镜像测速（立即返回，结果稍后经 mirror_cached 读取）。
+///
+/// 为什么单独成命令：镜像信息必须**与「是否需要下载 Node」解耦** ——
+/// 否则 Node 已达标的用户（主力用户）永远看不到壳选了哪个源。
+#[tauri::command]
+fn mirror_warmup() -> serde_json::Value {
+    mirror::warmup_async();
+    serde_json::json!({ "ok": true })
+}
+
+/// 读镜像预热缓存（**无网络 I/O**，任何时刻可安全轮询）。
+#[tauri::command]
+fn mirror_cached() -> serde_json::Value {
+    match mirror::cached() {
+        Some(s) => serde_json::json!({
+            "ready": true,
+            "nodeBest": s.node_best,
+            "nodeLatencyMs": s.node_latency_ms,
+            "npmBest": s.npm_best,
+            "npmLatencyMs": s.npm_latency_ms,
+            "npmProbes": s.npm_probes.iter().map(|(src, ok, ms)| serde_json::json!({
+                "source": src, "ok": ok, "latencyMs": ms
+            })).collect::<Vec<_>>(),
+            "at": s.at,
+        }),
+        None => serde_json::json!({ "ready": false }),
+    }
+}
+
 /// 网络侧元数据：最新 LTS + **镜像选择结果**（与本地环境检测彻底分离）。
 #[tauri::command]
 async fn node_latest() -> serde_json::Value {
@@ -685,6 +714,50 @@ fn is_alive(port: u16) -> bool {
 /// 靠读代码无法确定。本入口在有界预算内跑完探测并打印**逐候选追踪**，
 /// 卡住时也能看到「卡在谁、多久」—— 这是定位该类问题唯一可靠的手段。
 /// 用法：dsh-supervisor-gui --env-plan
+/// 无头自检：**镜像测速与选择**。
+///
+/// 为什么需要：用户曾反馈「连镜像源都看不到，根本不会去选择镜像源」。
+/// 功能本身是好的，但可见性缺失会被合理地理解为能力不存在。
+/// 本入口把「测了哪些源、各自延迟、最终选了谁」变成**可核对的事实**。
+/// 用法：dsh-supervisor-gui --mirror-plan
+fn cli_mirror_plan() -> i32 {
+    println!("== 镜像测速自检 ==");
+    let m = mirror::load();
+    println!("Node 候选 {} 个 / npm 候选 {} 个", m.node.len(), m.npm.len());
+    println!("");
+    println!("--- 并行测速（Node index.json）---");
+    let np = mirror::probe_all(&m.node, "index.json");
+    for p in &np {
+        println!(
+            "  {:<48} {} {:>6} ms",
+            p.source,
+            if p.ok { "可达" } else { "不可达" },
+            p.latency_ms
+        );
+    }
+    println!("");
+    println!("--- 并行测速（npm registry）---");
+    let pp = mirror::probe_all(&m.npm, "");
+    for p in &pp {
+        println!(
+            "  {:<48} {} {:>6} ms",
+            p.source,
+            if p.ok { "可达" } else { "不可达" },
+            p.latency_ms
+        );
+    }
+    println!("");
+    match np.iter().find(|p| p.ok) {
+        Some(b) => println!("Node 选中: {} ({} ms)", b.source, b.latency_ms),
+        None => println!("Node 选中: 无（全部不可达）"),
+    }
+    match pp.iter().find(|p| p.ok) {
+        Some(b) => println!("npm  选中: {} ({} ms)", b.source, b.latency_ms),
+        None => println!("npm  选中: 无（全部不可达）"),
+    }
+    0
+}
+
 fn cli_env_plan() -> i32 {
     println!("== 环境探测自检 ==");
     println!("平台          = {}", std::env::consts::OS);
@@ -1200,6 +1273,10 @@ fn cli_service_plan() -> i32 {
     }
 }
 fn main() {
+    // 无头自检：镜像测速与选择（用户要求「镜像必须可见」的验证入口）。
+    if std::env::args().any(|a| a == "--mirror-plan") {
+        std::process::exit(cli_mirror_plan());
+    }
     // 无头自检：环境探测（架构修复后的可诊断入口）。
     if std::env::args().any(|a| a == "--env-plan") {
         std::process::exit(cli_env_plan());
@@ -1236,7 +1313,7 @@ fn main() {
         // app.restart()：更新安装后重启进入新版本（旧进程装、新进程跑）。
         .plugin(tauri_plugin_process::init())
         .manage(Mutex::new(RunState::default()))
-        .invoke_handler(tauri::generate_handler![node_status, core_status, core_plan, core_apply, guard_start, guard_ready, start_node_install, finish_boot, win_ctl, shell_identity, shell_update_check, shell_update_apply, shell_restart, shell_set_phase, mirror_status, mirror_set, node_latest])
+        .invoke_handler(tauri::generate_handler![node_status, core_status, core_plan, core_apply, guard_start, guard_ready, start_node_install, finish_boot, win_ctl, shell_identity, shell_update_check, shell_update_apply, shell_restart, shell_set_phase, mirror_status, mirror_set, node_latest, mirror_warmup, mirror_cached])
         .setup(|app| {
             // 托盘直发本地 API 的端口：显式 DSH_SUPERVISOR_TRAY_PORT 优先，否则从用户 config.apiPort 解析
             let port: u16 = std::env::var("DSH_SUPERVISOR_TRAY_PORT")

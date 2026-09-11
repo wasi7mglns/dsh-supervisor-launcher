@@ -923,3 +923,70 @@ fn b46_windows_paths_from_env_not_hardcoded() {
     assert!(e.contains("ProgramFiles(x86)"), "B46 FAIL 未覆盖 Program Files (x86)");
     eprintln!("B46 PASS windows paths from env");
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// 数据流门禁（2026-09-11 用户质疑驱动）
+//
+// 用户指出：「镜像源都看不到…出现了很多东西丢失的状态」。
+// 查证后确认**不是能力丢失，是可见性丢失** —— 外壳做了工作，用户什么都看不到：
+//   · afterEnv 只在「未装/过低 Node」时才测镜像 → Node 达标的**主力用户**永远看不到；
+//   · core_plan 早已回传 registry（命中的镜像），但前端**从未使用** —— 数据链路断了。
+// 经全字段审计，共 **9 个字段**后端产出而前端未用。
+//
+// 故加此门禁：**后端回传的关键字段必须在前端被消费**，否则信息等于不存在。
+// ═══════════════════════════════════════════════════════════════════
+
+/// B49：镜像信息必须「全程可见」——不得只在需要下载 Node 时才产生。
+#[test]
+fn b49_mirror_visible_regardless_of_node_state() {
+    let h = bootstrap_html();
+    // 必须与引导并行预热（而非在下载分支里才测速）
+    assert!(h.contains("startMirrorWarmup"), "B49 FAIL 缺镜像预热入口");
+    assert!(h.contains("mirror_warmup"), "B49 FAIL 未调用 mirror_warmup");
+    assert!(h.contains("mirror_cached"), "B49 FAIL 未读取镜像缓存");
+    // 预热必须在 boot 中启动（与步骤无关）
+    let boot = h.find("function boot()").expect("B49 FAIL 缺 boot");
+    let boot_body = &h[boot..(boot + 900).min(h.len())];
+    assert!(boot_body.contains("startMirrorWarmup()"), "B49 FAIL boot 未启动镜像预热");
+    // 诊断串必须始终带镜像（含「预热中」这种明确状态，而非 none）
+    assert!(h.contains("mirror_npm_best="), "B49 FAIL 诊断缺 mirror_npm_best");
+    assert!(h.contains("warming（预热中）"), "B49 FAIL 诊断未区分「预热中」与「不可达」");
+    eprintln!("B49 PASS mirror visible regardless of node state");
+}
+
+/// B50：`core_plan` 已回传的 `registry`（命中镜像）必须在前端被展示。
+#[test]
+fn b50_registry_field_is_consumed() {
+    let c = fs::read_to_string(manifest_dir().join("src").join("core.rs")).expect("core.rs");
+    assert!(c.contains("\"registry\""), "B50 FAIL core.rs 未回传 registry");
+    let h = bootstrap_html();
+    assert!(h.contains("p.registry"), "B50 FAIL 前端未消费 core_plan 的 registry（数据链路断裂）");
+    eprintln!("B50 PASS registry field consumed by frontend");
+}
+
+/// B51：内核安装步骤必须显示当前镜像（该步依赖镜像却曾无任何可见性）。
+#[test]
+fn b51_kernel_steps_show_mirror() {
+    let h = bootstrap_html();
+    assert!(h.contains("function mirrorText"), "B51 FAIL 缺统一的镜像文案函数");
+    let plan = h.find("function stepCorePlan()").expect("B51 FAIL 缺 stepCorePlan");
+    let plan_body = &h[plan..(plan + 2600).min(h.len())];
+    assert!(plan_body.contains("mirrorText()") || plan_body.contains("p.registry"), "B51 FAIL 内核步骤未展示镜像");
+    eprintln!("B51 PASS kernel steps show mirror");
+}
+
+/// B52：npm 镜像探测必须用**真实包名**，不能用根路径。
+///
+/// 根路径在多数 registry 上返回 404 → **健康的源被判「不可达」**。
+/// 实测：腾讯云 npm 连测 3 次均 HTTP 200、能正确返回我们的包，
+/// 却因根路径 404 而在测速中显示不可达，进而被排除在选择之外 ——
+/// **探测方法错误让壳无谓地少一个可用镜像**。
+#[test]
+fn b52_npm_probe_uses_real_package() {
+    let m = fs::read_to_string(manifest_dir().join("src").join("mirror.rs")).expect("mirror.rs");
+    assert!(m.contains("fn npm_probe_path"), "B52 FAIL 缺 npm 探测路径函数");
+    assert!(m.contains("package_name()"), "B52 FAIL npm 探测未用真实包名");
+    // probe_all 必须把空 path 转成真实包名
+    assert!(m.contains("if path.is_empty()"), "B52 FAIL probe_all 未处理空 path");
+    eprintln!("B52 PASS npm probe uses real package");
+}

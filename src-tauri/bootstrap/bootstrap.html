@@ -188,6 +188,12 @@
   var nodeVer = null;      // 当前 Node 版本
   var lastEnv = null;      // 最近一次 node_status 快照（诊断用：含候选追踪与「卡在谁」）
   var lastMirror = null;   // 最近一次镜像测速结果（诊断用：选了哪个源、延迟）
+  // 镜像「一等公民」（2026-09-11 架构修复）：
+  //   此前镜像信息只在「需要下载 Node」时才产生 —— Node 已达标的用户（主力用户）
+  //   **永远看不到**，诊断串必然 mirror=none。现改为引导开始即后台预热，
+  //   任何步骤都可展示「当前镜像」，与是否需要下载解耦。
+  var warmMirror = null;   // mirror_cached 的结果（含 nodeBest/npmBest 与逐源延迟）
+  var warmTimer = null;
   var envStuck = null;     // 环境探测卡住的候选（诊断用）
   var coreFrom = null;     // 更新前内核版本
   var coreTo = null;       // 更新后内核版本
@@ -293,8 +299,23 @@
       'env_probe_error=' + ((lastEnv && lastEnv.probeError) || 'none'),
       'env_stuck=' + (envStuck ? (envStuck.on + '/' + envStuck.ms + 'ms') : 'none'),
       'env_trace=' + ((lastEnv && lastEnv.trace && lastEnv.trace.length) ? lastEnv.trace.map(function (t) { return t.path + '(' + t.ms + 'ms,' + (t.ok ? 'ok' : 'no') + ',' + (t.note || '') + ')'; }).join(' > ') : 'none'),
-      'mirror=' + (lastMirror && lastMirror.mirror ? (lastMirror.mirror + '/' + lastMirror.latencyMs + 'ms') : 'none'),
-      'mirror_probes=' + ((lastMirror && lastMirror.probes && lastMirror.probes.length) ? lastMirror.probes.map(function (p) { return p.source + (p.ok ? '(' + p.latencyMs + 'ms)' : '(x)'); }).join(' > ') : 'none'),
+      // 镜像信息**必须始终有值**（2026-09-11 修复）：此前只在「需要下载 Node」时才有，
+      // 于是 Node 达标的用户诊断串永远是 mirror=none —— 让人合理地怀疑镜像能力不存在。
+      // 现从预热缓存读（与是否需要下载解耦），并在尚未就绪时明确说明「预热中」。
+      'mirror=' + (
+        (warmMirror && warmMirror.npmBest)
+          ? (warmMirror.npmBest + '/' + warmMirror.npmLatencyMs + 'ms')
+          : (lastMirror && lastMirror.mirror
+              ? (lastMirror.mirror + '/' + lastMirror.latencyMs + 'ms')
+              : (warmTimer ? 'warming（预热中）' : 'none（预热未启动或全部不可达）')))
+      'mirror_node_best=' + ((warmMirror && warmMirror.nodeBest) || 'none'),
+      'mirror_npm_best=' + ((warmMirror && warmMirror.npmBest) || 'none'),
+      'mirror_probes=' + (
+        (warmMirror && warmMirror.npmProbes && warmMirror.npmProbes.length)
+          ? warmMirror.npmProbes.map(function (p) { return p.source.replace(/^https?:\/\//, '') + (p.ok ? '(' + p.latencyMs + 'ms)' : '(x)'); }).join(' > ')
+          : ((lastMirror && lastMirror.probes && lastMirror.probes.length)
+              ? lastMirror.probes.map(function (p) { return p.source + (p.ok ? '(' + p.latencyMs + 'ms)' : '(x)'); }).join(' > ')
+              : 'none')),
       'error=' + (lastError || 'none'),
     ].join(' | ');
   }
@@ -513,6 +534,40 @@
     return stepNodeDone();
   }
 
+  // 镜像预热：引导开始即**后台**测速（立即返回，不阻塞任何步骤）。
+  // 为什么必须解耦：镜像不是「下载 Node 的辅助」，而是壳所有网络动作的基础设施 ——
+  // 内核安装（npm install -g）同样依赖它，而那一步若不显示镜像，用户无从判断。
+  function startMirrorWarmup() {
+    try { core.invoke('mirror_warmup').catch(function () {}); } catch (e) {}
+    var tries = 0;
+    if (warmTimer) clearInterval(warmTimer);
+    warmTimer = setInterval(function () {
+      tries++;
+      if (tries > 40) { clearInterval(warmTimer); warmTimer = null; return; }
+      // mirror_cached 是**纯读缓存**（无网络 I/O），可安全高频轮询
+      core.invoke('mirror_cached').then(function (m) {
+        if (!m || !m.ready) return;
+        warmMirror = m;
+        if (!lastMirror) lastMirror = { mirror: m.nodeBest, latencyMs: m.nodeLatencyMs, probes: m.npmProbes };
+        clearInterval(warmTimer); warmTimer = null;
+        var host = String(m.nodeBest || '').replace(/^https?:\/\//, '').split('/')[0];
+        if (host) status('镜像已就绪：' + host + '（' + m.nodeLatencyMs + 'ms）');
+      }).catch(function () {});
+    }, 600);
+  }
+
+  // 取「当前生效镜像」的可读文本（供各步骤标注）。
+  function mirrorText() {
+    if (warmMirror && warmMirror.npmBest) {
+      var h = String(warmMirror.npmBest).replace(/^https?:\/\//, '').split('/')[0];
+      return h + '（' + warmMirror.npmLatencyMs + 'ms）';
+    }
+    if (lastMirror && lastMirror.mirror) {
+      return String(lastMirror.mirror).replace(/^https?:\/\//, '').split('/')[0];
+    }
+    return null;
+  }
+
   // 镜像源适配的**显式可见化**。
   // 此前镜像探测藏在下载内部，用户无从得知「有没有选、选了谁」 ——
   // 于是「完全没有自动适配最佳镜像源」成为无法证伪的观感。
@@ -565,14 +620,17 @@
       lastPlan = p || {};
       coreFrom = p.installed || null;
       if (!p.installed) {
-        status('未安装内核 · 正在安装标准产品包…');
+        status('未安装内核 · 正在安装标准产品包…' + (mirrorText() ? '（源 ' + mirrorText() + '）' : ''));
         return coreApply(null);
       }
       if (p.action === 'upgrade' && p.latest) {
         status('发现新内核 v' + p.latest + '（当前 v' + p.installed + '）· 正在强制更新…');
         return coreApply(p.latest);
       }
-      status('内核已是最新（v' + p.installed + '）');
+      // ⚠ 显示**实际命中的镜像**（2026-09-11 修复）：
+      //   core_plan 早就回传了 registry 字段，但前端从未使用 —— 数据链路断了。
+      var mt = p.registry ? String(p.registry).replace(/^https?:\/\//, '') : mirrorText();
+      status('内核已是最新（v' + p.installed + '）' + (mt ? ' · 源 ' + mt : ''));
       coreTo = p.installed;
       return wait(300).then(stepCoreDone);
     }).catch(function (e) { fail('内核版本检查失败：' + e); });
@@ -670,6 +728,8 @@
     // lastMirror 不重置（镜像选择结果与本次重试无关，保留可对比）。
     lastEnv = null; envStuck = null;
     $('btnForceNode').style.display = 'none';
+    // 镜像预热**与引导并行**（后台，不阻塞）：任何步骤都可展示当前镜像。
+    startMirrorWarmup();
     // 从**环境检测**开始（本地快检查在前）；随后 Node → 桌面版本 → 内核 → 守卫 → 控制面板。
     stepEnv().catch(function (e) { fail('引导异常：' + e); });
   }
