@@ -45,6 +45,21 @@ systemd user unit → dsh-supervisor（守卫内核，闭源）→ dsh web (127.
 └── .github/workflows/          四平台构建 + 产物验收 + npm 发布（tag 触发）
 ```
 
+
+## 文档索引
+
+| 文档 | 性质 | 说明 |
+|---|---|---|
+| [SHELL-EXECUTION-PLAN.md](docs/SHELL-EXECUTION-PLAN.md) | 计划 | 稳定与热更新完整执行方案 |
+| [SHELL-BOOTSTRAP-REMEDIATION.md](docs/SHELL-BOOTSTRAP-REMEDIATION.md) | **规范** | 引导逻辑修复方案（强制更新 + 失败回退）· 跨平台；含 K10/K11 的**设计决策与边界** |
+| [SHELL-NATIVE-STABILITY-DECISION.md](docs/SHELL-NATIVE-STABILITY-DECISION.md) | **规范** | 原生形态定案后的稳定架构（决策记录） |
+| [SHELL-UPDATE-CHANNEL-VERIFICATION.md](docs/SHELL-UPDATE-CHANNEL-VERIFICATION.md) | 实测记录 | 壳更新通道验证（含 CDN `@latest` 缓存延迟实测） |
+| [SHELL-UPDATE-TRIGGER-CORRECTION.md](docs/SHELL-UPDATE-TRIGGER-CORRECTION.md) | 修正 | 壳如何触发更新（对执行方案 §1 的更正） |
+| [AUDIT-SHELL-BOOTSTRAP.md](docs/AUDIT-SHELL-BOOTSTRAP.md) | 审计 | 引导逻辑深度检测报告 |
+| [SHELL-STABILITY-AUDIT.md](docs/SHELL-STABILITY-AUDIT.md) | 审计 | 稳定性深度审计 |
+| [docs/archive/](docs/archive/) | 归档 | 已决策/已落地的历史文档（见 [README](docs/archive/README.md)） |
+
+> **不变量**：壳的跨平台与引导行为由测试保障（`cargo test`，含引导流程回归 B1–B55）；文字文档不构成证据。
 ## 安装
 
 ### 内核（闭源，npm 分发）
