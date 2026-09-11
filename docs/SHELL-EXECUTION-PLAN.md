@@ -6,6 +6,9 @@
 > 依据：D1 已定案（**保留 Tauri 原生壳**，最终形态 = 桌面级产品）+ 采纳我的全部建议（D2–D7）。
 > 判据：**稳定与可靠优先**，承认有舍有得，工业级标准。
 > 本文件是执行方案，不是代码变更。
+>
+> ⚠ 文中引用的 `main.rs:NNN` 等行号是**方案撰写时快照** —— 后续分层重构
+> （`main.rs` → `commands/` + `domain/`）使这些行号全部失效。要看现状请读代码。
 
 ---
 
@@ -142,17 +145,23 @@
 
 ### 2.4 内核本地端点（仅回环；**不含更新源职责**）
 
-| 端点 | 用途 |
-|---|---|
-| `POST /shell/health` | 壳上报 `{phase, version, attempt}`；`phase=ready` 即**更新确认信号** |
-| `GET /shell/status` | 面板展示：壳版本 / 更新状态 / 回退记录 / 缓存版本 |
-| `POST /shell/prefetch` | 手动触发内核预取（面板按钮；可选） |
-| `POST /shell/rollback` | 手动回退到上一可用版本（排障入口；可选） |
+**实际情况**：端点集合以 `src/api/surface.js` 为唯一事实源（`test/api-surface-test.js` 强制
+双向一致：源码里出现的每个路由都必须登记，登记的每个路由都必须真实存在）。**本表仅为方案设想**，
+与实现有出入时以 `surface.js` 为准。
 
-**已移除**（原设计）：`GET /shell/update/v1/check` 与 `/shell/update/v1/artifact/<file>`——
-内核不再是壳的更新源（壳直连公网）。
+| 端点 | 用途 | 实现状态 |
+|---|---|---|
+| `POST /shell/health` | 壳上报 `{phase, version, attempt}`；`phase=ready` 即**更新确认信号** | ✅ 已实现 |
+| `GET /shell/status` | 面板展示：壳版本 / 更新状态 / 回退记录 / 缓存版本 | ✅ 已实现 |
+| `POST /shell/update-pending` | 壳安装完成后告知内核，建立更新账本 | ✅ 已实现（方案外新增）|
+| `POST /shell/check-update` | 壳版本检测（npm registry + 镜像回退）| ✅ 已实现（方案外新增）|
+| `POST /shell/restart` | 重启桌面壳以应用更新 | ✅ 已实现（方案外新增）|
+| `POST /shell/rollback` | 手动回退到上一可用版本（排障入口）| ✅ 已实现 |
+| ~~`POST /shell/prefetch`~~ | 手动触发内核预取 | ❌ **未实现**（全仓无 `prefetch`）|
 
-> 端点带 `/v1/` 版本段：内核演进破坏兼容时才有机会并行，符合我们已有的 API 契约纪律。
+**已移除**（原设计）：`GET /shell/update/v1/check` 与 `/shell/update/v1/artifact/<file>` ——
+内核不再是壳的更新源（壳直连公网）。**故下文关于 `/v1/` 版本段的说明也随之作废**
+（`surface.js` 现无任何 `/v1/` 路径）。
 
 ### 2.5 Tauri 侧配置要点（含一个必须知道的坑）
 
