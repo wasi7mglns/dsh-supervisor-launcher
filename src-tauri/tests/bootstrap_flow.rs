@@ -1082,3 +1082,77 @@ fn b53_frontend_js_must_be_syntactically_valid() {
     }
     eprintln!("B53 PASS frontend JS valid（校验 {} 个 script 块）", checked);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// B54：**需要 IPC 的页面必须是主帧**（2026-09-11 架构级修复）
+//
+// 真实根因（用户 Windows 真机：所有 invoke 都不返回）：
+//   Tauri 把 IPC 初始化脚本标记为 for_main_frame_only ——
+//   （tauri/src/manager/webview.rs: main_frame_script() 内 for_main_frame_only: true）
+//   其中包括 window.__TAURI_INTERNALS__（invoke / ipc 的实现）。
+//   而 window.__TAURI__.core.invoke 内部是 window.__TAURI_INTERNALS__.invoke(...)，
+//   故在 **iframe** 中 invoke 立即抛错、永无结果。
+//
+// 症状：shell_identity / node_status / mirror_cached 全部挂起，
+//   诊断串每一项都是 none —— 「卡在检测环境、不报错、无任何线索」。
+//
+// 修复：引导页**移出 iframe**（窗口直接加载 bootstrap.html），
+//   引导完成后再导航到 shell.html（壳框架；其 iframe 只放守卫托管的面板，不需 IPC）。
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn b54_bootstrap_must_be_main_frame() {
+    // 1) 窗口 URL 必须是引导页（主帧）
+    let conf: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(manifest_dir().join("tauri.conf.json")).expect("tauri.conf.json"),
+    )
+    .expect("B54 FAIL tauri.conf.json 解析失败");
+    let url = conf["app"]["windows"][0]["url"].as_str().unwrap_or("");
+    assert_eq!(url, "bootstrap.html", "B54 FAIL 窗口 URL 必须是 bootstrap.html（引导页需主帧 IPC）");
+
+    // 2) shell.html 不得再把引导页放进 iframe
+    let shell = fs::read_to_string(manifest_dir().join("bootstrap").join("shell.html")).expect("shell.html");
+    assert!(
+        !shell.contains("src=\"bootstrap.html\""),
+        "B54 FAIL shell.html 仍把 bootstrap.html 放进 iframe（IPC 将不可用）"
+    );
+
+    // 3) 引导页不得依赖 iframe 的 IPC 回退路径（那条路径在本平台不可用）
+    let boot = bootstrap_html();
+    assert!(
+        !boot.contains("window.parent.__TAURI__"),
+        "B54 FAIL 引导页仍依赖 iframe 的 IPC 回退（该路径在 Tauri 中不可用）"
+    );
+
+    // 4) 壳框架必须主动索取面板 URL（引导页导航过来后，事件可能已错过）
+    assert!(shell.contains("shell_panel_url"), "B54 FAIL shell.html 未主动索取面板 URL");
+    eprintln!("B54 PASS bootstrap is main frame");
+}
+
+// B55：IPC 不可用时必须**明确报错**，不得静默返回。
+//
+// 旧实现 `if (!core) return;` 会让页面停在静态文案「正在检测系统环境…」，
+// 既不报错也不推进 —— 这正是用户看到的现象之一，使排障无从下手。
+#[test]
+fn b55_missing_ipc_must_fail_loudly() {
+    let boot = bootstrap_html();
+    // ⚠ 只看 boot() 函数体：别处（如 wctl 的按钮守卫）出现 `if (!core) return;` 是合法的，
+    //   不应误判（首版断言即因此误报）。
+    let body = function_body(&boot, "function boot()");
+    // ⚠ 必须先剔除注释行：boot() 的注释里**引用了**旧写法（`if (!core) return;`）作说明，
+    //   不过滤会把说明文字误判为实际代码（首版断言即因此误报）。
+    let code: String = body
+        .split('\n')
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains("if (!core) return;"),
+        "B55 FAIL boot() 在 core 缺失时仍静默返回（应明确报错）"
+    );
+    assert!(
+        code.contains("Tauri IPC 不可用"),
+        "B55 FAIL boot() 缺 IPC 缺失时的明确错误信息"
+    );
+    eprintln!("B55 PASS missing IPC fails loudly");
+}

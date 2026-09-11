@@ -6,6 +6,130 @@
 
 （下一版本待记）
 
+## [1.0.8]（2026-09-11）
+
+### 修复：**架构级根因** —— 需要 IPC 的页面被放进了 iframe（所有 invoke 永久挂起）
+
+这是「卡在检测环境、不报错、诊断全 none」的**真正根因**。此前三轮修复都未触及。
+
+#### 一、根因（Tauri 源码级证据）
+
+`tauri/src/manager/webview.rs`：
+
+```rust
+fn main_frame_script(script: String) -> InitializationScript {
+    InitializationScript { script, for_main_frame_only: true }   // ← 仅主帧
+}
+all_initialization_scripts.push(main_frame_script(self.invoke_initialization_script.clone()));
+```
+
+**IPC 的初始化脚本全部标记为「仅主帧」**，其中包括 `window.__TAURI_INTERNALS__`
+（`invoke` / `ipc` 的实现）。而 `__TAURI__.core.invoke` 内部正是：
+
+```js
+async function invoke(cmd, payload) { return window.__TAURI_INTERNALS__.invoke(cmd, payload); }
+```
+
+⇒ **在 iframe 中 `__TAURI_INTERNALS__` 不存在 → invoke 立即抛错 → Promise 永不 settle。**
+
+#### 二、症状完全吻合
+
+旧架构：窗口加载 `shell.html`，引导页放在其中的 `<iframe src="bootstrap.html">`。
+于是 iframe 中的引导页：
+
+- `node_status` / `shell_identity` / `mirror_cached` **全部挂起**；
+- 我们的诊断代码大量使用 `.catch(function(){})`，**错误被静默吞掉**；
+- 只有**由前端主动发起**的阶段上报（`shell_set_phase`）会缺失 →
+  日志停在「壳启动」，`phase` 停在 `boot`；
+- 那些**不需要 invoke** 的展示位回落到初值 → 诊断串每一项都是 `none`。
+
+这与用户报告**逐字吻合**：
+
+```
+node=unknown | core_from=none | ... | env_candidates=none | env_probe_error=none
+env_stuck=none | env_trace=none | mirror=none（预热未启动或全部不可达）
+mirror_node_best=none | mirror_npm_best=none | mirror_probes=none
+error=环境检测超时（探针无响应，可能有异常的可执行文件占位）
+```
+
+**「探针无响应」是误判** —— 探针根本没被调用成功，因为 IPC 不可达。
+
+#### 三、为什么此前三轮都没找到
+
+| 轮次 | 我修的东西 | 为何无效 |
+|---|---|---|
+| 第 1 轮 | 探测移出主线程 | 探测**根本没被调用** |
+| 第 2 轮 | 枚举纳入进度上报 | 同上 |
+| 第 3 轮 | 硬死线 + 交错探测 | 同上 |
+
+我一直在修「探测慢 / 探测卡住」，而真问题是**前端根本无法与 Rust 通信**。
+具体原因：
+
+1. **该错误在两个平台表现不同**：Linux 上 iframe 的 `window.__TAURI__` 因某种原因
+   路径尚可解析（故我本机测试通过），Windows WebView2 上则彻底不可用 ——
+   而我在 Linux 上验证，**从未在 Windows 真机上验证过**；
+2. **错误被 `.catch(function(){})` 静默吞掉**，没有任何日志暴露它；
+3. 我**只读代码、静态断言**，没有真实运行 GUI 观察运行时行为。
+
+#### 四、修复：需要 IPC 的页面必须是主帧
+
+**不采用「换一种取 IPC 的方式」**（那只是绕过症状），而是修正架构：
+
+```json
+// tauri.conf.json —— 窗口直接加载引导页
+"url": "bootstrap.html"        // 原为 shell.html（内含 iframe）
+```
+
+```
+引导页（主帧）── 完成引导 ──▶ 导航到 shell.html（壳框架，主帧）
+                                    └── iframe：守卫托管的面板（HTTP 页面，不需 IPC）
+```
+
+关键变化：
+
+1. **引导页成为主帧** —— IPC 必然可用；
+2. **`tauri.windows.conf.json` 同步修改** —— 该文件是**数组整体替换**而非字段合并，
+   若不同步，**修复在 Windows 上完全失效**（门禁 B11 抓到了这一点）；
+3. **引导页自带窗口栏** —— 窗口是 `decorations:false`，故引导页必须有拖动区与
+   最小化/最大化/关闭按钮（此前由 shell.html 提供）；
+4. **引导完成 → 主帧导航**到 shell.html；
+5. **壳框架主动索取面板 URL**（新增命令 `shell_panel_url`）—— 不再依赖
+   `shell:goto-panel` 事件（它在首帧可能早于 listener 注册而被丢弃）；
+6. **`boot()` 不再静默返回** —— `core` 缺失时明确报错「Tauri IPC 不可用」，
+   而不是让页面停在静态文案上（旧代码 `if (!core) return;` 正是「不报错」的来源）。
+
+#### 五、真实 GUI 验证（端到端，非静态断言）
+
+Xvfb + 全新 dbus session 跑真实二进制：
+
+```
+[boot] main enter → building app → setup enter → init_identity done → building tray
+壳启动 v1.0.8
+阶段 → env                ← 检测环境
+阶段 → shell-update       ← 桌面版本
+阶段 → kernel             ← 内核版本
+阶段 → guard              ← 守卫
+守卫服务定义: 已存在 ~/.config/systemd/user/dsh-supervisor.service
+服务管理器未能在 30s 内拉起守卫 · 改用直接启动兜底
+兜底 spawn 守卫 pid=3059670
+阶段 → ready              ← 守卫就绪
+壳框架就绪（主帧导航完成），面板 URL: http://127.0.0.1:36360/
+```
+
+**「壳框架就绪」这行证明主帧导航真的发生** —— 这是我第一次观察到 GUI 走完全链路。
+
+#### 六、新增门禁
+
+- **B54** 引导页必须是主帧（窗口 URL = `bootstrap.html`；`shell.html` 不得再把
+  引导页放进 iframe；引导页不得依赖 iframe 的 IPC 回退；壳框架必须主动索取面板 URL）；
+- **B55** IPC 不可用时 `boot()` 必须**明确报错**，不得静默返回。
+
+#### 验证
+
+- 壳测试 **68 项全通过**（bootstrap_flow 54 + updater_artifacts 6 + 单元 8）；
+- 真实 GUI：引导链路完整推进 `env → shell-update → kernel → guard → ready`，
+  并**成功导航**到壳框架（`壳框架就绪（主帧导航完成）`）。
+
 ## [1.0.7]（2026-09-11）
 
 ### 修复：引导页 JS 语法错误导致引导完全静默（本轮真正的根因）+ 把真机验证变成常规手段

@@ -91,9 +91,37 @@
     border-radius: 8px; padding: 6px 14px; font-size: 12px; cursor: pointer; }
   .skipwrap button:hover { color: var(--text); }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── 唯一窗口栏（壳提供：产品 WindowTitlebar 同款视觉）──
+     ⚠ 引导页是**主帧**（2026-09-11 架构修复）：窗口直接加载本页，
+     故这里的 win_ctl 是主帧 IPC，必然可用（iframe 内的 IPC 会被 Tauri 拒绝）。*/
+  #titlebar { position: fixed; top: 0; left: 0; right: 0; height: 40px; z-index: 10;
+    display: flex; align-items: center; justify-content: space-between;
+    background: #f9fafb; border-bottom: 1px solid rgb(0 0 0 / 5%);
+    user-select: none; -webkit-user-select: none; }
+  @media (prefers-color-scheme: dark) {
+    #titlebar { background: #16191f; border-bottom: 1px solid rgb(255 255 255 / 12%); } }
+  .tb-drag { -webkit-app-region: drag; app-region: drag; flex: 1; height: 100%; }
+  .tb-btns { display: flex; height: 100%; }
+  .tb-btns button { width: 44px; height: 100%; border: 0; background: transparent;
+    color: #61666b; cursor: pointer; display: grid; place-items: center;
+    transition: background .15s, color .15s; }
+  .tb-btns button:hover { background: rgb(0 0 0 / 5%); color: #0f1115; }
+  .tb-btns button.close:hover { background: #e81123; color: #fff; }
+  /* 内容区下移，避免被固定标题栏遮住 */
+  .page { padding-top: 40px; }
 </style>
 </head>
 <body>
+  <div id="titlebar">
+    <div class="tb-drag" id="dragRegion" data-tauri-drag-region="deep"></div>
+    <div class="tb-btns">
+      <button id="btnMin" title="最小化" aria-label="最小化"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 6h8" stroke="currentColor" stroke-width="1" fill="none"/></svg></button>
+      <button id="btnMax" title="最大化/还原" aria-label="最大化"><svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x="1" y="1" width="8" height="8" rx="0.5" stroke="currentColor" stroke-width="1" fill="none"/></svg></button>
+      <button id="btnClose" class="close" title="关闭（隐藏到托盘）" aria-label="关闭"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.1" fill="none"/></svg></button>
+    </div>
+  </div>
+
   <div class="page">
     <div class="inner">
       <div class="startup-logo" id="logo" aria-hidden="true"><span class="startup-logo-image"></span></div>
@@ -172,11 +200,58 @@
   </div>
 <script>(function () {
   // Tauri API：自身注入优先；作为壳框架(shell.html) iframe 内容时经 parent 访问（同源）。
-  var core = (window.__TAURI__ && window.__TAURI__.core)
-    || (window.parent && window.parent.__TAURI__ && window.parent.__TAURI__.core)
-    || (window.top && window.top.__TAURI__ && window.top.__TAURI__.core) || null;
-  var evt = (window.__TAURI__ && window.__TAURI__.event)
-    || (window.parent && window.parent.__TAURI__ && window.parent.__TAURI__.event) || null;
+  // ═══════════════════════════════════════════════════════════════════
+  // IPC 获取（2026-09-11 **架构级修复**）
+  //
+  // 真实根因：Tauri 把 IPC 的初始化脚本标记为 for_main_frame_only ——
+  // （见 tauri/src/manager/webview.rs: main_frame_script() 内 for_main_frame_only: true）
+  //   其中包括 window.__TAURI_INTERNALS__（invoke / ipc 的实现）。
+  //   而 window.__TAURI__.core.invoke 内部是：
+  //       window.__TAURI_INTERNALS__.invoke(cmd, payload)
+  //   ⇒ 在 **iframe** 中 __TAURI_INTERNALS__ 不存在 → invoke 立即抛错 → 永无结果。
+  //
+  // 这解释了「所有 invoke 都不返回」的完整症状：
+  //   shell_identity / node_status / mirror_cached 全部挂起 → 诊断串每一项都是 none。
+  //   旧代码还优先取 iframe 自己的 window.__TAURI__（它存在但不可用），
+  //   恰好选中了那个坏的。
+  //
+  // 修复方式不是「换个取法」，而是**把引导页移出 iframe**：
+  //   窗口直接加载本页（tauri.conf.json 的 window.url = bootstrap.html），
+  //   引导完成后再导航到 shell.html（壳框架，面板在其中的 iframe 内 —— 面板是
+  //   守卫托管的 HTTP 页面，本来就不需要 Tauri IPC）。
+  // 原则：**需要 IPC 的页面必须是主帧。**
+  // ═══════════════════════════════════════════════════════════════════
+  var core = (window.__TAURI__ && window.__TAURI__.core) || null;
+  var evt = (window.__TAURI__ && window.__TAURI__.event) || null;
+
+  // ── 窗口栏（窗口 decorations:false，拖动与按钮由页面提供）──
+  (function () {
+    var wctl = function (a) {
+      if (!core) return;
+      try { core.invoke('win_ctl', { action: a }).catch(function () {}); } catch (e) {}
+    };
+    var bind = function (id, action) {
+      var el = document.getElementById(id);
+      if (el) el.addEventListener('click', function () { wctl(action); });
+    };
+    bind('btnMin', 'minimize');
+    bind('btnMax', 'toggle-maximize');
+    bind('btnClose', 'hide');
+    var drag = document.getElementById('dragRegion');
+    // 显式拖动（Linux WebKit drag-region 常不生效的可靠替代）
+    if (drag) drag.addEventListener('mousedown', function () { wctl('drag'); });
+  })();
+
+  // 引导完成后切到壳框架。
+  // 为何要导航而不是就地切换：面板需要壳框架（标题栏 + iframe），
+  // 而壳框架的 IPC 也在主帧（导航后 shell.html 成为主帧）—— 两者都成立。
+  function gotoShell() {
+    try { window.location.replace('shell.html'); } catch (e) {}
+  }
+  // 托盘「显示控制面板」会发这个事件；若此刻仍在引导页，直接切过去。
+  if (evt) {
+    evt.listen('shell:goto-panel', function () { gotoShell(); });
+  }
   var $ = function (id) { return document.getElementById(id); };
   // 步骤顺序（2026-09-11 重构）：环境 → Node → 桌面版本 → 内核 → 守卫 → 控制面板。
   // 设计纠正：旧顺序把「桌面壳自更新」放在第一步（旧称「门 0」），基于一个不成立的前提
@@ -716,16 +791,23 @@
     phase('ready');   // 关键：这是「壳已健康启动」的确认信号
     status('环境就绪 · 正在打开控制面板…');
     $('logo').classList.add('done');
-    return wait(700).then(function () { if (core) core.invoke('finish_boot').catch(function () {}); });
+    return wait(700).then(function () {
+      // 通知 Rust「引导完成 → 健康确认」（内核据此确认桌面版本更新成功 / 清 journal）
+      if (core) core.invoke('finish_boot').catch(function () {});
+      // 切到壳框架：主帧导航（shell.html 将成为主帧，其 win_ctl / 面板导航均可用）
+      setTimeout(gotoShell, 400);
+    });
   }
 
   function boot() {
-    // ⚠ 临时诊断（验证 iframe IPC）：把关键状态写到**顶层窗口标题**，
-    //   以便在无 GUI 交互的环境（xvfb + xdotool）中读取。
-    //   背景：shell.log 只有一行、identity.json 的 phase 停在 boot ——
-    //   说明引导页的 invoke **从未成功**，但无法区分「core 为 null」与「invoke 失败」。
-
-    if (!core) return;
+    // ⚠ 必须**明确报错**，不能静默返回（2026-09-11）：
+    //   旧实现 `if (!core) return;` 会让页面停在静态文案「正在检测系统环境…」——
+    //   既不报错也不推进，用户与排障者都无从下手（真实事故）。
+    //   现在若 IPC 不可用，直接给出结论与指引。
+    if (!core) {
+      fail('Tauri IPC 不可用（window.__TAURI__ 缺失）。请重装桌面壳，或反馈此诊断。');
+      return;
+    }
     hideFail();
     hideUpdChoice();
     cur = -1; nodeVer = null; coreFrom = null; coreTo = null; lastError = null; updPlan = null;

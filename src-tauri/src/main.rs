@@ -812,6 +812,20 @@ fn cli_plan() -> i32 {
 /// 壳 = 自绘窗口容器(shell.html 唯一窗口栏 + 内容 iframe)；面板由守卫内核 HTTP 托管（同源）。
 /// 切面板 = emit 守卫实际 API 基址(读 config.apiPort, 动态端口不硬编码) → 壳 iframe 导航该 URL，
 /// 页面与守卫 API 同源直连（无跨源/CORS 透传）。
+/// 返回控制面板 URL（供壳框架在导航后自行取得面板地址）。
+///
+/// 为什么需要：引导页与壳框架是**两个主帧页面**（引导完成后导航切换），
+/// 而 Rust 的 shell:goto-panel 事件在首帧可能早于 listener 注册而被丢弃。
+/// 由壳框架主动索取，可彻底避免事件竞态。
+#[tauri::command]
+fn shell_panel_url() -> serde_json::Value {
+    let url = env::api_base_url();
+    // 落盘一行：**证明主帧导航确实完成**（引导页 → 壳框架）。
+    // 这条日志也是可观测性的关键一环：从 shell.log 就能看出卡在引导页还是壳框架。
+    update::log(&format!("壳框架就绪（主帧导航完成），面板 URL: {}", url));
+    serde_json::json!({ "url": url })
+}
+
 fn go_panel(app: &tauri::AppHandle, force: bool) {
     let url = env::api_base_url(); // http://127.0.0.1:<config.apiPort 或高位段 fallback>/
     // 壳框架(shell.html)的 evt listener 在首帧注册；setup 线程的 emit 可能早于注册被丢弃，
@@ -1333,7 +1347,7 @@ fn main() {
         // app.restart()：更新安装后重启进入新版本（旧进程装、新进程跑）。
         .plugin(tauri_plugin_process::init())
         .manage(Mutex::new(RunState::default()))
-        .invoke_handler(tauri::generate_handler![node_status, core_status, core_plan, core_apply, guard_start, guard_ready, start_node_install, finish_boot, win_ctl, shell_identity, shell_update_check, shell_update_apply, shell_restart, shell_set_phase, mirror_status, mirror_set, node_latest, mirror_warmup, mirror_cached])
+        .invoke_handler(tauri::generate_handler![node_status, core_status, core_plan, core_apply, guard_start, guard_ready, start_node_install, finish_boot, win_ctl, shell_identity, shell_update_check, shell_update_apply, shell_restart, shell_set_phase, mirror_status, mirror_set, node_latest, mirror_warmup, mirror_cached, shell_panel_url])
         .setup(|app| {
             bt!("setup enter");
             // 托盘直发本地 API 的端口：显式 DSH_SUPERVISOR_TRAY_PORT 优先，否则从用户 config.apiPort 解析

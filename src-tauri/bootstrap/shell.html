@@ -69,7 +69,7 @@
 
   <!-- 内容区：引导页 / 内核面板（纯网页） -->
   <div id="content">
-    <iframe id="frame" src="bootstrap.html" title="内容"></iframe>
+    <iframe id="frame" title="内容"></iframe>
   </div>
   </div>
 
@@ -85,6 +85,14 @@
     // 显式拖动（Linux WebKit drag-region 常不生效的可靠替代）
     document.getElementById('dragRegion').addEventListener('mousedown', function () { wctl('drag'); });
     var panelUrl = null;
+    // 主动取面板 URL（2026-09-11）：本页是引导完成后的**主帧**（引导页已导航到这里），
+    // 而 Rust 的 shell:goto-panel 事件在首帧可能早于 listener 注册而被丢弃 ——
+    // 故此处直接向 Rust 要地址，不依赖事件竞态。
+    if (core) {
+      core.invoke('shell_panel_url').then(function (r) {
+        if (r && r.url) { panelUrl = r.url; frame.src = r.url; }
+      }).catch(function () {});
+    }
     var retried = 0;
 
     // 引导完成 → 内容区切到面板
@@ -97,7 +105,10 @@
         // force=true（用户重新显示窗口）→ 强制重载取最新 UI；否则同 URL 不重载（守卫重启延时重发不刷面板）
         if (p.force || u !== frame.src) { retried = 0; frame.src = u; }
       });
-      evt.listen('shell:goto-bootstrap', function () { panelUrl = null; if (frame.src !== 'bootstrap.html') frame.src = 'bootstrap.html'; });
+      evt.listen('shell:goto-bootstrap', function () {
+          // 引导页已是**独立主帧页面**，回退 = 主帧导航（不能再放进 iframe）
+          try { window.location.replace('bootstrap.html'); } catch (e) {}
+        });
     }
     // 面板加载失败兜底（守卫尚未就绪/瞬时错误）：同一 URL 最多重试 2 次（一次性 nonce 破缓存）
     frame.addEventListener('error', function () {
