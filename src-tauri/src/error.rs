@@ -18,9 +18,15 @@
 //!
 //! == 接入位置（现状）==
 //!
-//! **IPC 边界**：`commands/` 的 10 个 `Result` 命令都返回 [`ShellResult`] ——
+//! **IPC 边界**：`commands/` 的 `Result` 命令都返回 [`ShellResult`] ——
 //! 前端因此拿到结构化对象，并按 `kind` 分支、显示后端给的 `hint`
-//! （见 `bootstrap.html` 的 `errText()`）。
+//! （见 `bootstrap/js/10-ui.js` 的 `errText()`）。
+//!
+//! ⚠ 上述「显示后端给的 `hint`」在 2026-09-12 之前**并不成立**：
+//!   `hint()` 只是 Rust 方法，**从未进入 JSON**，前端 `e.hint` 恒为 `undefined` ——
+//!   即注释声称的能力当时并不存在（典型「注释声称、代码没有」）。
+//!   现由手工 `Serialize` 把 `hint` 并入输出（见本文件下方 impl），并有测试锁定：
+//!   `every_kind_serializes_a_hint` / `serialization_keeps_original_field_names`。
 //!
 //! ⚠ 有一处**例外**：`guard_start` 的 JSON 响应体里 `error` 仍是字符串（`e.to_string()`）。
 //!   因为该字段被前端当字符串拼接；塞入对象会显示 `[object Object]`。
@@ -31,8 +37,19 @@
 use serde::Serialize;
 
 /// 壳的结构化错误。
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+///
+/// ⚠ `hint` 是**序列化字段**（P2 修复，2026-09-12）。
+///
+///   此前 `hint()` 只是一个 Rust 方法，**从未进入 JSON** ——
+///   而前端 `10-ui.js::errText()` 写着 `e.hint ? (detail + '；' + e.hint) : detail`，
+///   于是 `e.hint` 恒为 `undefined`：
+///     · 「可尝试切换镜像源」「请按系统提示完成授权」这类**可操作建议永远到不了用户**；
+///     · 而 `error.rs` 头部注释却声称「前端按 kind 分支、显示后端给的 hint」——
+///       又一处「注释声称、代码没有」。
+///
+///   修法：把 `hint` 作为字段并入序列化输出（`#[serde(serialize_with)]`），
+///   使 `#[serde(tag = "kind")]` 的结构体里多出一个 `hint: String` 键。
+#[derive(Debug, Clone)]
 pub enum ShellError {
     /// 探测失败：**必须带阶段与耗时**（「卡住时看得见」）。
     Probe {
@@ -53,6 +70,73 @@ pub enum ShellError {
     Ipc { cause: String },
     /// **显式不支持**（替代静默成功 / 裸字符串）。
     Unsupported { capability: String, platform: String },
+}
+
+/// 手工 `Serialize`：派生表示 + 一个 `hint` 字段（P2 修复）。
+///
+/// ⚠ 为什么不直接 `#[derive(Serialize)]`：`hint()` 是**方法**，派生不会带上它。
+///   而前端 `errText()` 消费的正是 `e.hint` —— 不序列化等于那句建议永远发不出去。
+///
+/// ⚠ 字段格式必须与原先**逐字一致**（`kind` 用 kebab-case 变体名，字段名保持 snake_case），
+///   否则前端已有的 `e.stage` / `e.cause` / `e.elapsed_ms` 读取会失效。
+impl Serialize for ShellError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut v = match self {
+            ShellError::Probe {
+                stage,
+                cause,
+                elapsed_ms,
+            } => serde_json::json!({
+                "kind": "probe",
+                "stage": stage,
+                "cause": cause,
+                "elapsed_ms": elapsed_ms,
+            }),
+            ShellError::Network { url, cause } => serde_json::json!({
+                "kind": "network",
+                "url": url,
+                "cause": cause,
+            }),
+            ShellError::Install { platform, cause } => serde_json::json!({
+                "kind": "install",
+                "platform": platform,
+                "cause": cause,
+            }),
+            ShellError::Service { action, cause } => serde_json::json!({
+                "kind": "service",
+                "action": action,
+                "cause": cause,
+            }),
+            ShellError::Contract { file, cause } => serde_json::json!({
+                "kind": "contract",
+                "file": file,
+                "cause": cause,
+            }),
+            ShellError::Ipc { cause } => serde_json::json!({
+                "kind": "ipc",
+                "cause": cause,
+            }),
+            ShellError::Unsupported {
+                capability,
+                platform,
+            } => serde_json::json!({
+                "kind": "unsupported",
+                "capability": capability,
+                "platform": platform,
+            }),
+        };
+        // 这里就是「漏接线」的那一步：把可操作建议并入输出。
+        if let Some(o) = v.as_object_mut() {
+            o.insert(
+                "hint".to_string(),
+                serde_json::Value::String(self.hint().to_string()),
+            );
+        }
+        serde::Serialize::serialize(&v, serializer)
+    }
 }
 
 impl ShellError {
@@ -251,5 +335,75 @@ mod tests {
         for e in all {
             assert!(!e.hint().is_empty(), "{} 缺少建议", e.kind_label());
         }
+    }
+
+    /// **`hint` 必须真的进入 JSON**（P2 回归，2026-09-12）。
+    ///
+    /// 上面那条只检查了 **Rust 方法**非空 —— 而本次缺陷正是：
+    ///   方法存在、前端也读 `e.hint`，但 `hint()` **从未被序列化** → `e.hint` 恒 undefined。
+    ///   于是「可尝试切换镜像源」这类建议永远到不了用户，
+    ///   而文件头注释却声称前端会显示它。
+    ///
+    /// 故本测试断言的是**序列化输出**，并同时校验「JSON 里的值与方法返回一致」
+    /// （防两处各写一份而漂移）。
+    #[test]
+    fn every_kind_serializes_a_hint() {
+        let all = [
+            ShellError::probe("s", "c", 1),
+            ShellError::network("u", "c"),
+            ShellError::Install {
+                platform: "p".into(),
+                cause: "c".into(),
+            },
+            ShellError::Service {
+                action: "a".into(),
+                cause: "c".into(),
+            },
+            ShellError::Contract {
+                file: "f".into(),
+                cause: "c".into(),
+            },
+            ShellError::ipc("c"),
+            ShellError::Unsupported {
+                capability: "x".into(),
+                platform: "p".into(),
+            },
+        ];
+        for e in all {
+            let j = serde_json::to_value(&e).unwrap();
+            let h = j.get("hint").and_then(|x| x.as_str()).unwrap_or("");
+            assert!(
+                !h.is_empty(),
+                "{} 的 JSON 里没有 hint —— 前端 e.hint 会是 undefined",
+                e.kind_label()
+            );
+            assert_eq!(h, e.hint(), "{} 的 JSON hint 与方法返回不一致", e.kind_label());
+        }
+    }
+
+    /// 手工 `Serialize` 不得改动原有字段名/值（前端已按它们读取）。
+    #[test]
+    fn serialization_keeps_original_field_names() {
+        let p = serde_json::to_value(ShellError::probe("path-scan", "卡住", 999)).unwrap();
+        assert_eq!(p["kind"], "probe");
+        assert_eq!(p["stage"], "path-scan");
+        assert_eq!(p["cause"], "卡住");
+        assert_eq!(p["elapsed_ms"], 999);
+
+        let c = serde_json::to_value(ShellError::Contract {
+            file: "a.json".into(),
+            cause: "bad".into(),
+        })
+        .unwrap();
+        assert_eq!(c["file"], "a.json");
+        assert_eq!(c["cause"], "bad");
+
+        let u = serde_json::to_value(ShellError::Unsupported {
+            capability: "cap".into(),
+            platform: "plat".into(),
+        })
+        .unwrap();
+        assert_eq!(u["capability"], "cap");
+        assert_eq!(u["platform"], "plat");
     }
 }
