@@ -121,6 +121,30 @@
   · 我一度认定「内核 CI 不跑 npm test」—— 实际 `ci-core.sh [2/5]` 会跑（只是无 Linux runner）。
 
 两处均通过**逐条复核**发现，印证「子代理报告不构成证据」。
+### 第三轮：剩余 P2/P3（2026-09-12 续）
+
+| # | 位置 | 缺陷 |
+|---|---|---|
+| **G9 盲区** | 内核 bin/dsh-supervisor | 7 处裸 execFileSync（**无 timeout**）—— G9 只扫 src/，看不见 bin/；dbus 挂起时 CLI 无限阻塞 |
+| **死字段** | 内核 api/identity.js | trusted 每请求计算但零消费。⚠ **不能接线**：接到 access-key 门卫会让局域网**豁免**密钥 = 安全降级；故**删除** |
+| **架构静默当 x64** | 内核 dist._platformTag / 壳 linux.rs | 非 arm64 即 x64 → ppc64le 等按 x64 取产物（轻则 404，重则架构不符）；改白名单 + 未支持即报 |
+| **XML 转义** | 壳 macos.rs / 内核 autostart.js | plist 是 XML：真正会破坏它的是 & 与尖括号，而旧实现只转义双引号（XML 里本就合法）|
+| **Exec 未加引号** | 内核 .desktop | Desktop Entry 规范也是空格分词；家目录含空格时 Exec 被拆断 |
+| **clippy 16 条** | 壳 | 其中一条是**真问题**：B12 的 while let 循环体必定 panic 且 idx 从不更新 → 循环只跑 0/1 次（形态伪装成扫描全部）|
+
+⚠ **又发现两条既有测试把缺陷当成了要求**：
+autostart-ownership-test.js 的 P3-e/P3-f 断言的是「裸拼接 GUI_LABEL」与
+「用 replace 双引号当 XML 转义」—— 即测试**锁定了错误实现**，故修复后变红。
+已改为断言真正的 XML 转义。这与前两轮的「门禁空转」是同一族问题的另一面：
+**门禁不仅可能空转，还可能把 bug 固化为规范。**
+
+### 三轮累计验证
+
+```
+内核  npm test   64 文件 / 1187 断言 / 0 失败（起点 1098，+89）
+壳    cargo test  92 项 / 0 失败（起点 77，+15）
+壳    cargo check 0 警告      clippy 0 警告（排除 items-after-test-module 风格项）
+```
 
 
 ---
