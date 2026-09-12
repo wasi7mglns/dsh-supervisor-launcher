@@ -1184,3 +1184,23 @@ router 其余（switch/evidence/router-ops/index/quota-strategies）、guard/por
 壳    cargo test  92 项 / 0 失败（起点 77，+15）
 前端  verify     tsc 0 错 / eslint 0 错 / vitest 15 通过（此前从未运行）
 ```
+### 第五轮：剩余 P2/P3 + frpmgr/objects 审计（2026-09-12 续）
+
+| # | 位置 | 缺陷 |
+|---|---|---|
+| **P2-5** | 内核 router-ops + 前端 | `added++` **不 await 检测** → 计数虚高（N 个全被 discarded 也报「已添加 N 个」）；后端改为等齐结果并回报 discarded/discardedKeys，前端如实提示 |
+| **P2-8** | 内核 relay/manager | `list()` 每次触发 reconcile，而 reconcile 内**逐实例串行 TCP 探测**（600ms/个）→ 与 2s 节拍叠加；加**单飞** |
+| **P2 双写** | 内核 supervisor | daemon 模式下「守卫不得写 providers.json」的纪律**只在 3 条路径中的 1 条**执行 → 另两条会与 daemon 双写覆盖；收敛为 `_disableRouterPersist()` |
+| **P2 配套** | 内核 objects.js | P2-2 修复后，无 owner 的 `release(port)` 回退变成**绕过归属校验**的路径 → 删除 |
+
+本轮对 `relay/frpmgr.js`（384 行）与 `guard/lifecycle/objects.js`（353 行）做只读审计：**未发现新缺陷**。
+两者质量突出：frpmgr 的定时器全部 unref、SIGKILL 兜底用 `exit` 而非 `killed`（注释记录了旧实现的错）、
+tar 解包只写硬编码文件名（无遍历风险）、下载带 60s 超时；objects.js 的四条设计公理与实现一致。
+
+### 五轮累计
+
+```
+内核  npm test   69 文件 / 1278 断言 / 0 失败（起点 1098，+180）
+壳    cargo test  92 项 / 0 失败（起点 77，+15）
+前端  verify     tsc 0 错 / eslint 0 错 / vitest 15 通过 / build 成功
+```
