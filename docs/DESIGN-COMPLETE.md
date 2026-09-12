@@ -1227,3 +1227,26 @@ tar 解包只写硬编码文件名（无遍历风险）、下载带 60s 超时�
 壳    cargo test  92 项 / 0 失败（起点 77，+15）
 前端  verify     tsc 0 错 / eslint 0 错 / vitest 15 通过 / build 成功
 ```
+### 第八轮：proc / deploy / dist / shell / plugin（2026-09-12 续）
+
+| 级别 | 位置 | 缺陷 |
+|---|---|---|
+| **P0** | 内核 platform/deploy.js | 只认二进制 magic 头，而发布形态**早已弃 SEA** → 真实用户落 source-shell → **自更新永久不可用**；配套放宽两处 form===sea-binary 硬判 |
+| **P0** | 内核 guard/proc/daemon-lifecycle.js | cmdMark 传 router-daemon，真实 cmdline 是 .../domains/router/daemon.js → **永不匹配**（实测 -1）→ 换代逻辑与「异主不接管」全线死代码 |
+| **P1** | 内核 domains/shell | restartShell 对 spawn 失败返回 ok:true，且无 error 监听 → ENOENT 逃逸为 uncaughtException（守卫 60s 内 3 次**自杀**）+ watchdog 假成功每 90s 风暴 |
+| **P1** | 内核 dist/index.js | semverCompare 用 split(连字符) 只取前两段 → 1.0.0-beta-2 与 -beta-1 **判等** |
+| **P1** | 内核 self-update | prune/currentDir 用**字符串**比版本 → v0.10.0 排最前 → **删掉刚装的当前版本** |
+| **P1** | 内核 daemon-lifecycle._spawn | 不接 error、不看 child.pid 就写身份 → 异常逃逸 + 每轮重复 spawn |
+| **P1** | 内核 plugin | 重定向 Location 不校验协议（file:// 让 http.get 同步抛 → uncaughtException）· registry 为 null 时写进 env 变字符串 null |
+| **P1** | 内核 plugin | 停用插件的 entryId 用**子串**匹配 → 停 @scope/dsh-tool 误伤 -extra |
+| **P2** | 内核 daemon / dist | stop() 超时仍报 ok 并抹掉身份（孤儿无人可寻）· 插件 CLI 只杀直接子进程（pnpm 孙进程孤儿）· 内核改写壳拥有的 registry.json 抹掉 v2 字段 |
+
+⚠ **又拦下 1 处审计误判**（累计 5 次）：称 fs-utils.extractTarGz 是死导出 —— 实际被 self-update.js:87 调用，**照删会破坏守卫自更新**。
+
+### 八轮累计
+
+```
+内核  npm test   72 文件 / 1369 断言 / 0 失败（起点 1098，+271）
+壳    cargo test  92 项 / 0 失败（起点 77，+15）
+前端  verify     tsc 0 错 / eslint 0 错 / vitest 15 通过 / build 成功
+```
