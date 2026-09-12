@@ -203,7 +203,7 @@ pub fn download_verified(
             Err(e) => { last_err = Some(e); continue; }
         };
         let digest = hex::encode(Sha256::digest(&data));
-        let sums = match String::from_utf8(http_get_bytes(&format!("{}/{}/SHASUMS256.txt", base, version)).map_err(|e| e)?) {
+        let sums = match String::from_utf8(http_get_bytes(&format!("{}/{}/SHASUMS256.txt", base, version))?) {
             Ok(s) => s,
             Err(e) => { last_err = Some(format!("SHASUMS 读取失败: {}", e)); continue; }
         };
@@ -347,7 +347,7 @@ pub fn now_iso() -> String {
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as i64;                       // [0, 146096]
+    let doe = z - era * 146_097;                       // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);          // [0, 365]

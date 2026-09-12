@@ -165,9 +165,20 @@ impl ServiceControl for Impl {
             .join("supervisor")
             .join("log")
             .join("guard-stdio.log");
+        // ⚠ 2026-09-12（P3）：路径嵌入 plist 前**必须做 XML 转义**。
+        //   plist 是 XML —— 家目录/用户名含 `&`、`<`、`>` 时（如 `/Users/a&b/...`），
+        //   未转义会写出**非法 XML** → `launchctl bootstrap` 失败，
+        //   而报错只是含糊的 syntax error（且本函数会降级为「已建立但未加载」→ **自启静默失效**）。
+        //
+        //   转义三类最小必要字符（& 必须最先替换，否则会二次转义）。
+        let xml_escape = |s: &str| -> String {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
         let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.dsh.supervisor</string>\n  <key>ProgramArguments</key>\n  <array><string>@BIN@</string><string>daemon</string></array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ProcessType</key><string>Interactive</string>\n  <key>StandardOutPath</key><string>@LOG@</string>\n  <key>StandardErrorPath</key><string>@LOG@</string>\n</dict></plist>\n"
-            .replace("@BIN@", &guard.display().to_string())
-            .replace("@LOG@", &log.display().to_string());
+            .replace("@BIN@", &xml_escape(&guard.display().to_string()))
+            .replace("@LOG@", &xml_escape(&log.display().to_string()));
         // ── 内容比对：决定「新写」「重写」还是「不动」──
         let existing = std::fs::read_to_string(&path).ok();
         let needs_write = match &existing {

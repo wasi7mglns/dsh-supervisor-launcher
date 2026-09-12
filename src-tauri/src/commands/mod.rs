@@ -316,11 +316,11 @@ pub async fn guard_start(app: tauri::AppHandle) -> ShellResult<serde_json::Value
     let task = tauri::async_runtime::spawn_blocking(move || crate::domain::guardctl::ensure_guard(&a));
     let r = match tokio::time::timeout(GUARD_TOTAL_BUDGET, task).await {
         Ok(Ok(inner)) => inner,
-        Ok(Err(e)) => Err(format!("守卫启动任务异常: {}", e).into()),
+        Ok(Err(e)) => Err(format!("守卫启动任务异常: {}", e)),
         Err(_) => Err(format!(
             "守卫启动超时（{} 秒未完成）。可能原因：服务管理器无响应，或守卫进程无法启动。请用 dsh-supervisor-gui --service-plan 查看服务定义状态。",
             GUARD_TOTAL_BUDGET.as_secs()
-        ).into()),
+        )),
     };
     Ok(match r {
         Ok(()) => serde_json::json!({"ok": true}),

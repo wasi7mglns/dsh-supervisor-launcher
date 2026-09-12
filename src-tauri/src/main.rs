@@ -109,13 +109,9 @@ fn run_install(app: &tauri::AppHandle) -> Result<(String, String), String> {
     }
 }
 
-/// 内核可执行名候选（跨平台）：Windows 上 npm 可能生成 .cmd 垫片；Unix 无扩展名。
-
-
-
-
-
-
+// ⚠ 此处原有孤立文档注释「内核可执行名候选（跨平台）…」+ 6 行空行（2026-09-12 清理）：
+//   它描述的函数在更早的重构中已删除（候选名现由 platform trait 的 core_exe_names 提供），
+//   留下一条**没有宿主**的文档注释与连续空行 —— clippy 报 empty_lines_after_doc_comments。
 
 // ── 守卫服务的「启停」已迁入 platform 层（2026-09-11）──
 //
@@ -233,7 +229,7 @@ fn cli_service_plan() -> i32 {
 
     let apply = std::env::args().any(|a| a == "--service-apply");
     if !apply {
-        println!("");
+        println!();
         println!("（未写盘。加 --service-apply 实际建立服务定义）");
         return 0;
     }
@@ -243,7 +239,7 @@ fn cli_service_plan() -> i32 {
     };
     match platform::service().ensure_defined(&g) {
         Ok(desc) => {
-            println!("");
+            println!();
             println!("建立结果      = {}", desc);
             println!("建立后现存    = {}", if platform::service().definition_path().is_file() { "是" } else { "否" });
             0
@@ -329,7 +325,7 @@ fn main() {
             bt!("setup enter");
             // 托盘直发本地 API 的端口：显式 DSH_SUPERVISOR_TRAY_PORT 优先，否则从用户 config.apiPort 解析
             let port: u16 = std::env::var("DSH_SUPERVISOR_TRAY_PORT")
-                .ok().and_then(|p| p.parse().ok()).unwrap_or_else(|| env::api_port());
+                .ok().and_then(|p| p.parse().ok()).unwrap_or_else(env::api_port);
             let handle = app.handle().clone();
 
             // 壳身份初始化（2026-09-11）：写 ~/.dsh/shell/identity.json + shell.log，
@@ -458,7 +454,7 @@ fn main() {
                     let port = env::api_port();
                     // 契约 §4.1：停被管对象（等回执）→ 由所有者停止守卫 → 壳退出
                     domain::guardctl::shutdown_all(port);
-                    let _ = app.exit(0);
+                    app.exit(0);
                     return;
                 }
                 let _ = window.hide();

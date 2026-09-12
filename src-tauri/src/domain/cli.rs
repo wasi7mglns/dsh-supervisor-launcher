@@ -11,7 +11,7 @@ pub(crate) fn cli_mirror_plan() -> i32 {
     println!("== 镜像测速自检 ==");
     let m = crate::mirror::load();
     println!("Node 候选 {} 个 / npm 候选 {} 个", m.node.len(), m.npm.len());
-    println!("");
+    println!();
     println!("--- 并行测速（Node index.json）---");
     let np = crate::mirror::probe_all(&m.node, "index.json");
     for p in &np {
@@ -22,7 +22,7 @@ pub(crate) fn cli_mirror_plan() -> i32 {
             p.latency_ms
         );
     }
-    println!("");
+    println!();
     println!("--- 并行测速（npm registry）---");
     let pp = crate::mirror::probe_all(&m.npm, "");
     for p in &pp {
@@ -33,7 +33,7 @@ pub(crate) fn cli_mirror_plan() -> i32 {
             p.latency_ms
         );
     }
-    println!("");
+    println!();
     match np.iter().find(|p| p.ok) {
         Some(b) => println!("Node 选中: {} ({} ms)", b.source, b.latency_ms),
         None => println!("Node 选中: 无（全部不可达）"),

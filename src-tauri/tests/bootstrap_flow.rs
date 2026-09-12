@@ -38,8 +38,8 @@ fn bootstrap_html() -> String {
         let tag = &after[..open_end];
         if let Some(s) = tag.find("src=") {
             let tail = &tag[s + 4..];
-            let tail = tail.trim_start_matches(|c| c == ' ' || c == '\t' || c == '"' || c == '\'');
-            let end = tail.find(|c| c == '"' || c == '\'').unwrap_or(tail.len());
+            let tail = tail.trim_start_matches([' ', '\t', '"', '\'']);
+            let end = tail.find(['"', '\'']).unwrap_or(tail.len());
             let rel = &tail[..end];
             if let Ok(js) = fs::read_to_string(root.join(rel)) {
                 all.push('\n');
@@ -318,10 +318,13 @@ fn b11_windows_config_disables_shadow_and_stays_in_sync() {
 #[test]
 fn b12_no_stale_desktop_update_wording() {
     let html = bootstrap_html();
+    // ⚠ 2026-09-12 修正（clippy never_loop）：原写成
+    //     `let idx = 0; while let Some(p) = html[idx..].find(bad) { …panic… }`
+    //   —— `idx` 从不更新，循环体又必定 panic，故**循环只可能执行 0 或 1 次**。
+    //   它能通过是因为「找到即 panic」，但形态本身是误导（看起来像在扫描全部出现处）。
+    //   改为直白的 `if let`：语义完全相同，且不再伪装成循环。
     for bad in ["桌面更新"] {
-        let idx = 0;
-        while let Some(p) = html[idx..].find(bad) {
-            let abs = idx + p;
+        if let Some(abs) = html.find(bad) {
             let line_start = html[..abs].rfind(char::is_whitespace).map(|x| x + 1).unwrap_or(0);
             let line_end = html[abs..].find(char::is_whitespace).map(|x| abs + x).unwrap_or(html.len());
             panic!("B12 FAIL 仍含旧措辞「{}」：{}", bad, html[line_start..line_end].trim());
@@ -1154,7 +1157,7 @@ fn b45_platform_tag_is_arch_aware() {
     // ⚠ 反向自检：确保找的是**实现文件**而非又一处注释 ——
     //   若 platform_sources() 未来不再含这些串，上面会失败（不会静默通过）。
     assert!(
-        platform_sources().len() > 0,
+        !platform_sources().is_empty(),
         "B45 FAIL platform_sources() 为空（测试读不到实现）"
     );
     eprintln!("B45 PASS platform tag arch-aware（读 platform 实现，非注释）");
@@ -1696,8 +1699,8 @@ fn g5_frontend_scripts_syntax_and_error_handling() {
                 blocks.push(body.to_string());
             } else if let Some(sq) = attrs.find("src=") {
                 let tail = &attrs[sq + 4..];
-                let tail = tail.trim_start_matches(|c: char| c == ' ' || c == '\t' || c == '"' || c == '\'');
-                let end = tail.find(|c: char| c == '"' || c == '\'').unwrap_or(tail.len());
+                let tail = tail.trim_start_matches([' ', '\t', '"', '\'']);
+                let end = tail.find(['"', '\'']).unwrap_or(tail.len());
                 let rel = &tail[..end];
                 // 拆分后的外部模块同样是「会执行的 JS」，必须一并检查（否则 G5 空转）
                 if let Ok(js) = fs::read_to_string(manifest_dir().join("bootstrap").join(rel)) {

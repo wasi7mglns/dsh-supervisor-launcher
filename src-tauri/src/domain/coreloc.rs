@@ -48,7 +48,7 @@ pub(crate) fn locate_core_candidates(resource_dir: Option<PathBuf>) -> Vec<PathB
     // 平台额外候选（Windows 的 %APPDATA%\npm 与包内真实脚本；macOS 的 Homebrew 落点）
     // —— 已下沉到 platform 层（2026-09-11），本文件不再出现平台分支。
     {
-        let names: Vec<&str> = crate::domain::coreloc::core_exe_names().iter().copied().collect();
+        let names: Vec<&str> = crate::domain::coreloc::core_exe_names().to_vec();
         let pkg = crate::core::package_name().ok();
         for p in crate::platform::current().core_extra_candidates(&names, pkg.as_deref()) {
             add(p, &mut out);

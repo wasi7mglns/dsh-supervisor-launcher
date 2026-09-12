@@ -42,7 +42,16 @@ impl Platform for Impl {
 
     fn node_artifact(&self, version: &str) -> Option<super::NodeArtifact> {
         // 官方 files[] 两个标签都存在（实测）。
-        let arch = if std::env::consts::ARCH == "aarch64" { "arm64" } else { "x64" };
+        //
+        // ⚠ 2026-09-12（P2）：原为「非 aarch64 即 x64」——静默把未知架构当 x64，
+        //   而 core.rs::package_name() 对同一事实是显式 match + Err（两处两种态度）。
+        //   本函数返回 Option，故未知架构用 None 表达「无可用制品」，
+        //   由调用方如实报告，而不是拿到一个架构不符的包（那比明确失败更糟）。
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            _ => return None,
+        };
         let tag = if arch == "arm64" { "linux-arm64" } else { "linux-x64" };
         Some(super::NodeArtifact {
             tag,

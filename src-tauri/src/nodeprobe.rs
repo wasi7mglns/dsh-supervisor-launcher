@@ -24,7 +24,7 @@
 //! 实现细节说明：本文件刻意不使用反引号与单引号字面量（用数值 92/58 表达反斜杠与冒号），
 //! 以免文档与代码在跨格式传递时被转义破坏。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -415,7 +415,7 @@ fn detect() -> (Option<PathBuf>, Option<String>, Option<String>) {
 }
 
 /// 探测单个候选：stage → 可用性判定 → 执行取版本 → 落追踪。返回版本（成功时）。
-fn try_probe(source: &str, cand: &PathBuf) -> Option<String> {
+fn try_probe(source: &str, cand: &Path) -> Option<String> {
     let p = cand.to_string_lossy().to_string();
     stage(&format!("探测候选 {}（{}）", source, p));
     let t0 = Instant::now();
