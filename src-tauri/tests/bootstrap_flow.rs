@@ -1043,6 +1043,65 @@ fn b56_windows_schtasks_tr_value_is_quoted() {
     eprintln!("B56 PASS schtasks /TR value is quoted");
 }
 
+/// B57：**异步命令不得在 tokio worker 上做阻塞工作**（P1-H 回归，2026-09-12）。
+///
+/// ## 缺陷
+///
+/// `core_plan` 是 `async fn`，但旧实现在里面**同步**调用 `locate_core` ——
+/// 而后者会逐个候选**执行内核二进制**拿版本（每个上限 10s，见 core.rs）。
+///
+/// 后果：候选多、或某候选损坏/被安全软件拦截时，可累积数十秒，
+///   期间同进程其它 async IPC（如 `node_status` 轮询）排队 →
+///   表现为「检查内核版本」阶段整体卡顿。
+///
+/// 这正是「同一根因改了一处、漏了一处」：同文件的 `core_status` 早已改为 `spawn_blocking`，
+///   而 `core_plan` 自己的文档就写着「网络调用放线程池，不阻塞 UI 线程」。
+///
+/// ## 断言
+///   阻塞调用 `locate_core` 必须出现在 `spawn_blocking` 闭包内，
+///   而不是直接在 async fn 体里调用。
+#[test]
+fn b57_async_commands_do_not_block_on_tokio_worker() {
+    let c = fs::read_to_string(manifest_dir().join("src").join("commands").join("mod.rs"))
+        .expect("commands/mod.rs");
+
+    // 取出 core_plan 函数体
+    let start = c.find("pub async fn core_plan").expect("B57 FAIL 未找到 core_plan");
+    let rest = &c[start..];
+    let end = rest[1..].find("\n}\n").map(|i| i + 1).unwrap_or(rest.len());
+    let body = &rest[..end];
+
+    assert!(
+        body.contains("spawn_blocking"),
+        "B57 FAIL core_plan 未使用 spawn_blocking —— 阻塞会占用 tokio worker"
+    );
+    // locate_core 必须在 spawn_blocking 之后出现（即在闭包内）
+    let i_sb = body.find("spawn_blocking").expect("B57 FAIL 无 spawn_blocking");
+    let i_lc = body.find("locate_core").expect("B57 FAIL core_plan 未调用 locate_core（断言失效？）");
+    assert!(
+        i_sb < i_lc,
+        "B57 FAIL locate_core 在 spawn_blocking **之前** —— 仍是同步阻塞调用"
+    );
+
+    // 反向覆盖：同一类阻塞调用在其它 async 命令里也必须经线程池
+    for (cmd, blocking) in [
+        ("pub async fn core_status", "locate_core_with_version"),
+        ("pub async fn guard_start", "ensure_guard"),
+    ] {
+        let s = c.find(cmd).unwrap_or_else(|| panic!("B57 FAIL 未找到 {}", cmd));
+        let r = &c[s..];
+        let e = r[1..].find("\n}\n").map(|i| i + 1).unwrap_or(r.len());
+        let b = &r[..e];
+        assert!(
+            b.contains("spawn_blocking"),
+            "B57 FAIL {} 未使用 spawn_blocking（阻塞调用 {}）",
+            cmd,
+            blocking
+        );
+    }
+    eprintln!("B57 PASS async commands offload blocking work");
+}
+
 /// B44：本地 TCP 连接必须有**连接**超时，且守卫探针不得占用主线程。
 ///
 /// `TcpStream::connect` **没有超时**：端口被防火墙 DROP（而非 REJECT）时会等到 OS

@@ -227,10 +227,26 @@ pub async fn core_status(app: tauri::AppHandle) -> serde_json::Value {
 }
 
 /// 内核版本规划（引导页决策输入）：本地已装版本 + 远端最高版本 + 动作(install/upgrade/none)。
-/// 网络调用放线程池，不阻塞 UI 线程。
+///
+/// ⚠ **两段都必须 spawn_blocking**（P1-H 修复，2026-09-12）：
+///   `locate_core` 会**逐个候选执行内核二进制**拿版本（每个候选上限 10s，见 core.rs），
+///   是**同步阻塞**调用。旧实现直接在 async fn 里调它 → 占用 tokio worker：
+///   候选多、或某候选损坏/被安全软件拦截时，可累积数十秒，
+///   期间同进程其它 async IPC（如 node_status 轮询）排队 → 表现为「检查内核版本」阶段整体卡顿。
+///
+///   这正是「同一根因改了一处、漏了一处」：同文件的 `core_status` 早已改为 spawn_blocking，
+///   而它自己的文档也写着「网络调用放线程池，不阻塞 UI 线程」—— core_plan 没跟进。
 #[tauri::command]
 pub async fn core_plan(app: tauri::AppHandle) -> ShellResult<serde_json::Value> {
-    let installed = crate::domain::coreloc::locate_core(&app).and_then(|b| crate::core::installed_version(&b));
+    // ① 本地定位 + 版本探测（阻塞，逐候选执行二进制）
+    let installed = tauri::async_runtime::spawn_blocking(move || {
+        let a = app.clone();
+        crate::domain::coreloc::locate_core(&a).and_then(|b| crate::core::installed_version(&b))
+    })
+    .await
+    .ok()
+    .flatten();
+    // ② 远端最高版本（网络，同样经线程池）
     let pkg = crate::core::package_name()?;
     let latest = tauri::async_runtime::spawn_blocking(move || crate::core::latest_version(&pkg))
         .await.map_err(|e| ShellError::ipc(e.to_string()))?;
