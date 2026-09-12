@@ -126,7 +126,12 @@ jobs:
           # ⚠ 不用 `--lib`：本包是 **bin crate**（无 library target），
           #   `--lib` 会直接 `error: no library targets found` 并退出 101。
           #   `--bins` 覆盖 src 内嵌的 #[cfg(test)] 单元测试。
-          cargo test --bins --test bootstrap_flow --test update_guard_test 2>&1 | tail -80
+          # G6-i/j 与 U-a..d 分别锁定「跨仓 probe 超时单一事实源」「SHA 清单失败不中断回退」
+          # 与「未知平台实现的 trait 方法归属」——后者尤其重要：该模块被
+          # #[cfg(not(any(linux,macos,windows)))] 排除，三大平台构建根本不编译它，
+          # 故**只有静态结构门禁**能拦住「方法放错 impl 块」这类缺陷。
+          cargo test --bins --test bootstrap_flow --test update_guard_test \
+            --test platform_unsupported_structure_test 2>&1 | tail -80
         working-directory: src-tauri
 
       - name: 壳无头冒烟（--node-plan：环境探针 + 官方最新 LTS）

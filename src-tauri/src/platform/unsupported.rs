@@ -76,6 +76,27 @@ impl ServiceControl for Impl {
             .map_err(|e| format!("直接拉起守卫失败: {}", e))?;
         Ok(child.id())
     }
+}
+
+// ⚠ 2026-09-12（P1 修复）：**这里必须收束 ServiceControl，另起 Platform 的 impl**。
+//
+//   缺陷：原实现把 Platform 的 11 个必需方法（node_artifact / node_candidate_paths /
+//     node_bin_after_install / is_usable_executable / core_extra_candidates /
+//     is_local_fixed_dir / install_node / has_privilege_channel / node_exe_name /
+//     npm_exe_name / core_exe_names）写在了 ServiceControl 的 impl 块内 ——
+//     而 ServiceControl 只有 6 个方法（kind/definition_path/ensure_defined/start/stop/spawn_daemon），
+//     于是：(a) Platform 的 impl 缺 11 个必需方法；(b) 这 11 个方法在 ServiceControl 里
+//     属「不属于该 trait 的项」。两者都是编译错误。
+//
+//   为何从未暴露：platform/mod.rs 用
+//       #[cfg(not(any(target_os = "linux", "macos", "windows")))]
+//     把本模块整体排除 —— 三大平台构建根本不编译它。
+//     于是「未知平台显式 Unsupported、绝不静默成功」的承诺在源码层不成立：
+//     任何移植/新增 target 的那一刻就会编译失败。
+//
+//   修法：在此收束 ServiceControl，另起 Platform 的 impl。
+//   门禁：tests/platform_unsupported_structure_test.rs（U-a/U-b/U-c/U-d）。
+impl Platform for Impl {
     fn node_artifact(&self, _version: &str) -> Option<super::NodeArtifact> {
         // 未知平台：**显式返回 None**（无可用制品），而不是猜一个。
         None
