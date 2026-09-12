@@ -103,6 +103,24 @@
 ```
 
 每条修复都配了**注入 → 失败 → 还原 → 通过**的验证；门禁均实测能失败。
+### 第二轮：P2/P3 批量修复（2026-09-12 续）
+
+| # | 位置 | 缺陷 | 回归测试 |
+|---|---|---|---|
+| **G1 盲区** | 壳 `tests/bootstrap_flow.rs` | 门禁只拦 `#[cfg(` **属性**，看不见 `cfg!()` **宏** → 平台/ 之外实有 3 处生产平台分支（env/core/coreloc）| B59（含反向自检）|
+| **hint 未序列化** | 壳 `error.rs` | `hint()` 只是 Rust 方法、从未进 JSON → 前端 `e.hint` 恒 undefined，可操作建议永远到不了用户 | 2 项内嵌单测 |
+| **B45/B46 空转** | 壳 `tests/bootstrap_flow.rs` | 断言读的是**注释**（实现已下沉 platform/）→ 门禁永久为真，拦不住真实缺陷 | 注入验证：改坏实现即 FAIL |
+| **服务定义只创建不更新** | 壳三平台 `ensure_defined` | 「已存在即返回」→ 模板演进后老用户永远跑旧定义（P3 引号修复因此到不了已装用户）| B60（静态）+ B61（行为级）|
+| **GBK 丢诊断** | 壳 `bounded.rs`/`core.rs` | `read_to_string` 遇非 UTF-8 返回空 → 中文 Windows 上失败详情全丢 | B62 |
+| **重复执行器** | 壳 `core.rs` | 复制了 bounded.rs 的完整实现且**行为已分叉**（漏 stdin(null)/曾用毫秒名/漏 prepare）| B63 |
+| **内核死代码** | `supervisor.js`/`settings-view.js` | 死导入 child_process（G9 盲区）· 死方法 guardSelfUpdateDir | — |
+| **systemd 引号** | 壳 `platform/linux.rs` | `ExecStart` 路径未加引号 → 家目录含空格时命令被拆断（systemd-analyze 实测确认）| B58 |
+
+⚠ **两处审计误判已被拦下**（未采纳）：
+  · 「`self-update.js` 整文件死代码」—— 实际被 `guard-update-test.js` require、API 面在线；若照删会破坏守卫自更新；
+  · 我一度认定「内核 CI 不跑 npm test」—— 实际 `ci-core.sh [2/5]` 会跑（只是无 Linux runner）。
+
+两处均通过**逐条复核**发现，印证「子代理报告不构成证据」。
 
 
 ---
