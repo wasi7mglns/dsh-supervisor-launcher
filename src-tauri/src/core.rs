@@ -44,9 +44,9 @@ pub fn package_name() -> Result<String, String> {
     Ok(format!("@dsh-sup/dsh-core-{}-{}", os, arch))
 }
 
-/// npm 可执行名（Windows 需 .cmd 后缀）。
+/// npm 可执行名（Windows 需 .cmd 后缀）—— 下沉到 trait（P2/G1）。
 pub fn npm_exe() -> &'static str {
-    if cfg!(windows) { "npm.cmd" } else { "npm" }
+    crate::platform::current().npm_exe_name()
 }
 
 fn num_ok(s: &str) -> bool {

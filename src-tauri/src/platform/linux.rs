@@ -117,6 +117,11 @@ impl Platform for Impl {
                 .unwrap_or(false)
         })
     }
+
+    // ── 可执行文件名的平台差异（P2/G1：原为平台层之外的 cfg!() 宏）──
+    fn node_exe_name(&self) -> &'static str { "node" }
+    fn npm_exe_name(&self) -> &'static str { "npm" }
+    fn core_exe_names(&self) -> &'static [&'static str] { &["dsh-supervisor"] }
 }
 
 impl ServiceControl for Impl {

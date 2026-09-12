@@ -13,9 +13,9 @@ use tauri::Manager;
 
 use std::path::PathBuf;
 
+/// 内核可执行候选名 —— 下沉到 trait（P2/G1：原为 `cfg!()` 宏）。
 pub(crate) fn core_exe_names() -> &'static [&'static str] {
-    if cfg!(windows) { &["dsh-supervisor.exe", "dsh-supervisor.cmd", "dsh-supervisor"] }
-    else { &["dsh-supervisor"] }
+    crate::platform::current().core_exe_names()
 }
 
 /// 收集全部内核候选（去重 + 解析符号链接），供「按版本最高仲裁」使用。

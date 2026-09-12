@@ -134,6 +134,11 @@ impl Platform for Impl {
         // macOS 的 osascript 管理员授权**恒可用**（无需额外命令）。
         true
     }
+
+    // ── 可执行文件名的平台差异（P2/G1：原为平台层之外的 cfg!() 宏）──
+    fn node_exe_name(&self) -> &'static str { "node" }
+    fn npm_exe_name(&self) -> &'static str { "npm" }
+    fn core_exe_names(&self) -> &'static [&'static str] { &["dsh-supervisor"] }
 }
 
 impl ServiceControl for Impl {

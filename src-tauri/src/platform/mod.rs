@@ -146,6 +146,28 @@ pub trait Platform: Send + Sync {
     ///
     /// **不主动执行提权**，只探测命令存在性。
     fn has_privilege_channel(&self) -> bool;
+
+    // ── 可执行**文件名**的平台差异（P2/G1 修复，2026-09-12）──
+    //
+    // 为什么这三个要进 trait：它们此前以 `cfg!()` 形式散落在 env.rs / core.rs /
+    //   domain/coreloc.rs —— 而门禁 G1 只拦 `#[cfg(` **属性**，看不见 `cfg!()` **宏**，
+    //   于是「平台分支只在 platform/」这条约束被绕过（三处生产代码在 platform/ 之外）。
+    //
+    // 语义差别也重要：`cfg!` **不做条件编译裁剪**，两个分支都参与类型检查，
+    //   平台知识会随调用点扩散；`#[cfg]` 属性则按目标平台裁剪。
+    //   进 trait 后由各平台文件实现，语义与 G1 的意图一致。
+
+    /// Node 可执行**文件名**（Windows `node.exe` / 其余 `node`）。
+    fn node_exe_name(&self) -> &'static str;
+
+    /// npm 可执行**文件名**（Windows `npm.cmd` / 其余 `npm`）。
+    ///
+    /// ⚠ 与内核侧 `platform/os/exec-path.js::npmBin()` 是**同一事实的两端**：
+    ///   Windows 上 npm 是 `.cmd`，Node 的 spawn 不做 PATHEXT 解析（P1-C 已修）。
+    fn npm_exe_name(&self) -> &'static str;
+
+    /// 内核可执行文件的**候选名**（Windows 含 `.exe`/`.cmd` 垫片）。
+    fn core_exe_names(&self) -> &'static [&'static str];
 }
 
 // ── 平台实现的选择：**本文件是全仓唯一出现平台分支的地方**（门禁 G1）──

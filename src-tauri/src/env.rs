@@ -14,8 +14,9 @@ const NODE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 兼容包装 probe_system_node 的有界预算（真正执行在 nodeprobe 的分离线程里）。
 const NODE_PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(20);
 
+/// Node 可执行名 —— 平台知识已下沉到 trait（P2/G1：原为 `cfg!()` 宏，门禁 G1 只拦 `#[cfg(` 属性，看不见它）。
 pub fn node_exe() -> &'static str {
-    if cfg!(windows) { "node.exe" } else { "node" }
+    crate::platform::current().node_exe_name()
 }
 
 /// 候选是否可用（平台判定）。

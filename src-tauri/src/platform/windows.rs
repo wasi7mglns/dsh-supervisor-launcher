@@ -199,6 +199,16 @@ impl Platform for Impl {
         // Windows 的 UAC 提权**恒可用**（msiexec -Verb RunAs）。
         true
     }
+
+    // ── 可执行文件名的平台差异（P2/G1：原为平台层之外的 cfg!() 宏）──
+    fn node_exe_name(&self) -> &'static str { "node.exe" }
+    /// Windows 上 npm 是 `.cmd`；Node 的 spawn/execFileSync **不做 PATHEXT 解析** ——
+    /// 与内核侧 `platform/os/exec-path.js::npmBin()` 同一事实（P1-C）。
+    fn npm_exe_name(&self) -> &'static str { "npm.cmd" }
+    /// Windows 内核候选：`.cmd` 垫片必须在内 —— PATH 解析只认扩展名形态。
+    fn core_exe_names(&self) -> &'static [&'static str] {
+        &["dsh-supervisor.exe", "dsh-supervisor.cmd", "dsh-supervisor"]
+    }
 }
 
 impl ServiceControl for Impl {

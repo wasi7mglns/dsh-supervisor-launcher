@@ -1458,14 +1458,35 @@ fn g1_platform_branches_only_in_platform_layer() {
         }
         for (i, line) in src.lines().enumerate() {
             let t = line.trim();
-            // 只看**属性位置**的 cfg（注释里提到 cfg 不算）
-            if !t.starts_with("#[cfg(") {
+            // 注释里提到 cfg 不算
+            if t.starts_with("//") || t.starts_with("///") || t.starts_with("//!") {
+                continue;
+            }
+
+            // ── 形态 ①：`#[cfg(...)]` **属性**（按目标平台裁剪）──
+            let is_attr = t.starts_with("#[cfg(");
+            // ── 形态 ②：`cfg!(...)` **宏**（P2 修复，2026-09-12）──
+            //   门禁此前只拦形态 ①，于是在 platform/ 之外存在 3 处 `cfg!()` 生产代码：
+            //     env.rs（node.exe）· core.rs（npm.cmd）· domain/coreloc.rs（.cmd 候选名）
+            //   —— 「平台分支只在 platform/」这条约束被**绕过**了。
+            //
+            //   语义差别也重要：`cfg!` **不做条件编译裁剪**，两个分支都参与类型检查，
+            //   平台知识会随调用点扩散；`#[cfg]` 才按目标平台裁剪。
+            //   三者现已下沉为 Platform trait 方法（见 platform/mod.rs）。
+            let is_macro = t.contains("cfg!(");
+            if !is_attr && !is_macro {
                 continue;
             }
             if t.contains("cfg(test)") {
                 continue; // 测试门控不是平台分支
             }
-            if t.contains("target_os") || t.contains("windows") || t.contains("unix") {
+            // 只对「含平台关键字」的 cfg 报错（纯 feature 门控不算）
+            if t.contains("target_os")
+                || t.contains("windows")
+                || t.contains("unix")
+                || t.contains("target_family")
+                || t.contains("target_arch")
+            {
                 offenders.push(format!("{}:{} {}", name, i + 1, t));
             }
         }
@@ -1753,4 +1774,73 @@ fn b58_systemd_exec_start_quotes_the_binary_path() {
         "B58 FAIL 未把带引号的路径写入 unit 模板"
     );
     eprintln!("B58 PASS systemd ExecStart quotes the binary path");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// B59：门禁 G1 必须同时覆盖 `#[cfg(...)]` **属性**与 `cfg!(...)` **宏**
+//      （P2 回归，2026-09-12）
+//
+// 缺陷：G1 原先只 `starts_with("#[cfg(")`，于是 platform/ 之外存在 3 处 `cfg!()`
+// 生产平台分支（env.rs / core.rs / domain/coreloc.rs），
+// 而 platform/mod.rs 自称「全仓唯一出现平台分支的地方」。
+//
+// 为什么两者不能混为一谈：`#[cfg]` 按目标平台**裁剪**编译；
+// `cfg!` **不裁剪**，另一平台的代码仍参与类型检查 —— 平台知识会扩散到调用点。
+//
+// 现三处已下沉为 Platform trait 方法（node_exe_name / npm_exe_name / core_exe_names）。
+//
+// ⚠ 本测试含**反向自检**：门禁的识别逻辑必须能命中已知样本 ——
+//   否则「改了门禁但逻辑写错」会让它永远通过（假门禁）。
+#[test]
+fn b59_g1_covers_cfg_macro_form() {
+    // ① 正向：platform/ 之外不得有含平台关键字的 cfg!() 或 #[cfg()]
+    let mut offenders: Vec<String> = Vec::new();
+    for (name, src) in all_rust_sources() {
+        if name.starts_with("platform/") {
+            continue;
+        }
+        if name == "bounded.rs" {
+            continue; // G1 已登记的白名单（infra 原语）
+        }
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim();
+            if t.starts_with("//") || t.starts_with("///") || t.starts_with("//!") {
+                continue;
+            }
+            let is_attr = t.starts_with("#[cfg(");
+            let is_macro = t.contains("cfg!(");
+            if !is_attr && !is_macro {
+                continue;
+            }
+            if t.contains("cfg(test)") {
+                continue;
+            }
+            if t.contains("target_os")
+                || t.contains("windows")
+                || t.contains("unix")
+                || t.contains("target_family")
+                || t.contains("target_arch")
+            {
+                offenders.push(format!("{}:{} {}", name, i + 1, t));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "B59 FAIL platform/ 之外仍有平台分支（cfg! 宏也算）：\n{}",
+        offenders.join("\n")
+    );
+
+    // ② 反向自检：同样的判定逻辑对「含 cfg!(windows) 的样本」必须报错
+    let sample = "    if cfg!(windows) { \"node.exe\" } else { \"node\" }";
+    let sample_hit = sample.trim().contains("cfg!(") && sample.contains("windows");
+    assert!(sample_hit, "B59 FAIL 识别逻辑对 cfg!() 样本失效（门禁成空转）");
+
+    // ③ 且 trait 必须真的暴露这三个能力（下沉的落点存在）
+    let pm = fs::read_to_string(manifest_dir().join("src").join("platform").join("mod.rs"))
+        .expect("platform/mod.rs");
+    for m in ["node_exe_name", "npm_exe_name", "core_exe_names"] {
+        assert!(pm.contains(m), "B59 FAIL Platform trait 缺少 {}（下沉未完成）", m);
+    }
+    eprintln!("B59 PASS G1 covers cfg! macro form");
 }

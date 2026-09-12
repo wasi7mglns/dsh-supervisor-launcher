@@ -117,4 +117,10 @@ impl ServiceControl for Impl {
     fn has_privilege_channel(&self) -> bool {
         false
     }
+
+    // ── 可执行文件名的平台差异（P2/G1）──
+    // 未知平台按 POSIX 形态给出（保守：至少不引入 Windows 专有扩展名）。
+    fn node_exe_name(&self) -> &'static str { "node" }
+    fn npm_exe_name(&self) -> &'static str { "npm" }
+    fn core_exe_names(&self) -> &'static [&'static str] { &["dsh-supervisor"] }
 }
