@@ -1927,3 +1927,52 @@ fn b60_service_definition_self_heals_on_content_drift() {
     );
     eprintln!("B60 PASS service definitions self-heal on drift");
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// B62：子进程诊断必须**容忍非 UTF-8**，临时文件名不得撞名（P2 回归，2026-09-12）。
+//
+// ## 缺陷一：GBK 输出被静默丢弃
+//
+// `bounded.rs::read_log` 用 `read_to_string(...).unwrap_or_default()`，
+// `core.rs::read_log` 用 `f.read_to_string(...)` —— 两者在**非 UTF-8** 时都返回空串。
+// 而中文版 Windows 上 `schtasks`/`systemctl`/`npm` 的 stderr 是 **GBK** ——
+// 于是「失败（退出码 N）：<详情>」里的详情**全丢**，与「如实报错」的设计目标相反。
+//
+// ## 缺陷二：临时文件名用毫秒时间戳会撞名
+//
+// `core.rs` 用毫秒时间戳：同进程同毫秒内的并发调用（core_status 与 core_plan）
+// 会生成同名临时文件 → 互相截断/删除 → 可能读到错内容。`bounded.rs` 一直用纳秒。
+#[test]
+fn b62_subprocess_diagnostics_survive_non_utf8() {
+    let b = fs::read_to_string(manifest_dir().join("src").join("bounded.rs")).expect("bounded.rs");
+    let c = fs::read_to_string(manifest_dir().join("src").join("core.rs")).expect("core.rs");
+
+    for (name, src) in [("bounded.rs", &b), ("core.rs", &c)] {
+        let i = match src.find("fn read_log") {
+            Some(v) => v,
+            None => panic!("B62 FAIL {} 未找到 read_log", name),
+        };
+        let end = (i + 420).min(src.len());
+        let body = &src[i..end];
+        assert!(
+            body.contains("from_utf8_lossy"),
+            "B62 FAIL {} 的 read_log 未用 lossy —— GBK 输出会被静默丢弃",
+            name
+        );
+        assert!(
+            !body.contains("read_to_string"),
+            "B62 FAIL {} 的 read_log 仍用 read_to_string（非 UTF-8 时返回空）",
+            name
+        );
+    }
+
+    assert!(
+        c.contains("as_nanos()"),
+        "B62 FAIL core.rs 临时文件名仍用毫秒时间戳（并发会撞名）"
+    );
+    assert!(
+        c.contains("Err(_) => String::new()"),
+        "B62 FAIL 读取失败时应返回空串（不是 panic）"
+    );
+    eprintln!("B62 PASS subprocess diagnostics survive non-UTF-8; temp names unique");
+}

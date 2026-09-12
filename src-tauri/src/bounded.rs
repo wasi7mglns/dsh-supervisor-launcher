@@ -131,8 +131,20 @@ pub fn run_lossy(cmd: &mut Command, timeout: Duration) {
     let _ = run(cmd, timeout);
 }
 
+/// 读取子进程输出（**容忍非 UTF-8**）。
+///
+/// ⚠ 2026-09-12（P2 修复）：原实现是 `read_to_string(p).unwrap_or_default()` ——
+///   非 UTF-8 时**静默返回空串**。而中文版 Windows 上 `schtasks`/`systemctl`/`npm`
+///   的 stderr 是 **GBK**，于是所有「失败（退出码 N）：<详情>」里的详情**全丢**，
+///   排障信息消失 —— 与「如实报错」的设计目标正好相反。
+///
+///   现用 `String::from_utf8_lossy`：非法字节替换为 U+FFFD，**详情保留**。
+///   注意用 `fs::read`（读字节）而非 `read_to_string`（本就是为这条路径准备）。
 fn read_log(p: &std::path::Path) -> String {
-    std::fs::read_to_string(p).unwrap_or_default()
+    match std::fs::read(p) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
+    }
 }
 
 fn cleanup(a: &std::path::Path, b: &std::path::Path) {

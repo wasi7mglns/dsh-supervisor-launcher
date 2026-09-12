@@ -13,7 +13,8 @@
 //      只信 latest 会导致「强制更新」变「强制降级」。
 
 use serde_json::Value;
-use std::io::Read;
+// ⚠ 原 `use std::io::Read;` 已移除（2026-09-12）：read_log 改用 fs::read + from_utf8_lossy，
+//   不再需要 Read trait（会触发 unused_imports 警告）。
 use std::path::{Path, PathBuf};
 
 /// 内建默认镜像（与内核 config.registries 同集合；registry.json 缺失时的兜底）。
@@ -369,15 +370,19 @@ fn run_command_bounded(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
 ) -> Result<BoundedOutput, String> {
-    use std::process::Stdio;   // std::io::Read 已在文件顶部导入
+    use std::process::Stdio;
 
     let dir = std::env::temp_dir();
+    // ⚠ 2026-09-12（P2）：时间戳用 **as_nanos** 而非 as_millis ——
+    //   同进程同毫秒内的并发调用（如 core_status 与 core_plan 同时 invoke）
+    //   会生成**同名临时文件**，互相截断/删除 → 可能读到错内容。
+    //   `bounded.rs` 一直用 nanos，此处与之对齐。
     let stamp = format!(
         "{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
+            .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
     let out_path = dir.join(format!("dsh-npm-out-{}.log", stamp));
@@ -432,12 +437,17 @@ fn run_command_bounded(
     })
 }
 
+/// 读取输出（**容忍非 UTF-8**）。
+///
+/// ⚠ 2026-09-12（P2 修复）：原实现 `read_to_string` 在非 UTF-8 时**静默失败**
+///   并返回空串 —— 与 `bounded.rs::read_log` 同一缺陷。
+///   中文版 Windows 上 npm/schtasks 的 stderr 是 GBK → 「安装失败」的详情**全丢**。
+///   现用 `from_utf8_lossy` 保留详情（非法字节 → U+FFFD）。
 fn read_log(p: &Path) -> String {
-    let mut s = String::new();
-    if let Ok(mut f) = std::fs::File::open(p) {
-        let _ = f.read_to_string(&mut s);
+    match std::fs::read(p) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
     }
-    s
 }
 
 
