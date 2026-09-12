@@ -1947,32 +1947,93 @@ fn b62_subprocess_diagnostics_survive_non_utf8() {
     let b = fs::read_to_string(manifest_dir().join("src").join("bounded.rs")).expect("bounded.rs");
     let c = fs::read_to_string(manifest_dir().join("src").join("core.rs")).expect("core.rs");
 
-    for (name, src) in [("bounded.rs", &b), ("core.rs", &c)] {
-        let i = match src.find("fn read_log") {
-            Some(v) => v,
-            None => panic!("B62 FAIL {} 未找到 read_log", name),
-        };
-        let end = (i + 420).min(src.len());
-        let body = &src[i..end];
+    // ⚠ 2026-09-12 更新（B63 去重后）：`core.rs` 的执行器已统一到 `bounded.rs`，
+    //   其自带的 `read_log` 随之删除 —— 故这里只断言**唯一那份**（bounded.rs），
+    //   并反向断言 core.rs **不再**有第二份读取实现（否则又是两处实现）。
+    let i = match b.find("fn read_log") {
+        Some(v) => v,
+        None => panic!("B62 FAIL bounded.rs 未找到 read_log"),
+    };
+    let body = &b[i..(i + 420).min(b.len())];
+    assert!(
+        body.contains("from_utf8_lossy"),
+        "B62 FAIL bounded.rs 的 read_log 未用 lossy —— GBK 输出会被静默丢弃"
+    );
+    assert!(
+        !body.contains("read_to_string"),
+        "B62 FAIL bounded.rs 的 read_log 仍用 read_to_string（非 UTF-8 时返回空）"
+    );
+    assert!(
+        body.contains("Err(_) => String::new()"),
+        "B62 FAIL 读取失败时应返回空串（不是 panic）"
+    );
+
+    // 反向：core.rs 不得再有第二份读取实现（统一到 bounded 后应为零）
+    assert!(
+        !c.contains("fn read_log"),
+        "B62 FAIL core.rs 仍有自己的 read_log（应统一到 bounded.rs）"
+    );
+    // 时间戳的唯一性由 bounded.rs 的 as_nanos 保证（core 已委托）
+    assert!(
+        b.contains("as_nanos()"),
+        "B62 FAIL bounded.rs 临时文件名未用纳秒（并发会撞名）"
+    );
+    eprintln!("B62 PASS subprocess diagnostics survive non-UTF-8; temp names unique");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// B63：有界执行器只能有**一份实现**（P2 去重回归，2026-09-12）。
+//
+// 缺陷：`core.rs` 曾复制了 `bounded.rs` 的完整实现（字段与逻辑逐一相同），
+//   但**行为已分叉**：漏 `stdin(Stdio::null())`、曾用毫秒时间戳、
+//   物探路径漏 `prepare()`（Windows 闪控制台）。
+//   这正是 `bounded.rs` 顶部「所有外部命令一律经它执行」被违反的又一例。
+//
+// 现 `core::run_command_bounded` 只是 `crate::bounded::run` 的薄包装。
+#[test]
+fn b63_single_bounded_executor_implementation() {
+    let c = fs::read_to_string(manifest_dir().join("src").join("core.rs")).expect("core.rs");
+
+    // ① core.rs 不得再自建临时日志/轮询等待（那是 bounded.rs 的职责）
+    for forbidden in [
+        "dsh-npm-out-",
+        "dsh-npm-err-",
+        "child.try_wait()",
+        "let mut child = cmd",
+    ] {
         assert!(
-            body.contains("from_utf8_lossy"),
-            "B62 FAIL {} 的 read_log 未用 lossy —— GBK 输出会被静默丢弃",
-            name
-        );
-        assert!(
-            !body.contains("read_to_string"),
-            "B62 FAIL {} 的 read_log 仍用 read_to_string（非 UTF-8 时返回空）",
-            name
+            !c.contains(forbidden),
+            "B63 FAIL core.rs 仍含自己的执行器实现片段: {}",
+            forbidden
         );
     }
 
+    // ② 必须真的委托给统一实现
     assert!(
-        c.contains("as_nanos()"),
-        "B62 FAIL core.rs 临时文件名仍用毫秒时间戳（并发会撞名）"
+        c.contains("crate::bounded::run(&mut cmd, timeout)"),
+        "B63 FAIL core::run_command_bounded 未委托给 bounded::run"
     );
+
+    // ③ 不得再定义与 bounded::Output 重复的结构。
+    //    ⚠ 必须排除注释行：文档里会**提到**该结构名（说明它已删除），
+    //      直接 `contains` 会把说明文字当成代码（我第一版就踩了这个假阳性）。
+    let code_only: String = c
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        c.contains("Err(_) => String::new()"),
-        "B62 FAIL 读取失败时应返回空串（不是 panic）"
+        !code_only.contains("struct BoundedOutput"),
+        "B63 FAIL core.rs 仍定义 BoundedOutput（与 bounded::Output 重复）"
     );
-    eprintln!("B62 PASS subprocess diagnostics survive non-UTF-8; temp names unique");
+
+    // ④ 反向：bounded.rs 必须仍是那**唯一**一份（含 stdin/null + prepare + nanos）
+    let b = fs::read_to_string(manifest_dir().join("src").join("bounded.rs")).expect("bounded.rs");
+    for required in ["cmd.stdin(Stdio::null())", "prepare(cmd)", "as_nanos()"] {
+        assert!(b.contains(required), "B63 FAIL bounded.rs 缺 {}", required);
+    }
+    eprintln!("B63 PASS single bounded executor implementation");
 }

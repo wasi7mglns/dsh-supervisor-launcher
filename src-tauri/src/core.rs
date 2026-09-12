@@ -358,97 +358,28 @@ pub fn install_version(pkg: &str, version: &str, prefix: Option<&Path>, registry
 /// 但绝不无限等待 —— 超时即杀进程并如实报错（引导页据此给出重试/回退）。
 const NPM_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-struct BoundedOutput {
-    success: bool,
-    code: Option<String>,
-    stdout: String,
-    stderr: String,
-}
-
-/// 有界执行子进程：超出 timeout 即 kill 并返回错误（绝不无限阻塞调用方）。
+/// 有界执行子进程 —— **委托给 `bounded.rs` 的统一实现**（P2 去重，2026-09-12）。
+///
+/// ⚠ 此处原有 `struct BoundedOutput` + 一份 `run_command_bounded` 的**完整复制**：
+///   字段与 `bounded::Output` 逐一相同，逻辑也几乎逐行相同，但**行为已经分叉**：
+///     · 漏 `cmd.stdin(Stdio::null())` —— 子进程会继承 GUI 进程的 stdin；
+///     · 曾用 `as_millis()` 做临时名（并发撞名）而 bounded 一直用 nanos；
+///     · `prepare()`（Windows CREATE_NO_WINDOW）只在 npm 路径手动调过，物探路径漏了 → 闪控制台。
+///   这正是 `bounded.rs` 顶部「所有外部命令一律经它执行」被违反的又一例。
+///
+///   现统一走 `crate::bounded::run`：stdin/prepare/nanos/超时杀进程全部一致，
+///   返回类型直接用 `bounded::Output`（字段本就相同，无需再定义一份）。
 fn run_command_bounded(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
-) -> Result<BoundedOutput, String> {
-    use std::process::Stdio;
-
-    let dir = std::env::temp_dir();
-    // ⚠ 2026-09-12（P2）：时间戳用 **as_nanos** 而非 as_millis ——
-    //   同进程同毫秒内的并发调用（如 core_status 与 core_plan 同时 invoke）
-    //   会生成**同名临时文件**，互相截断/删除 → 可能读到错内容。
-    //   `bounded.rs` 一直用 nanos，此处与之对齐。
-    let stamp = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let out_path = dir.join(format!("dsh-npm-out-{}.log", stamp));
-    let err_path = dir.join(format!("dsh-npm-err-{}.log", stamp));
-
-    let out_file = std::fs::File::create(&out_path).map_err(|e| format!("创建临时日志失败: {}", e))?;
-    let err_file = std::fs::File::create(&err_path).map_err(|e| format!("创建临时日志失败: {}", e))?;
-    cmd.stdout(Stdio::from(out_file));
-    cmd.stderr(Stdio::from(err_file));
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("npm 启动失败: {}（Node 就绪后才能安装内核）", e))?;
-
-    let start = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let partial = read_log(&err_path);
-                    let _ = std::fs::remove_file(&out_path);
-                    let _ = std::fs::remove_file(&err_path);
-                    return Err(format!(
-                        "安装超时（超过 {} 分钟未完成）{}",
-                        timeout.as_secs() / 60,
-                        if partial.is_empty() { String::new() } else { format!("；最后输出：{}", tail(&partial, 400)) }
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&out_path);
-                let _ = std::fs::remove_file(&err_path);
-                return Err(format!("等待 npm 进程失败: {}", e));
-            }
-        }
-    };
-
-    let stdout = read_log(&out_path);
-    let stderr = read_log(&err_path);
-    let _ = std::fs::remove_file(&out_path);
-    let _ = std::fs::remove_file(&err_path);
-
-    Ok(BoundedOutput {
-        success: status.success(),
-        code: status.code().map(|c| c.to_string()),
-        stdout,
-        stderr,
-    })
+) -> Result<crate::bounded::Output, String> {
+    crate::bounded::run(&mut cmd, timeout)
 }
 
-/// 读取输出（**容忍非 UTF-8**）。
-///
-/// ⚠ 2026-09-12（P2 修复）：原实现 `read_to_string` 在非 UTF-8 时**静默失败**
-///   并返回空串 —— 与 `bounded.rs::read_log` 同一缺陷。
-///   中文版 Windows 上 npm/schtasks 的 stderr 是 GBK → 「安装失败」的详情**全丢**。
-///   现用 `from_utf8_lossy` 保留详情（非法字节 → U+FFFD）。
-fn read_log(p: &Path) -> String {
-    match std::fs::read(p) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(_) => String::new(),
-    }
-}
+
+// ── 注：本文件原有的 `read_log` 已删除（2026-09-12 去重）。
+//    它随 `run_command_bounded` 的复制体一起存在；统一到 `bounded.rs` 后成为死代码。
+//    GBK/非 UTF-8 的容忍现由 `bounded.rs::read_log` 单点负责（B62 锁定）。
 
 
 /// 计算规划：只有 latest 严格大于 installed 才需更新（**绝不降级**）。
