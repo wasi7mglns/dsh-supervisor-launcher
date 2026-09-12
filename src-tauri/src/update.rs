@@ -168,17 +168,42 @@ impl Guard {
         }
     }
     fn save(&self) {
+        // ⚠ 上限裁剪（2026-09-13，P3 修复）：pinned 此前**只增不剪**。
+        //
+        //   缺陷：每次「尝试失败达阈值」都会 push 一个**目标版本**（见 init_identity 情况 B），
+        //     而全仓**唯一**的移除点是 init_identity 里那一处 —— 它只解除与**当前运行版本**
+        //     相等的一项。于是失败过的旧目标版本永久留在列表里（及其在 identity.json 的投影）。
+        //     长期反复更新失败的机器上该列表单调增长：文件越来越长，
+        //     而其中绝大多数旧版本**早已不可能再成为更新目标**。
+        //
+        //   修法：在**唯一的持久化点**（本函数）统一裁剪，保留**最近** MAX_PINNED 项。
+        //     放在这里而非各调用点 —— 否则又是「纪律只在一条路径上执行」（失效模式 g）。
+        //     保留最近的（而非最早的）：越新的失败越相关，且更新目标总趋于最新版本。
+        //
+        //   ⚠ 裁剪必须经 pruned_pinned()，**不能在本函数里各写一遍** ——
+        //     否则 update-guard.json 裁剪了，而 write_identity_for 的 identity.json
+        //     投影用未裁剪的 self.pinned（同一事实两处实现再次分叉）。
         write_json(
             &guard_path(),
             &serde_json::json!({
                 "attempt": self.attempt,
                 "pendingVersion": self.pending_version,
-                "pinned": self.pinned,
+                "pinned": self.pruned_pinned(),
                 "lastAttemptAt": self.last_attempt_at,
                 "updatedAt": now_secs(),
             }),
         );
     }
+    /// 裁剪后的本地黑名单（保留**最近** MAX_PINNED 项，丢弃更早的）。
+    ///
+    /// **唯一**的裁剪实现：update-guard.json 的落盘（save）与 identity.json 的
+    /// 护栏投影（write_identity_for）都经它 —— 否则两处会各自裁剪/不裁剪而分叉。
+    fn pruned_pinned(&self) -> Vec<String> {
+        let n = self.pinned.len();
+        let start = n.saturating_sub(MAX_PINNED);
+        self.pinned[start..].to_vec()
+    }
+
     /// 冷却是否已过（未记录时间视作已过，兼容旧账本）。
     fn cooldown_elapsed(&self) -> bool {
         if self.last_attempt_at == 0 {
@@ -202,6 +227,13 @@ fn now_secs() -> u64 {
 
 /// 最大连续失败次数（达到即放弃强制，并把该版本拉黑）。
 const MAX_ATTEMPTS: u32 = 2;
+
+/// 本地黑名单（pinned）的**上限** —— 超过时保留最近 MAX_PINNED 项（见 Guard::save）。
+///
+/// 取 8：足够覆盖「近期若干次失败的目标版本」，又让文件与 identity.json 投影有明确上界。
+/// 被裁掉的都是**很早以前**的目标版本 —— 更新目标总趋于最新，它们不会再被尝试，
+/// 故裁剪不损失任何抑制语义。
+const MAX_PINNED: usize = 8;
 
 /// 写 identity.json —— **身份文件的唯一写入点**。
 ///
@@ -247,7 +279,9 @@ fn write_identity_for(g: &Guard, runtime_fields: &serde_json::Value) -> serde_js
     // 护栏字段：**只**来自 Guard，调用方无法覆盖（即便 runtime_fields 里写了同名键，
     // 也会被下面这三行盖掉）—— 这正是「不可能分叉」的实现保证。
     map.insert("attempt".into(), serde_json::json!(g.attempt));
-    map.insert("pinned".into(), serde_json::json!(g.pinned));
+    // ⚠ pinned 用**裁剪后**的值（与 update-guard.json 同源）—— 否则文件受上限约束
+    //   而 identity.json 投影不受，同一事实两处实现分叉。
+    map.insert("pinned".into(), serde_json::json!(g.pruned_pinned()));
     map.insert("pendingVersion".into(), serde_json::json!(g.pending_version));
     let out = serde_json::Value::Object(map.clone());
     write_json(&identity_path(), &out);
@@ -703,6 +737,90 @@ mod d3_tests {
             serde_json::json!("keep-me"),
             "D-3-e FAIL 未知字段被丢弃（收敛不得变成裁剪）"
         );
+    }
+
+    /// A-6：pinned 不得只增不剪 —— 持久化点必须裁剪到 MAX_PINNED（保留最近）。
+    ///
+    /// 注入：把 Guard::save 里的 take(MAX_PINNED) 改回 self.pinned → 本测试 FAIL。
+    #[test]
+    fn a6_pinned_is_pruned_at_persistence() {
+        let env = Env::new("pinned");
+        // 造一个「长期反复失败」的账本：远超上限的旧目标版本
+        let many: Vec<String> = (0..40).map(|i| format!("0.0.{}", i)).collect();
+        let mut g = Guard::default();
+        g.pinned = many.clone();
+        g.last_attempt_at = now_secs();
+        g.save();
+
+        let saved = env.guard();
+        let pinned = saved["pinned"].as_array().expect("pinned 应为数组");
+        assert!(
+            pinned.len() <= MAX_PINNED,
+            "A-6 FAIL pinned 未裁剪（{} 项，上限 {}）—— 只增不剪",
+            pinned.len(),
+            MAX_PINNED
+        );
+        assert_eq!(pinned.len(), MAX_PINNED, "应恰好保留到上限");
+        // 保留的必须是**最近**的（列表尾部），而不是最早的
+        let kept: Vec<String> = pinned.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        let expected: Vec<String> = many[many.len() - MAX_PINNED..].to_vec();
+        assert_eq!(kept, expected, "A-6 FAIL 裁剪保留的不是最近的项");
+
+        // 反向：未超上限时不得被裁剪（不能变成「最多只记 1 项」）
+        let mut g2 = Guard::default();
+        g2.pinned = vec!["1.0.0".into(), "1.0.1".into()];
+        g2.save();
+        assert_eq!(env.guard()["pinned"], serde_json::json!(["1.0.0", "1.0.1"]));
+    }
+
+    /// A-6（闭环）：init_identity 写入的 identity.json 投影同样受上限约束。
+    #[test]
+    fn a6_pinned_projection_also_bounded() {
+        let _env = Env::new("pinned-proj");
+        let many: Vec<String> = (0..30).map(|i| format!("0.0.{}", i)).collect();
+        let mut g = Guard::default();
+        g.pinned = many;
+        g.save();
+        // 以「已在 pinned 中的版本」启动：解除该项后仍应有界
+        init_identity("0.0.29");
+        let id = identity_snapshot();
+        let n = id["pinned"].as_array().map(|a| a.len()).unwrap_or(0);
+        assert!(n <= MAX_PINNED, "A-6 FAIL identity.json 的 pinned 投影未受上限约束（{} 项）", n);
+        assert!(
+            !id["pinned"].as_array().unwrap().iter().any(|x| x == "0.0.29"),
+            "A-6 FAIL 运行中的版本应被解除拉黑"
+        );
+    }
+
+    /// A-6（投影同源）：identity.json 的 pinned 必须与 update-guard.json **用同一份裁剪结果**。
+    ///
+    /// 注入判据：把 `write_identity_for` 里的 `g.pruned_pinned()` 改回 `g.pinned` ——
+    ///   此时落盘文件受 MAX_PINNED 约束、而投影不受 → **两处不一致** → 本测试 FAIL。
+    ///   （注意必须让**写入方**产生分叉：只把 pruned_pinned 改成返回全量会同时改变两边，
+    ///     那种注入由 a6_pinned_is_pruned_at_persistence 捕获，不是本用例的职责。）
+    #[test]
+    fn a6_projection_and_file_use_same_pruning() {
+        let _env = Env::new("pinned-samesrc");
+        // 不变量：无论 pinned 多长，投影长度 == 文件长度 == 裁剪后长度。
+        for n in [0usize, 1, MAX_PINNED - 1, MAX_PINNED, MAX_PINNED + 1, 40] {
+            let mut g = Guard::default();
+            g.pinned = (0..n).map(|i| format!("0.0.{}", i)).collect();
+            g.last_attempt_at = now_secs();
+            g.save();
+            let file_pinned = _env.guard()["pinned"].clone();
+            let projected = write_identity(&g)["pinned"].clone();
+            assert_eq!(
+                file_pinned, projected,
+                "A-6 FAIL n={} 时 identity.json 投影与 update-guard.json 不同源：文件={} 投影={}",
+                n, file_pinned, projected
+            );
+            assert_eq!(
+                projected.as_array().map(|a| a.len()).unwrap_or(0),
+                n.min(MAX_PINNED),
+                "A-6 FAIL n={} 时裁剪长度不符",
+                n
+            );
+        }
     }
 
     /// D-3-f：init_identity 启动即把护栏投影写正确（正向闭环）。

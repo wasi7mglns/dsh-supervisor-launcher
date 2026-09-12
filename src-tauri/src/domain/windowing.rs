@@ -37,4 +37,10 @@ pub(crate) fn show_main(app: &tauri::AppHandle) {
 // 三平台**同一代码路径**：检查 → 下载 → minisign 验签 → 平台安装 → 重启。
 // 平台差异（Linux pkexec dpkg -i / macOS .app 替换 / Windows NSIS passive）
 // 全部由 tauri-plugin-updater 内部处理，壳侧无平台分支。
-// ═══════════════════════════════════════════════════════════════════
+//
+// ⚠ 2026-09-13（P3 清理）：此处**原有一段没有宿主的文档注释** ——
+//   它描述的命令（shell_update_check / shell_update_apply / shell_restart）
+//   实际定义在 src/commands/mod.rs（命令层只做校验与委托，见门禁 G3：
+//   main.rs 不得定义 #[tauri::command]）。文档留在 windowing.rs 会产生
+//   「这里应该有一组命令」的误导 —— 读者会去找不存在的实现。
+//   设计要点已上移到上面的块注释，本段只保留**指向**。

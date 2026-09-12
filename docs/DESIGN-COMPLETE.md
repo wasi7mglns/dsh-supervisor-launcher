@@ -1362,7 +1362,52 @@ tar 解包只写硬编码文件名（无遍历风险）、下载带 60s 超时�
 壳    cargo test 100 项 → 106 项（+6，全部在 src/update.rs 的 bin 单测）
       bin 单测 14 → 20；其余 5 个 test target 不变
 壳    cargo check --all-targets  0 警告
-内核  npm test  77 文件 / 1444 断言 / 0 失败（本轮未动内核）
-前端  npm run verify  tsc 0 / eslint 0 / vitest 15 / build 成功（本轮未动前端）
+内核  npm test  77 文件 / 1444 断言 / 0 失败（D-3 未动内核）
+前端  npm run verify  tsc 0 / eslint 0 / vitest 15 / build 成功（D-3 未动前端）
 ```
+
+---
+
+### 第十二轮续：A 节四项（壳仓，2026-09-13）
+
+| 级别 | 位置 | 缺陷 | 修法 |
+|---|---|---|---|
+| P3 | `platform/linux.rs` | `has_privilege_channel` 探测「pkexec **或** sudo」，而 `install_node` **硬编码 pkexec** → 有 sudo 无 pkexec 的机器被误判「可自更新」，却在装 Node 时失败 | 两者共用 `find_privilege_command()` + `PRIVILEGE_COMMANDS`（单一事实源）|
+| P3 | `env.rs` | 同一事实两个默认端口：`api_base_url` 用 36360、`api_port` 回退 **3100**（已退役端口）| 新增 `DEFAULT_API_PORT` 常量，两处共用；回退指向它 |
+| P3 | `bounded.rs` | 第二个临时日志创建失败 / `spawn` 失败时，**已建的 temp 日志不清理** → temp 目录残留 | 两条失败路径都 `cleanup()`（spawn 改为 match）|
+| P3 | `update.rs` | `pinned` **只增不剪**（唯一移除点只解除与当前版本相等的一项）→ 文件与 identity 投影单调增长 | `Guard::pruned_pinned()` 为**唯一裁剪实现**；`save`（文件）与 `write_identity_for`（identity 投影）都经它，保留最近 `MAX_PINNED`=8 项 |
+| P3 | `domain/windowing.rs` | 一段描述自更新命令的文档注释后**无任何代码**（命令实际在 `commands/mod.rs`）| 改为指向性说明，消除「这里应该有一组命令」的误导 |
+
+#### 注入验证
+
+| 注入 | 命中 |
+|---|---|
+| `install_node` 还原为硬编码 pkexec | a2_ 结构断言 FAIL（可编译的前修复代码）|
+| `has_privilege_channel` 还原为内联双命令 | a2_ 结构断言 FAIL |
+| `api_port` 回退改回 3100 | a3_default_api_port_is_single_source FAIL |
+| `spawn` 改回 `?` 直接返回（不清理）| a4_spawn_failure_leaves_no_temp_logs FAIL |
+| `Guard::save` 改回不裁剪 | a6_pinned_is_pruned + a6_pinned_projection FAIL |
+| `pruned_pinned` 改成返回全量 | a6_pinned_is_pruned + a6_pinned_projection FAIL |
+| `write_identity_for` 的 pinned 改回 `g.pinned`（文件与投影不同源）| a6_projection_and_file_use_same_pruning FAIL |
+
+⚠ 第三项注入最初**没有失败** —— 说明我第一版的投影用例没有真正覆盖「文件裁剪、投影不裁剪」这一分叉。
+已补 `a6_projection_and_file_use_same_pruning`（对 n = 0/1/7/8/9/40 断言
+「投影 == 文件 == 裁剪后长度」），并确认该注入现在确实 FAIL。**门禁不失败就是门禁没用。**
+
+⚠ 首次注入 A-2 时我写出了**不可编译**的注入（`?` 作用于非 Try 类型）→ 测试根本没跑。
+改用「可编译的前修复代码」作为注入后，门禁确实 FAIL。**这正是 AUDIT-HANDOFF 3 节记录的坑。**
+
+#### 一处自造假门禁（已修正）
+
+A-2/A-3 的断言用 `include_str!` 读自身源码，而**针脚字符串本身出现在测试源码里**
+→ 断言计数 2 ≠ 1 或恒假。改用**运行时拼接的针脚**（`format!("const {}: ", "PRIVILEGE_COMMANDS")`
+与 `(3636 * 10).to_string()`）。这是本任务第 8 次「断言命中自己的文字」。
+
+#### 计数变化（本轮壳仓累计）
+
+```
+壳    cargo test 100 项 → 114 项（bin 单测 14 → 28，新增 14）
+      bootstrap_flow 66 / platform_unsupported 4 / service_self_heal 1 /
+      update_guard 9 / updater_artifacts 6 —— 五项不变
+壳    cargo check --all-targets  0 警告
 ```

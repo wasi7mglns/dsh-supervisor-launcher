@@ -73,13 +73,30 @@ pub fn run(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
     let err_path = dir.join(format!("dsh-cmd-err-{}.log", stamp));
 
     let out_file = std::fs::File::create(&out_path).map_err(|e| format!("创建临时日志失败: {}", e))?;
-    let err_file = std::fs::File::create(&err_path).map_err(|e| format!("创建临时日志失败: {}", e))?;
+    // ⚠ P3 修复（2026-09-13）：第二个文件创建失败时，**已建的第一个必须清掉**。
+    //   旧实现直接 `?` 返回 —— out_path 已落盘但永不清理，每次这种失败都留一个
+    //   空的 dsh-cmd-out-*.log 在 temp 目录（本仓另有清理脚本会竞争，见 AUDIT-HANDOFF 9.4）。
+    //   同理，spawn 失败时两个文件都已建好，也必须一并清理。
+    let err_file = match std::fs::File::create(&err_path) {
+        Ok(f) => f,
+        Err(e) => {
+            cleanup(&out_path, &err_path); // 清掉已建的 out_path（err_path 可能未建，cleanup 容忍）
+            return Err(format!("创建临时日志失败: {}", e));
+        }
+    };
     cmd.stdout(Stdio::from(out_file));
     cmd.stderr(Stdio::from(err_file));
     cmd.stdin(Stdio::null());
     prepare(cmd);
 
-    let mut child = cmd.spawn().map_err(|e| format!("启动失败: {}", e))?;
+    // ⚠ spawn 失败（命令不存在/不可执行）此前直接返回 Err，两个临时文件永久残留。
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            cleanup(&out_path, &err_path);
+            return Err(format!("启动失败: {}", e));
+        }
+    };
 
     let start = Instant::now();
     let status = loop {
@@ -165,8 +182,14 @@ fn tail(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
 
+    /// 本模块的测试**串行执行**（2026-09-13）。
+    /// 默认线程池会并发跑它们，而 A-4 需要数 temp 目录里的 dsh-cmd-*.log：
+    /// 并发用例的创建/清理会让计数抖动 → 断言假红。锁把本模块串起来即可消除。
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn bounded_run_success() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut c = Command::new(if cfg!(windows) { "cmd" } else { "echo" });
         if cfg!(windows) {
             c.args(["/C", "echo hello"]);
@@ -180,6 +203,7 @@ mod tests {
 
     #[test]
     fn bounded_run_kills_on_timeout() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // 睡眠远超上限：必须被 kill 并返回 Err，而不是无限阻塞
         let mut c = Command::new(if cfg!(windows) { "cmd" } else { "sleep" });
         if cfg!(windows) {
@@ -196,7 +220,48 @@ mod tests {
 
     #[test]
     fn missing_binary_is_error_not_panic() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut c = Command::new("dsh-no-such-binary-xyz");
         assert!(run(&mut c, Duration::from_secs(2)).is_err());
+    }
+
+    /// A-4 门禁：失败路径不得在 temp 目录留下 dsh-cmd-*.log 残渣（2026-09-13）。
+    ///
+    /// 旧实现：第二个临时文件创建失败、或 spawn 失败时**直接返回 Err**，
+    /// 已建的文件永不清理 → 每次失败留一对/一个空日志。
+    ///
+    /// 用 spawn 失败这一**可复现**的失败路径做行为验证（文件必然已创建）。
+    /// 注入：把 spawn 的 match 改回 `cmd.spawn().map_err(...)?` → 本测试 FAIL。
+    #[test]
+    fn a4_spawn_failure_leaves_no_temp_logs() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir();
+        let before = count_dsh_cmd_logs(&dir);
+        let mut c = Command::new("dsh-no-such-binary-xyz");
+        let r = run(&mut c, Duration::from_secs(2));
+        assert!(r.is_err(), "前置：不存在的命令应失败");
+        let after = count_dsh_cmd_logs(&dir);
+
+        // ⚠ 并发测试可能同时创建/清理，故断言「不增长」而非「精确相等」。
+        //   本测试的 pid 唯一，自己的那对必然被清掉，不会制造 +N。
+        assert!(
+            after <= before,
+            "A-4 FAIL spawn 失败后 temp 日志未清理（之前 {} 个，之后 {} 个）",
+            before,
+            after
+        );
+    }
+
+    fn count_dsh_cmd_logs(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| {
+                        let n = e.file_name().to_string_lossy().to_string();
+                        n.starts_with("dsh-cmd-out-") || n.starts_with("dsh-cmd-err-")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
 }

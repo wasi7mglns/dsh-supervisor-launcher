@@ -184,7 +184,9 @@ fn config_json() -> Option<serde_json::Value> {
 /// 守卫本地 API 基址：读 config.json 的 apiPort（用户可改），失败/缺失回退默认端口。
 /// 壳极少更新但内核配置可演进——硬编码会让改过 apiPort 的用户导航到死端口（F7）。
 pub fn api_base_url() -> String {
-    let default_port = 36360u16; // 高位段起始（3100 常用端口易冲突，动态端口 2026-09-07）
+    // 默认端口来自**唯一常量**（见 DEFAULT_API_PORT）—— 此前这里是字面量 36360，
+    // 而 api_port() 的回退是另一个字面量 3100，同一事实两处默认。
+    let default_port = DEFAULT_API_PORT;
     let port = config_json()
         .and_then(|v| v.get("apiPort").and_then(|x| x.as_u64()))
         .filter(|n| *n > 0 && *n <= u16::MAX as u64)
@@ -205,10 +207,29 @@ pub fn close_action() -> String {
         .unwrap_or_else(|| "hide".into())
 }
 
+/// 守卫 API 的**默认端口**（单一事实源）。
+///
+/// ⚠ 2026-09-13（P3 修复）：原实现里这个「默认端口」有两个值 ——
+///   `api_base_url()` 用 36360（高位段起始），而 `api_port()` 的回退是 **3100**
+///   （旧端口，注释里还写着「3100 常用端口易冲突」）。同一事实两处默认且已分叉。
+///
+/// 虽然正常路径下 `api_port()` 由 `api_base_url()` 解析而来（不会走到回退），
+/// 但一旦走到（解析失败/逻辑被改动），就会**回退到一个早就退役的端口** ——
+/// 守卫存活探测与面板导航将指向一个没人监听的端口，且现象是「守卫未运行」
+/// 而非「端口取错」，排障方向被带偏。
+///
+/// 现两者共用本常量：改一处即两处一致，不可能再漂移。
+pub const DEFAULT_API_PORT: u16 = 36360;
+
 /// 壳可用性探测用守卫端口（与 api_base_url 同源解析）。
 pub fn api_port() -> u16 {
     let u = api_base_url();
-    u.trim_end_matches('/').rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(3100)
+    // 从派生出的 URL 反解端口；回退到**同一个**默认端口常量（而非另一个字面量）。
+    u.trim_end_matches('/')
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_API_PORT)
 }
 
 pub fn home() -> PathBuf {
@@ -218,3 +239,85 @@ pub fn home() -> PathBuf {
 }
 
 
+#[cfg(test)]
+mod tests {
+    //! A-3 门禁：守卫 API 的「默认端口」必须是**单一事实源**（2026-09-13）。
+    //!
+    //! 缺陷：api_base_url() 的默认是 36360，而 api_port() 的回退是 3100 ——
+    //! 同一事实两个默认值且已分叉。正常路径下 api_port 由 api_base_url 解析而来，
+    //! 故 3100 那条回退**不可达**；但它是潜伏的第二默认：一旦 api_base_url 的返回
+    //! 形态变化（或有人改动解析），就会回退到一个早就退役的端口，
+    //! 现象是「守卫未运行」而非「端口取错」，排错方向被带偏。
+    //!
+    //! 断言的是「只有一个默认端口字面量」+「回退指向那个常量」——
+    //! 这正是该缺陷的判据。针脚在**运行时拼出**，避免命中本测试自己的源码。
+    use super::*;
+
+    #[test]
+    fn a3_default_api_port_is_single_source() {
+        let raw = include_str!("env.rs");
+        // 剥离注释：本仓两次被自己写的说明文字骗过（AUDIT-HANDOFF 9.2）
+        let code: String = raw
+            .lines()
+            .map(|l| if l.trim_start().starts_with("//") { "" } else { l })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 36460 与 3100 在测试源码里**不得以字面量出现**，否则自匹配。
+        //   针脚在运行时拼出，且**注释里也不写**那两个字面量 ——
+        //   本测试源码经 include_str! 被读入，任何逐字出现都会自匹配。
+        let expected_default = (3636 * 10).to_string(); // 默认端口 = 3636 乘 10
+        let old_stale_port = (31 * 100).to_string();    // 旧端口 = 31 乘 100
+
+        assert_eq!(
+            code.matches(&expected_default).count(),
+            1,
+            "A-3 FAIL 默认端口字面量出现 {} 次（应为 1 —— 单一事实源）",
+            code.matches(&expected_default).count()
+        );
+        assert!(
+            !code.contains(&old_stale_port),
+            "A-3 FAIL 仍存在旧端口 {} 的回退 —— 同一事实两个默认",
+            old_stale_port
+        );
+        // 正向：回退必须指向那个常量
+        let api_port = code.split("pub fn api_port").nth(1).expect("A-3 FAIL 未找到 api_port");
+        let body = api_port.split("\n}").next().unwrap_or(api_port);
+        assert!(
+            body.contains("unwrap_or(DEFAULT_API_PORT)"),
+            "A-3 FAIL api_port 回退未指向 DEFAULT_API_PORT"
+        );
+        assert!(
+            body.contains("api_base_url()"),
+            "A-3 FAIL api_port 未与 api_base_url 同源"
+        );
+    }
+
+    /// A-3（行为）：默认端口常量确实等于契约里的高位段起始，且 url 由它派生。
+    #[test]
+    fn a3_default_port_constant_value_and_url_derivation() {
+        assert_eq!(DEFAULT_API_PORT, 3636 * 10, "A-3 FAIL 默认端口常量值被改动");
+        // 在一个**空 HOME** 下：无 config.json → 必须落回 DEFAULT_API_PORT。
+        // 用锁串行，避免与其它读 HOME 的用例并发互踩。
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("HOME");
+        let dir = std::env::temp_dir().join(format!("dsh-a3-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HOME", &dir);
+        let url = api_base_url();
+        let port = api_port();
+        match &saved {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            url,
+            format!("http://127.0.0.1:{}/", DEFAULT_API_PORT),
+            "A-3 FAIL api_base_url 未按默认常量生成"
+        );
+        assert_eq!(port, DEFAULT_API_PORT, "A-3 FAIL api_port 与默认端口不一致");
+    }
+}

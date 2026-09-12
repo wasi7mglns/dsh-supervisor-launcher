@@ -13,6 +13,27 @@ pub const NAME: &str = "linux";
 /// 安装命令超时（15 分钟：下载 + 解包 + 系统授权）。
 const INSTALL_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// Linux 可用提权通道（**按优先级**）。单一事实源：
+///   · has_privilege_channel() 用它判定「能否提权」；
+///   · install_node() 用它选**实际执行**的命令。
+///
+/// ⚠ 两者必须同源（2026-09-13 P3 修复）。此前前者探测「pkexec 或 sudo」、
+///   后者硬编码 pkexec → 有 sudo 无 pkexec 的机器被误判「可自更新」却在安装时失败。
+pub const PRIVILEGE_COMMANDS: [&str; 2] = ["pkexec", "sudo"];
+
+/// 在 PATH 中定位第一个可用的提权命令（**不执行**，只判存在性）。
+///
+/// 返回 None 表示系统两种通道都没有 —— 调用方据此给出**明确的**环境错误，
+/// 而不是去执行一个不存在的命令再报一个含混的 spawn 失败。
+pub fn find_privilege_command() -> Option<&'static str> {
+    let path = std::env::var_os("PATH")?;
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    PRIVILEGE_COMMANDS
+        .iter()
+        .find(|c| dirs.iter().any(|d| d.join(c).is_file()))
+        .copied()
+}
+
 pub struct Impl;
 static IMPL: Impl = Impl;
 
@@ -87,14 +108,32 @@ impl Platform for Impl {
     fn install_node(&self, file: &Path) -> Result<PathBuf, String> {
         let abs = file.canonicalize().map_err(|e| e.to_string())?;
         let cmd = format!("tar -xJf '{}' -C /usr/local --strip-components=1", abs.display());
+        // ⚠ P3 修复（2026-09-13）：**经与 has_privilege_channel 同一个 helper** 选提权命令。
+        //
+        //   缺陷：has_privilege_channel 探测「pkexec **或** sudo」，而这里**硬编码 pkexec**。
+        //     一台**有 sudo、无 pkexec** 的机器（常见于精简发行版/容器/自建环境）上：
+        //       · self_update_capable() / 引导页诊断显示「可自更新」；
+        //       · 但真正安装 Node 时立刻失败于「无法启动 pkexec」。
+        //     用户看到的是「已经说可以，却装不上」，且错误指向 pkexec —— 与实际环境不符。
+        //     （桌面壳自更新走 tauri-plugin-updater，它内部是 pkexec → GUI sudo → sudo 回退，
+        //       故只有本壳自己的 Node 安装这一条路径漏了回退。）
+        //
+        //   修法：两者共用 find_privilege_command()（单一事实源）—— 见 PRIVILEGE_COMMANDS。
+        let priv_cmd = find_privilege_command().ok_or_else(|| {
+            format!(
+                "未找到可用提权通道（需要 {} 之一）。请安装 policykit（提供 pkexec）或 sudo。",
+                PRIVILEGE_COMMANDS.join(" 或 ")
+            )
+        })?;
         let out = crate::bounded::run(
-            Command::new("pkexec").args(["sh", "-c", &cmd]),
+            Command::new(priv_cmd).args(["sh", "-c", &cmd]),
             INSTALL_CMD_TIMEOUT,
         )
-        .map_err(|e| format!("无法启动 pkexec（{}）。请确认系统已安装 pkexec（policykit）。", e))?;
+        .map_err(|e| format!("无法启动 {}（{}）。", priv_cmd, e))?;
         if !out.success {
             return Err(format!(
-                "pkexec 退出码 {}（用户取消或安装失败）：{}",
+                "{} 退出码 {}（用户取消或安装失败）：{}",
+                priv_cmd,
                 out.code.unwrap_or_else(|| "killed".into()),
                 out.stderr.trim()
             ));
@@ -119,12 +158,8 @@ impl Platform for Impl {
 
     fn has_privilege_channel(&self) -> bool {
         // **不主动执行提权**，只探测命令存在性（用于「不可自更新」的提前判定）。
-        ["pkexec", "sudo"].iter().any(|c| {
-            std::env::var("PATH")
-                .ok()
-                .map(|path| std::env::split_paths(&path).any(|d| d.join(c).is_file()))
-                .unwrap_or(false)
-        })
+        // ⚠ 与 install_node **共用** find_privilege_command —— 同一事实一处实现。
+        find_privilege_command().is_some()
     }
 
     // ── 可执行文件名的平台差异（P2/G1：原为平台层之外的 cfg!() 宏）──
@@ -255,5 +290,103 @@ impl ServiceControl for Impl {
             .spawn()
             .map_err(|e| format!("直接拉起守卫失败: {}", e))?;
         Ok(child.id())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! A-2 门禁：提权通道的「探测」与「使用」必须**同源**（2026-09-13）。
+    //!
+    //! 缺陷：has_privilege_channel 探测「pkexec **或** sudo」，而 install_node 硬编码
+    //! pkexec。有 sudo 无 pkexec 的机器被误判「可自更新」，却在安装 Node 时失败。
+    //! 该缺陷在二进制里无法用普通单测覆盖（要真提权），故按本仓既有惯例做**结构断言**；
+    //! 但断言的是**特征调用**（install_node 里必须出现 find_privilege_command，
+    //! 且不得再出现字面量 pkexec），而不是易撞名的局部变量。
+    use super::*;
+
+    /// 去掉注释后再断言 —— 本仓两次被自己写的说明文字骗过（见 AUDIT-HANDOFF 9.2）。
+    fn strip_comments(src: &str) -> String {
+        src.lines()
+            .map(|l| {
+                let t = l.trim_start();
+                if t.starts_with("//") { String::new() } else { l.to_string() }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a2_probe_and_use_share_one_privilege_source() {
+        let raw = include_str!("linux.rs");
+        let code = strip_comments(raw);
+
+        // 正向：探测与实际执行都必须经同一 helper
+        assert!(
+            code.contains("find_privilege_command()"),
+            "A-2 FAIL 未使用共享的 find_privilege_command"
+        );
+        let install = code
+            .split("fn install_node")
+            .nth(1)
+            .expect("A-2 FAIL 未找到 install_node");
+        let install_body = install.split("fn core_extra_candidates").next().unwrap_or(install);
+        assert!(
+            install_body.contains("find_privilege_command()"),
+            "A-2 FAIL install_node 未用共享 helper 选提权命令"
+        );
+        // 反向：install_node 内不得再**硬编码** pkexec 作为执行命令
+        assert!(
+            !install_body.contains("Command::new(\"pkexec\")"),
+            "A-2 FAIL install_node 仍硬编码 pkexec —— 有 sudo 无 pkexec 的机器会被误判可自更新"
+        );
+        let probe = code
+            .split("fn has_privilege_channel")
+            .nth(1)
+            .expect("A-2 FAIL 未找到 has_privilege_channel");
+        let probe_body = probe.split("fn node_exe_name").next().unwrap_or(probe);
+        assert!(
+            probe_body.contains("find_privilege_command()"),
+            "A-2 FAIL has_privilege_channel 未用共享 helper"
+        );
+        // 单一事实源：命令清单只定义一次。
+        //   ⚠ 针脚必须**在运行时拼出**（不能是源码里逐字出现的字面量）——
+        //     include_str! 把**本测试自己也读进来了**，逐字字面量必然自匹配，
+        //     正是 AUDIT-HANDOFF 9.2 记录的「断言命中自己的文字」陷阱。
+        let needle = format!("const {}: ", "PRIVILEGE_COMMANDS");
+        assert_eq!(
+            code.matches(&needle).count(),
+            1,
+            "A-2 FAIL PRIVILEGE_COMMANDS 不是单一定义"
+        );
+    }
+
+    /// A-2（行为）：find_privilege_command 只认 PATH 里**真实存在**的命令。
+    #[test]
+    fn a2_find_privilege_command_respects_path() {
+        // 空 PATH → 必然 None（不依赖机器上是否真有 pkexec/sudo）
+        let saved = std::env::var_os("PATH");
+        std::env::set_var("PATH", "");
+        let none = find_privilege_command();
+        // 恢复 PATH（后续测试可能依赖）
+        match &saved {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        assert!(none.is_none(), "A-2 FAIL 空 PATH 下仍报告有提权通道: {:?}", none);
+
+        // 造一个只含伪 pkexec 的临时目录 → 必须命中它
+        let dir = std::env::temp_dir().join(format!("dsh-priv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("pkexec");
+        std::fs::write(&fake, b"#!/bin/sh\n").unwrap();
+        std::env::set_var("PATH", dir.display().to_string());
+        let got = find_privilege_command();
+        match &saved {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, Some("pkexec"), "A-2 FAIL 未按 PATH 命中伪造的 pkexec");
     }
 }
