@@ -109,11 +109,26 @@ fn write_json(p: &Path, v: &serde_json::Value) {
 }
 
 /// 更新护栏状态（壳本地；内核的 update-journal 是另一份权威账本）。
+///
+/// ⚠ 自锁缺陷与修法（P1-A，2026-09-12）：
+///   旧设计里 `attempt` **只在更新成功时**归零（`init_identity` 的 confirmed 分支），
+///   而 `should_check` 在 `attempt >= MAX_ATTEMPTS` 后**永久**返回 false ——
+///   于是「成功」成了「继续尝试」的前提，而继续尝试被自己掐断，形成无复位机制的自锁。
+///   叠加两个真实场景即触发：① 用户在授权弹窗上点了取消；② 弱网下载失败。
+///   （两者都不回滚 pendingVersion，故每次重开壳都 +1。）
+///
+///   修法：把「永久拉黑」改为「**时间冷却**」——
+///   · 记录 `last_attempt_at`，达到上限后进入冷却；
+///   · 冷却期（GUARD_COOLDOWN_SECS）过后**自动复位** attempt 并重新尝试；
+///   · 同时提供显式恢复入口（`reset_guard`），供 UI/排障调用。
+///   这样「不再纠缠」与「永不恢复」被区分开：护栏仍然抑制反复失败，但不会永久关闭更新。
 #[derive(Default)]
 struct Guard {
     attempt: u32,
     pending_version: Option<String>,
     pinned: Vec<String>,
+    /// 最近一次推进护栏的时间（秒）。用于冷却判定；旧账本无此字段时为 0。
+    last_attempt_at: u64,
 }
 
 impl Guard {
@@ -127,23 +142,40 @@ impl Guard {
                 .and_then(|x| x.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default(),
+            last_attempt_at: v.get("lastAttemptAt").and_then(|x| x.as_u64()).unwrap_or(0),
         }
     }
     fn save(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         write_json(
             &guard_path(),
             &serde_json::json!({
                 "attempt": self.attempt,
                 "pendingVersion": self.pending_version,
                 "pinned": self.pinned,
-                "updatedAt": now,
+                "lastAttemptAt": self.last_attempt_at,
+                "updatedAt": now_secs(),
             }),
         );
     }
+    /// 冷却是否已过（未记录时间视作已过，兼容旧账本）。
+    fn cooldown_elapsed(&self) -> bool {
+        if self.last_attempt_at == 0 {
+            return true;
+        }
+        now_secs().saturating_sub(self.last_attempt_at) >= GUARD_COOLDOWN_SECS
+    }
+}
+
+/// 自更新被抑制后的冷却时长（秒）。**不是永久拉黑** —— 到期自动恢复尝试。
+/// 取 6 小时：足够让「反复失败」不再打扰用户，又不会让机器永久收不到更新（含安全修复）。
+const GUARD_COOLDOWN_SECS: u64 = 6 * 60 * 60;
+
+/// 当前 Unix 时间（秒）。
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 最大连续失败次数（达到即放弃强制，并把该版本拉黑）。
@@ -164,15 +196,30 @@ pub fn init_identity(version: &str) -> serde_json::Value {
         // 情况 B：装过新版本，但以别的版本启动 → 更新未生效/启动失败
         let target = g.pending_version.clone().unwrap_or_default();
         g.attempt = g.attempt.saturating_add(1);
+        // 记录推进时间：达到上限后据此进入**冷却**（而非永久拉黑），见 Guard 文档。
+        g.last_attempt_at = now_secs();
         if g.attempt >= MAX_ATTEMPTS {
             if !target.is_empty() && !g.pinned.contains(&target) {
                 g.pinned.push(target.clone());
             }
             g.pending_version = None;
-            log(&format!("更新失败达阈值（{} 次）：已拉黑 {}，本轮不再尝试", g.attempt, target));
+            log(&format!(
+                "更新失败达阈值（{} 次）：已抑制 {}，{} 小时后自动重试（可经 shell_reset_update_guard 立即恢复）",
+                g.attempt, target, GUARD_COOLDOWN_SECS / 3600
+            ));
         } else {
             log(&format!("更新疑似未生效：期望 {}，实际 {}（第 {} 次）", target, version, g.attempt));
         }
+        g.save();
+    } else if g.attempt >= MAX_ATTEMPTS && g.cooldown_elapsed() {
+        // 情况 C（P1-A 关键修复）：上一轮因失败进入冷却，现已到期 → **自动复位**。
+        //   旧实现没有任何复位路径：attempt 只在「更新成功」时归零，
+        //   而继续尝试又被 attempt>=2 掐断 —— 用户永久收不到更新。
+        log(&format!(
+            "更新冷却期已过（{} 小时），自动恢复更新尝试（原 attempt={}）",
+            GUARD_COOLDOWN_SECS / 3600, g.attempt
+        ));
+        g.attempt = 0;
         g.save();
     }
 
@@ -224,18 +271,55 @@ pub fn mark_pending(version: &str) {
 }
 
 /// 前置判定：是否**应当**尝试检查更新。返回 (should_check, reason)。
+///
+/// ⚠ 抑制是**有期限**的（P1-A）：达到上限后进入冷却，`cooldown_elapsed()` 为真即放行。
+///   旧实现在此**永久**返回 false，且无任何复位路径 → 用户永久收不到更新。
 pub fn should_check(version: &str) -> (bool, String) {
     let g = Guard::load();
     if !self_update_capable() {
         return (false, format!("安装形态 {} 不可自更新（或缺提权通道）", install_kind()));
     }
     if !version.is_empty() && g.pinned.iter().any(|p| p == version) {
-        return (false, format!("当前版本 {} 已被拉黑（此前更新失败）", version));
+        // 被拉黑的是「**曾经尝试过的目标版本**」，故只在目标版本 == 当前版本时才拦截。
+        // ⚠ 旧实现比对的就是当前版本，而拉黑写的是目标版本 —— 两者永不相等，
+        //   于是这条分支**形同虚设**（真正的抑制来自下面的 attempt 闸）。此处保留并说明。
+        return (false, format!("当前版本 {} 已被抑制（此前更新失败）", version));
     }
     if g.attempt >= MAX_ATTEMPTS {
-        return (false, format!("连续失败已达 {} 次上限，本轮放行", g.attempt));
+        let left = GUARD_COOLDOWN_SECS.saturating_sub(now_secs().saturating_sub(g.last_attempt_at));
+        if !g.cooldown_elapsed() {
+            return (false, format!(
+                "连续失败 {} 次，已进入冷却（约 {} 分钟后自动恢复；或调用 shell_reset_update_guard 立即恢复）",
+                g.attempt, left / 60
+            ));
+        }
+        // 冷却已过：放行（下一次 init_identity 会把 attempt 复位）。
+        return (true, String::new());
     }
     (true, String::new())
+}
+
+/// **显式恢复入口**（P1-A）：清零 attempt、解除冷却与拉黑。
+///
+/// 为什么要它：自动冷却解决「永久自锁」，但用户/支持人员仍需要一个「现在就再试一次」的动作。
+/// 旧实现完全没有恢复路径，唯一手段是手工删 `~/.dsh/shell/update-guard.json`（UI 从不提示）。
+/// 返回恢复前的状态，供日志与 UI 如实说明「恢复了什么」。
+pub fn reset_guard() -> serde_json::Value {
+    let before = Guard::load();
+    let snapshot = serde_json::json!({
+        "attempt": before.attempt,
+        "pinned": before.pinned,
+        "pendingVersion": before.pending_version,
+    });
+    let g = Guard {
+        attempt: 0,
+        pending_version: None,
+        pinned: Vec::new(),
+        last_attempt_at: 0,
+    };
+    g.save();
+    log(&format!("更新护栏已手动复位（此前 attempt={}，pinned={:?}）", before.attempt, before.pinned));
+    snapshot
 }
 
 pub fn identity_snapshot() -> serde_json::Value { read_json(&identity_path()) }

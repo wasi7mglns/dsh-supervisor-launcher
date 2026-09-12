@@ -408,6 +408,23 @@ pub fn shell_identity(app: tauri::AppHandle) -> serde_json::Value {
     id
 }
 
+/// **显式恢复自更新**（P1-A）：清零失败计数、解除冷却与拉黑，并立即重查。
+///
+/// 为什么需要它：自动冷却（6 小时）解决「永久自锁」，但用户/支持仍需一个
+/// 「现在就再试一次」的动作。旧实现完全没有恢复路径 ——
+/// 唯一手段是手工删 `~/.dsh/shell/update-guard.json`，而 UI 从不提示。
+///
+/// 返回 `{ recovered: <复位前状态>, plan: <重查结果> }`，供 UI 如实说明恢复了什么。
+#[tauri::command]
+pub async fn shell_reset_update_guard(app: tauri::AppHandle) -> ShellResult<serde_json::Value> {
+    let recovered = crate::update::reset_guard();
+    // 复位后**立即重查**（幂等）：让 UI 一次调用就能拿到「现在能不能更新」。
+    let plan = shell_update_check(app).await.unwrap_or_else(|e| {
+        serde_json::json!({ "error": e.to_string() })
+    });
+    Ok(serde_json::json!({ "recovered": recovered, "plan": plan }))
+}
+
 /// 引导阶段上报（写入 identity.json + shell.log，便于问题定位）。
 #[tauri::command]
 pub fn shell_set_phase(phase: String) {

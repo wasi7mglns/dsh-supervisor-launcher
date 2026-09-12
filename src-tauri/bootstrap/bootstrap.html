@@ -203,6 +203,17 @@
           <button id="btnUpdSkip" class="ghost">继续使用当前版本</button>
         </div>
       </div>
+      <!-- 自更新被抑制时**必须可见**（P1-A 修复，2026-09-12）。
+           旧实现只写一行状态就继续启动——用户无从得知自己已收不到更新，
+           而护栏又没有恢复入口，于是「永久失效 + 无人察觉」。
+           此卡片给出原因与「立即重试」出口（调 shell_reset_update_guard）。 -->
+      <div class="choice" id="updSuppressed" style="display:none">
+        <div class="choice-title">桌面自动更新已暂停</div>
+        <div class="choice-msg" id="updSuppressedMsg"></div>
+        <div class="choice-actions">
+          <button id="btnUpdRetrySuppressed">立即恢复自更新</button>
+        </div>
+      </div>
     </div>
   </div>
 <!-- 引导脚本已按职责拆分为 9 个文件（2026-09-11）。
