@@ -71,6 +71,38 @@
 | G10 | 受管 daemon 脚本路径必须可解析 | 内核 |
 
 **已全部执行**：本文件描述的缺陷清单（K1–K10 / S1–S5 / O1–O7 / 批 A–F）均已处理。
+---
+
+## 审计后修复（2026-09-12，全仓架构与跨平台审计）
+
+对两仓做了一次全量只读审计（3 路并行 + 逐条复核），发现并修复 6 个 P1：
+
+| # | 位置 | 缺陷 | 修法 | 回归测试 |
+|---|---|---|---|---|
+| **P1-A** | 壳 `update.rs` | 自更新护栏**永久自锁**：`attempt` 只在成功时归零，而成功路径被 `attempt>=2` 掐断 → 用户永久收不到更新 | 改为**时间冷却**（6h）+ `reset_guard()` 显式恢复入口 + 前端可见提示 | `update_guard_test.rs`（5）|
+| **P1-B** | 两仓 CI | 壳 59+ 门禁与内核 `npm test` **从未在 CI 执行**（README 却声称有保障）| 壳入三平台矩阵；内核补 ubuntu `test` job + 日常触发 | CI 命令本地复现 |
+| **P1-C** | 内核 `dist`/`native` | Windows 上裸 npm 不做 PATHEXT 解析 → 升级/安装/卸载全失败 | `exec-path.npmBin()` 唯一解析入口（Windows → `npm.cmd`）| `npm-resolution-test.js`（10）|
+| **P1-D** | 壳 `windows.rs` | 计划任务 `/TR` 未加引号 → 用户名含空格时**登录自启静默失效** | 值内嵌引号（与内核已有写法一致）| `bootstrap_flow::b56` |
+| **P1-E** | 内核 `api/index.js` | 注释声称支持 RFC1918，实为只查回环 → 开局域网后**写操作全 403** | 复用 `identity.isPrivateIpv4`，双闸纳入私有网段（**不放宽公网拒绝**）| `lan-access-boundary-test.js`（20）|
+| **P1-F** | 内核 `native/manager.js` | 卸载 npm **无超时** → 一次挂起即永久锁死安装/卸载 | 15min 看门狗 + `killTree` + `finally` 释放锁 + `timedOut` 上报 | 静态（12）+ **行为级**（8）|
+
+### 附带修复
+
+- `40-shell-update.js` 的 `showUpdChoice` 曾被**重复定义两次**（前次拆分遗留）—— 已去重；
+- `api/index.js` 闸门上方注释与文件头的信任集合声明**自相矛盾** —— 已校准；
+- 新增 `test/test-safety-gate-test.js`：禁止测试用「patch 模块导出」伪造依赖
+  （`const { x } = require()` 是值绑定，patch 无效 → 会跑真实副作用；已发生一次真实事故，所幸 no-op）。
+
+### 验证
+
+```
+内核  npm test            61 文件 / 1153 断言 / 0 失败
+壳    cargo test          83 项 / 0 失败（12 + 60 + 5 + 6）
+壳    cargo check         0 警告
+壳    前端 9 模块语法      9/9 通过
+```
+
+每条修复都配了**注入 → 失败 → 还原 → 通过**的验证；门禁均实测能失败。
 
 
 ---
