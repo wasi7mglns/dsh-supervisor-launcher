@@ -1131,27 +1131,59 @@ fn b44_local_connect_bounded_and_async() {
 /// 就是「靠恰好在同一个 files[] 里」而侥幸通过。
 #[test]
 fn b45_platform_tag_is_arch_aware() {
-    let n = fs::read_to_string(manifest_dir().join("src").join("node.rs")).expect("node.rs");
+    // ⚠ 2026-09-12 修复：本测试原先读 `src/node.rs` 找 `linux-arm64` ——
+    //   但制品映射早已**下沉到 platform 层**（见 B42 的说明），node.rs 里只剩**注释**含该串。
+    //   于是断言**永久为真**（读的是注释，不是实现）→ 门禁空转。
+    //   这与 B42 是同一根因，B42 当时已改用 platform_sources()，B45/B46 漏改。
+    let n = platform_sources();
     assert!(n.contains("linux-arm64"), "B45 FAIL Linux 标签未按架构区分");
+    assert!(
+        n.contains("linux-x64"),
+        "B45 FAIL Linux x64 标签缺失（应有 arch 分支的两端）"
+    );
     // 不得对 linux 直接 return 硬编码字面量
     assert!(
         !n.contains("#[cfg(target_os = \"linux\")]\n    { return \"linux-x64\"; }"),
         "B45 FAIL Linux 标签仍硬编码 x64"
     );
     // Windows arm64 限制必须被如实记录（诚实性断言）
-    assert!(n.contains("win-arm64-msi"), "B45 FAIL 未记录 Windows arm64 的 msi 缺失限制");
-    eprintln!("B45 PASS platform tag arch-aware");
+    assert!(
+        n.contains("win-arm64-msi"),
+        "B45 FAIL 未记录 Windows arm64 的 msi 缺失限制"
+    );
+    // ⚠ 反向自检：确保找的是**实现文件**而非又一处注释 ——
+    //   若 platform_sources() 未来不再含这些串，上面会失败（不会静默通过）。
+    assert!(
+        platform_sources().len() > 0,
+        "B45 FAIL platform_sources() 为空（测试读不到实现）"
+    );
+    eprintln!("B45 PASS platform tag arch-aware（读 platform 实现，非注释）");
 }
 
 /// B46：Windows 路径不得硬编码（系统盘符/语言/Program Files(x86) 都会变化）。
+///
+/// ⚠ 2026-09-12 修复：本测试原先读 `src/env.rs` 找 `ProgramFiles(x86)` ——
+///   但该实现早已**下沉到 platform 层**（`platform/windows.rs`），
+///   env.rs 里只剩**注释**含该串 → 断言永久为真，门禁空转。
+///   与 B45 同根因（B42 已改对，这两条漏改）。
 #[test]
 fn b46_windows_paths_from_env_not_hardcoded() {
-    let e = fs::read_to_string(manifest_dir().join("src").join("env.rs")).expect("env.rs");
+    // ① 硬编码检测仍针对全量源码（哪一层都不许出现）
+    let mut all = String::new();
+    for (_n, src) in all_rust_sources() {
+        all.push_str(&src);
+        all.push('\n');
+    }
     assert!(
-        !e.contains(r#"PathBuf::from(r"C:\Program Files\nodejs\node.exe")"#),
-        "B46 FAIL env.rs 仍硬编码 C:\\Program Files"
+        !all.contains(r#"PathBuf::from(r"C:\Program Files\nodejs\node.exe")"#),
+        "B46 FAIL 仍有硬编码 C:\\Program Files\\nodejs"
     );
-    assert!(e.contains("ProgramFiles(x86)"), "B46 FAIL 未覆盖 Program Files (x86)");
+    // ② 正向断言必须落在**实现文件** platform/windows.rs 上（而非 env.rs 的注释）
+    let w = platform_sources();
+    assert!(
+        w.contains("ProgramFiles(x86)"),
+        "B46 FAIL platform/windows.rs 未覆盖 Program Files (x86)"
+    );
     eprintln!("B46 PASS windows paths from env");
 }
 
