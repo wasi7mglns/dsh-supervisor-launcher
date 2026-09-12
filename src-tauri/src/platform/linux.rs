@@ -137,12 +137,19 @@ impl ServiceControl for Impl {
             .join("dsh-supervisor.service")
     }
 
-    /// 建立 systemd 用户单元（幂等）。
+    /// 建立 systemd 用户单元（幂等，且**内容过时时自愈**）。
+    ///
+    /// ⚠ 2026-09-12（P2 修复）：原实现是「`path.is_file()` → 直接返回」，
+    ///   即**只创建、永不更新**。后果：模板演进后（例如 P3 给 ExecStart 加引号），
+    ///   老用户磁盘上的旧 unit **永远不会被重写** → 修复到不了已装用户。
+    ///   macOS plist 与 Windows 计划任务同病。
+    ///
+    ///   现改为：先算出**期望内容**，与磁盘上的比对；
+    ///     · 不存在 → 写入（原行为）；
+    ///     · 存在但内容不同 → **重写**并 reload（自愈，使模板修复能触达用户）；
+    ///     · 存在且一致 → 不触碰（真正的幂等，避免每次启动都写盘/reload）。
     fn ensure_defined(&self, guard: &Path) -> Result<String, String> {
         let path = self.definition_path();
-        if path.is_file() {
-            return Ok(format!("已存在 {}", path.display()));
-        }
         // 模板内嵌（不再依赖外部 systemd/*.service 文件 —— npm 发行包不含该目录，
         // 旧实现因此静默跳过服务部署，是本次死锁的直接成因）。
         //
@@ -162,10 +169,21 @@ impl ServiceControl for Impl {
         let exec_start = format!("\"{}\" daemon", guard.display());
         let body = "[Unit]\nDescription=dsh-supervisor - DSH lifecycle guard\nAfter=network.target\nStartLimitIntervalSec=600\nStartLimitBurst=3\n\n[Service]\nType=simple\nExecStart=@EXEC@\nRestart=always\nRestartSec=5\nKillMode=process\n\n[Install]\nWantedBy=default.target\n"
             .replace("@EXEC@", &exec_start);
+        // ── 内容比对：决定「新写」「重写」还是「不动」──
+        let existing = std::fs::read_to_string(&path).ok();
+        let needs_write = match &existing {
+            Some(cur) => cur != &body, // 存在但内容过时 → 重写（自愈）
+            None => true,              // 不存在 → 新建
+        };
+        if !needs_write {
+            // 真正的幂等：内容一致就不动盘、不 reload（避免每次启动都触发 daemon-reload）。
+            return Ok(format!("已存在且为最新 {}", path.display()));
+        }
+        let is_update = existing.is_some();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("创建 systemd 目录失败: {}", e))?;
         }
-        std::fs::write(&path, body).map_err(|e| format!("写入 unit 失败: {}", e))?;
+        std::fs::write(&path, &body).map_err(|e| format!("写入 unit 失败: {}", e))?;
         // 全部经 bounded::run：超时即返回，绝不把引导挂在 systemctl 上。
         crate::bounded::run_lossy(
             Command::new("systemctl").args(["--user", "daemon-reload"]),
@@ -182,15 +200,19 @@ impl ServiceControl for Impl {
         );
         // 注意：enable 失败不算致命 —— 服务定义已写入，start 时仍可拉起（并另有 spawn 兜底）。
         // 故这里只如实描述状态，不返回 Err（否则会把「可继续」的情形误判为彻底失败）。
+        // 文案区分「新建」与「更新」（自愈时用户从 shell.log 就能看出定义被升级过）。
+        let verb = if is_update { "已更新并启用" } else { "已建立并启用" };
         match en {
-            Ok(o) if o.success => Ok(format!("已建立并启用 {}", path.display())),
+            Ok(o) if o.success => Ok(format!("{} {}", verb, path.display())),
             Ok(o) => Ok(format!(
-                "已建立（enable 未成功：{}，start 时重试）{}",
+                "{}（enable 未成功：{}，start 时重试）{}",
+                verb,
                 o.stderr.trim(),
                 path.display()
             )),
             Err(e) => Ok(format!(
-                "已建立（enable 超时/失败：{}，start 时重试）{}",
+                "{}（enable 超时/失败：{}，start 时重试）{}",
+                verb,
                 e,
                 path.display()
             )),

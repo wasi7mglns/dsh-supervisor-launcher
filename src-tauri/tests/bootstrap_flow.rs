@@ -1876,3 +1876,54 @@ fn b59_g1_covers_cfg_macro_form() {
     }
     eprintln!("B59 PASS G1 covers cfg! macro form");
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// B60：服务定义必须**内容过时时自愈**（P2 回归，2026-09-12）
+//
+// 缺陷：三平台 `ensure_defined` 都是「已存在 → 直接返回」= **只创建、永不更新**。
+//   后果：模板演进后（例如给 systemd ExecStart 加引号、给 /TR 加引号），
+//   老用户磁盘上的旧定义**永远不会被重写** → 修复到不了已装用户。
+//   对刚修的 P3（systemd 引号）与 P1-D（schtasks /TR）而言，这会让修复「只对新装用户有效」。
+//
+// 断言：每个平台都必须有**读磁盘 → 比对 → 决定是否重写**的逻辑。
+#[test]
+fn b60_service_definition_self_heals_on_content_drift() {
+    // Linux：读文件比对
+    let lx = fs::read_to_string(manifest_dir().join("src").join("platform").join("linux.rs"))
+        .expect("platform/linux.rs");
+    assert!(
+        lx.contains("read_to_string(&path)") || lx.contains("read_to_string(&path).ok()"),
+        "B60 FAIL linux 未读取既有 unit 内容（无法检测过时）"
+    );
+    assert!(lx.contains("needs_write"), "B60 FAIL linux 缺「是否需要重写」判据");
+    assert!(
+        lx.contains("已存在且为最新"),
+        "B60 FAIL linux 缺「内容一致则不触碰」的幂等分支"
+    );
+
+    // macOS：同上 + 内容变化时必须重新 load
+    let mc = fs::read_to_string(manifest_dir().join("src").join("platform").join("macos.rs"))
+        .expect("platform/macos.rs");
+    assert!(mc.contains("needs_write"), "B60 FAIL macos 缺「是否需要重写」判据");
+    assert!(mc.contains("已存在且为最新"), "B60 FAIL macos 缺幂等分支");
+    assert!(
+        mc.contains("bootout"),
+        "B60 FAIL macos 内容变化后未 bootout 旧定义（launchd 会继续跑旧的）"
+    );
+
+    // Windows：任务存在 **且** 包装脚本一致才算最新
+    let win = fs::read_to_string(manifest_dir().join("src").join("platform").join("windows.rs"))
+        .expect("platform/windows.rs");
+    assert!(win.contains("wrapper_current"), "B60 FAIL windows 未比对包装脚本内容");
+    assert!(
+        win.contains("已存在且为最新"),
+        "B60 FAIL windows 缺「任务+脚本均最新」的幂等分支"
+    );
+
+    // 反向：不得退化成「每次启动都无脑重写」（那会丢失幂等语义、每次都 reload）
+    assert!(
+        lx.contains("if !needs_write"),
+        "B60 FAIL linux 缺「不重写」的早返回 —— 会每次都写盘+reload"
+    );
+    eprintln!("B60 PASS service definitions self-heal on drift");
+}

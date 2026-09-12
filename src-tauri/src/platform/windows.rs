@@ -221,16 +221,23 @@ impl ServiceControl for Impl {
         PathBuf::from(format!("schtasks://{}", GUARD_TASK))
     }
 
-    /// 建立计划任务（幂等）。
+    /// 建立计划任务（幂等，且**包装脚本过时时自愈**）。
+    ///
+    /// ⚠ 2026-09-12（P2）：原实现「`/Query` 成功 → 直接返回」= **只创建、永不更新**。
+    ///   与 Linux unit / macOS plist 同病：模板演进后老用户永远跑旧定义。
+    ///
+    ///   Windows 与另两平台的区别：计划任务**本身**无法直接比对内容，
+    ///   但它的动作指向我们写的 `.cmd` 包装脚本（可比对）；
+    ///   故判据改为「任务存在 **且** 包装脚本内容一致」才提前返回，
+    ///   否则用 `/Create /F` 强制重建（`/F` 本就是覆盖语义）。
     fn ensure_defined(&self, guard: &Path) -> Result<String, String> {
-        if let Ok(o) = crate::bounded::run(
-            Command::new("schtasks").args(["/Query", "/TN", GUARD_TASK]),
-            SVC_QUICK,
-        ) {
-            if o.success {
-                return Ok(format!("已存在 计划任务 {}", GUARD_TASK));
-            }
-        }
+        let task_exists = matches!(
+            crate::bounded::run(
+                Command::new("schtasks").args(["/Query", "/TN", GUARD_TASK]),
+                SVC_QUICK,
+            ),
+            Ok(o) if o.success
+        );
         // 计划任务的 /TR 引号转义极易出错（尤其是路径含空格与 .cmd 垫片）。
         // 改为写一个**包装脚本**再指向它 —— 与内核 watchdog.ps1 同一思路，规避转义地狱。
         let wrapper = home_dir()
@@ -241,7 +248,14 @@ impl ServiceControl for Impl {
             std::fs::create_dir_all(dir).map_err(|e| format!("创建状态目录失败: {}", e))?;
         }
         let shim = format!("@echo off\r\n\"{}\" daemon\r\n", guard.display());
-        std::fs::write(&wrapper, shim).map_err(|e| format!("写入包装脚本失败: {}", e))?;
+        // ── 内容比对（P2 自愈）：任务在 + 包装脚本内容一致 → 才算「已是最新」。
+        //    否则继续往下走 `/Create /F` 重建（覆盖语义）。
+        let wrapper_current = std::fs::read_to_string(&wrapper).ok().as_deref() == Some(shim.as_str());
+        if task_exists && wrapper_current {
+            return Ok(format!("已存在且为最新 计划任务 {}", GUARD_TASK));
+        }
+        let is_update = task_exists;
+        std::fs::write(&wrapper, &shim).map_err(|e| format!("写入包装脚本失败: {}", e))?;
         // ⚠ `/RL HIGHEST` 需要相应权限（2026-09-11 审计）：
         //   在**非提权**会话中创建「以最高权限运行」的计划任务可能被拒（Access is denied）。
         //   而壳默认以普通用户权限运行 —— 若首次尝试失败，退化为普通权限任务，
@@ -270,10 +284,12 @@ impl ServiceControl for Impl {
             c
         };
 
+        let verb = if is_update { "已更新" } else { "已建立" };
         let first = crate::bounded::run(&mut base(Some("HIGHEST")), SVC_NORMAL)?;
         if first.success {
             return Ok(format!(
-                "已建立 计划任务 {}（最高权限）-> {}",
+                "{} 计划任务 {}（最高权限）-> {}",
+                verb,
                 GUARD_TASK,
                 wrapper.display()
             ));
@@ -282,7 +298,8 @@ impl ServiceControl for Impl {
         let second = crate::bounded::run(&mut base(None), SVC_NORMAL)?;
         if second.success {
             return Ok(format!(
-                "已建立 计划任务 {}（普通权限，HIGHEST 被拒）-> {}",
+                "{} 计划任务 {}（普通权限，HIGHEST 被拒）-> {}",
+                verb,
                 GUARD_TASK,
                 wrapper.display()
             ));

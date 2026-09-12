@@ -153,12 +153,13 @@ impl ServiceControl for Impl {
             .join(format!("{}.plist", GUARD_LABEL))
     }
 
-    /// 建立 LaunchAgent plist 并 bootstrap（幂等）。
+    /// 建立 LaunchAgent plist 并 bootstrap（幂等，且**内容过时时自愈**）。
+    ///
+    /// ⚠ 2026-09-12（P2）：原实现「`is_file()` → 直接返回」= **只创建、永不更新**，
+    ///   模板演进后老用户永远跑旧 plist。与 Linux unit / Windows 计划任务同病。
+    ///   现：算期望内容 → 比对 → 一致不动、不同则重写（并重新 bootstrap）。
     fn ensure_defined(&self, guard: &Path) -> Result<String, String> {
         let path = self.definition_path();
-        if path.is_file() {
-            return Ok(format!("已存在 {}", path.display()));
-        }
         let log = home_dir()
             .join(".dsh")
             .join("supervisor")
@@ -167,24 +168,41 @@ impl ServiceControl for Impl {
         let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.dsh.supervisor</string>\n  <key>ProgramArguments</key>\n  <array><string>@BIN@</string><string>daemon</string></array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ProcessType</key><string>Interactive</string>\n  <key>StandardOutPath</key><string>@LOG@</string>\n  <key>StandardErrorPath</key><string>@LOG@</string>\n</dict></plist>\n"
             .replace("@BIN@", &guard.display().to_string())
             .replace("@LOG@", &log.display().to_string());
+        // ── 内容比对：决定「新写」「重写」还是「不动」──
+        let existing = std::fs::read_to_string(&path).ok();
+        let needs_write = match &existing {
+            Some(cur) => cur != &body,
+            None => true,
+        };
+        let is_update = existing.is_some();
+        if !needs_write {
+            return Ok(format!("已存在且为最新 {}", path.display()));
+        }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("创建 LaunchAgents 目录失败: {}", e))?;
         }
         if let Some(dir) = log.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        std::fs::write(&path, body).map_err(|e| format!("写入 plist 失败: {}", e))?;
+        std::fs::write(&path, &body).map_err(|e| format!("写入 plist 失败: {}", e))?;
+        // 内容变了必须**重新加载**：先 bootout 旧的，再 bootstrap 新的（否则 launchd 仍跑旧定义）。
+        if is_update {
+            let off = format!("launchctl bootout gui/$(id -u)/{}", GUARD_LABEL);
+            crate::bounded::run_lossy(Command::new("sh").args(["-c", &off]), SVC_QUICK);
+        }
         // bootstrap 会因 RunAtLoad 立即启动；KeepAlive 负责崩溃重启。
         let cmd = format!("launchctl bootstrap gui/$(id -u) \"{}\"", path.display());
         let out = crate::bounded::run(Command::new("sh").args(["-c", &cmd]), SVC_NORMAL);
+        let verb = if is_update { "已更新并加载" } else { "已建立并加载" };
         match out {
-            Ok(o) if o.success => Ok(format!("已建立并加载 {}", path.display())),
+            Ok(o) if o.success => Ok(format!("{} {}", verb, path.display())),
             Ok(o) => Ok(format!(
-                "已建立（bootstrap 未成功: {}，start 时重试）{}",
+                "{}（bootstrap 未成功: {}，start 时重试）{}",
+                verb,
                 o.stderr.trim(),
                 path.display()
             )),
-            Err(e) => Ok(format!("已建立（bootstrap 超时/失败: {}）{}", e, path.display())),
+            Err(e) => Ok(format!("{}（bootstrap 超时/失败: {}）{}", verb, e, path.display())),
         }
     }
 
