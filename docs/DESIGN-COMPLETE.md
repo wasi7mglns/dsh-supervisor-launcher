@@ -21,7 +21,7 @@
 | **C** | 结构化错误 `ShellError` | ✅ 完成（曾因 `mod error;` 丢失成孤儿文件，已修复并接线）|
 | **D** | 契约层 M1–M5（镜像目录归壳 / 探测统一 / Node 门槛 / 版本向量）| ✅ 完成 |
 | **E** | 前端拆分 + 全局错误上报 + IPC 自检 + 门禁 G5 | ✅ 完成（802 行单块 → **9 个模块**；`bootstrap.html` 963 → 221 行；B53/G5 已适配且**注入验证能失败**）|
-| **F** | 内核缺陷 K1–K10 + M6 有界执行 | ✅ K1–K10 全部处理（K3 仅做到「相位不谎报」，状态源合并留待后续）|
+| **F** | 内核缺陷 K1–K10 + M6 有界执行 | ✅ 完成（含 K3 状态源合并）|
 
 ### 壳侧缺陷 S1–S5
 
@@ -39,7 +39,7 @@
 |---|---|---|
 | **K1** | daemon 脚本路径全断（生产致命）| ✅ 修（`platform/srcpath.js` + 门禁 G10）|
 | **K2** | `platform/exec.js` 零引用 + 23 处无 timeout | ✅ 修（18 处绕过执行器的调用全部迁入 + 门禁 G9）|
-| **K3** | 双生命周期状态源 | ⚠ **部分**：两套 PHASES 仍并存（视图从权威单向镜像，方向正确）；**但修掉了用户可见的相位谎报** —— `_syncRouterLifecycleView` 曾无条件置 `running`，现按观测 `ok` 区分 running/starting |
+| **K3** | 双生命周期状态源 | ✅ 修 —— `managed.js` 曾自建一份分叉副本（多了死词 `degraded`、少了 `backoff`/`failed`/`restarting`/`installing`）；现改为引用 canonical（同一数组引用）。回归 `test/phase-vocabulary-test.js`（8 项）|
 | **K4** | `ManagedLifecycle.start` 忽略回调 `ok:false` | ✅ 修（`start`/`stop` 均尊重显式失败；保留「无 ok 字段=成功」兼容）；回归 `test/managed-lifecycle-failure-test.js`（13 项）|
 | **K5** | 影子决策未建模 `_crashHalted` | ✅ 修（快照补 `crashHalted`/`sessionHalting`，与 `_shouldRun()` 同序）；回归 `test/shadow-decision-test.js`（9 项）|
 | **K6** | `originAllowed` 只比端口不校验 host | ✅ 修（补 Host 闸 + 壳 origin；行为级断言）|
@@ -70,7 +70,7 @@
 | G9 | 仅 `platform/exec.js` 可调用 `execFileSync` | 内核 |
 | G10 | 受管 daemon 脚本路径必须可解析 | 内核 |
 
-**明确未执行**：K3 的**状态源合并**（两套 PHASES 仍并存；但视图镜像方向正确且相位不再谎报）。（批 E 已完成，从本节移除）
+**已全部执行**：本文件描述的缺陷清单（K1–K10 / S1–S5 / O1–O7 / 批 A–F）均已处理。
 
 
 ---
@@ -627,7 +627,7 @@ bootstrap/
 | F3 | **K2**：`platform/exec.js` 接入全部 `execFileSync`（或删除并统一到 `bounded` 等价物）+ 加「禁裸 exec」门禁 | 无 timeout 的 `execFileSync` 归零 |
 | F4 | K6：`originAllowed` 增加 host 校验（补上 `identity.js` 声称的 Host 闸）| 新增 rebinding 测试 |
 | F5 | K7/K8/K9/K10：`ports.js` HOME 兜底 / 平台命令下沉 / 正则修正 / manifest 保留 | 逐条断言 |
-| F6 | K3/K4/K5：生命周期双源收敛、`start` 尊重 `ok:false`、影子建模 `crashHalted` | ✅ K4/K5 完成；K3 仅完成「相位不谎报」 |
+| F6 | K3/K4/K5：生命周期双源收敛、`start` 尊重 `ok:false`、影子建模 `crashHalted` | ✅ 全部完成 |
 
 ## 21. 门禁清单（规范的可执行化）
 
