@@ -203,17 +203,33 @@ pub fn download_verified(
             Err(e) => { last_err = Some(e); continue; }
         };
         let digest = hex::encode(Sha256::digest(&data));
-        let sums = match String::from_utf8(http_get_bytes(&format!("{}/{}/SHASUMS256.txt", base, version))?) {
-            Ok(s) => s,
-            Err(e) => { last_err = Some(format!("SHASUMS 读取失败: {}", e)); continue; }
+        // ⚠ P1 修复（2026-09-12）：**镜像回退必须在 SHASUMS 失败时也能继续**。
+        //
+        //   缺陷：原为 `String::from_utf8(http_get_bytes(...)?)` —— 外层 `?` 让
+        //     **网络失败直接 return**，下面的 `continue` 只覆盖 `from_utf8` 的非 UTF-8 情形。
+        //     `SHASUMS256.txt` 瞬时抽风（限流/超时）即中断整条回退链，
+        //     即使后续镜像完全健康 —— 用户卡在引导页「装不上 Node」。
+        //   与本函数上方「校验失败换下一个源」（见 `node.rs` 文档注释）的承诺矛盾。
+        //
+        //   同一位置还有第二处同类问题：`ok_or_else(...)?`（条目未找到）也直接 return。
+        //     一并改为 `continue`。
+        let sums = match http_get_bytes(&format!("{}/{}/SHASUMS256.txt", base, version)) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => { last_err = Some(format!("SHASUMS 读取失败: {}", e)); continue; }
+            },
+            Err(e) => { last_err = Some(format!("SHASUMS 下载失败: {}", e)); continue; }
         };
-        let expect = sums.lines().find_map(|l| {
+        let expect = match sums.lines().find_map(|l| {
             let l = l.trim();
             if l.ends_with(&format!("  {}", file)) {
                 let h = l.split_whitespace().next().unwrap_or("");
                 if h.len() == 64 { Some(h.to_string()) } else { None }
             } else { None }
-        }).ok_or_else(|| format!("SHASUMS256.txt 中未找到条目 {}", file))?;
+        }) {
+            Some(h) => h,
+            None => { last_err = Some(format!("SHASUMS256.txt 中未找到条目 {}", file)); continue; }
+        };
         if digest != expect {
             last_err = Some(format!("SHA256 校验失败：期望 {} 实得 {}（拒绝安装）", expect, digest));
             continue;

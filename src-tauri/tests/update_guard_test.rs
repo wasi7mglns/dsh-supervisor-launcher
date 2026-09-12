@@ -221,3 +221,55 @@ fn g6f_pinned_is_cleared_once_running() {
 
     eprintln!("G6-f/g/h PASS pinned 在更新成功后被解除，且抑制语义保留");
 }
+
+/// G6-i：跨仓 `probe` 契约的 `timeoutMs` 必须与壳实际探测超时**同源**。
+///
+/// `probe` 字段的全部目的就是让壳与内核**选源一致**：
+/// 壳按它测速并导出选择结果，内核按它复测。若两侧超时不同，
+/// 落在两者之间的源会被一方判可达、另一方判不可达 → 选源分叉。
+///
+/// 原实现：`probe_all` 用 `PROBE_TIMEOUT`(8s)，而导出契约硬编码 `6000` —— 典型的
+/// 「同一事实两处实现且已分叉」。现改为由同一常量派生。
+#[test]
+fn g6i_probe_timeout_is_single_source() {
+    let m = read("src/mirror.rs");
+    assert!(
+        !m.contains("\"timeoutMs\": 6000"),
+        "G6-i FAIL 契约仍硬编码 6000ms —— 与 PROBE_TIMEOUT(8s) 分叉，选源会不一致"
+    );
+    assert!(
+        m.contains("PROBE_TIMEOUT.as_millis() as u64"),
+        "G6-i FAIL timeoutMs 未由 PROBE_TIMEOUT 派生（单一事实源）"
+    );
+    // 反向：确认壳真的用该常量做探测（否则派生也没意义）
+    assert!(
+        m.contains(".timeout(PROBE_TIMEOUT)"),
+        "G6-i FAIL probe_all 未使用 PROBE_TIMEOUT"
+    );
+    eprintln!("G6-i PASS 跨仓 probe 超时单一事实源");
+}
+
+/// G6-j：Node 安装的镜像回退**不得被 SHASUMS 失败中断**。
+///
+/// 原实现 `String::from_utf8(http_get_bytes(..SHASUMS256.txt..)?)` —— 外层 `?` 让
+/// **网络失败直接 return**，下面的 `continue` 只覆盖非 UTF-8 情形。
+/// `SHASUMS256.txt` 瞬时抽风即中断整条回退链，即使后续镜像健康。
+/// 同处还有第二例：条目未找到时的 `ok_or_else(..)?` 也直接 return。
+#[test]
+fn g6j_shasums_failure_does_not_abort_fallback() {
+    let n = read("src/node.rs");
+    assert!(
+        !n.contains("http_get_bytes(&format!(\"{}/{}/SHASUMS256.txt\", base, version))?"),
+        "G6-j FAIL SHASUMS 下载仍用 `?` —— 网络失败会中断镜像回退"
+    );
+    assert!(
+        n.contains("SHASUMS 下载失败") && n.contains("SHASUMS256.txt 中未找到条目"),
+        "G6-j FAIL SHASUMS 的两条失败路径都应 continue 到下一个源"
+    );
+    // 反向：确认「换下一个源」语义仍在（不能在失败处直接返回）
+    assert!(
+        n.contains("SHASUMS") && n.contains("last_err = Some("),
+        "G6-j FAIL 失败时应记 last_err 并继续（而非 return）"
+    );
+    eprintln!("G6-j PASS SHASUMS 失败不中断镜像回退");
+}

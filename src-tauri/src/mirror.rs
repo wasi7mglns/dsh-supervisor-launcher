@@ -251,7 +251,15 @@ pub fn export_to_kernel_with(m: &Mirrors, latency_ms: Option<u128>) -> Result<()
         "probe": {
             "kind": "package-metadata",
             "pathTemplate": npm_probe_path(),
-            "timeoutMs": 6000,
+            // ⚠ P1 修复（2026-09-12）：**必须与壳实际探测用的超时一致**。
+            //
+            //   缺陷：此处硬编码 6000，而 `probe_all` 用 `PROBE_TIMEOUT` = **8s**（见上）。
+            //     `probe` 字段的全部目的就是让两侧**选源一致**（见文件头说明与
+            //     内核 `registry-contract.js` 的注释）—— 6~8s 区间的源会被壳判可达、
+            //     内核判不可达，选源**再次分叉**。
+            //
+            //   修法：直接由 `PROBE_TIMEOUT` 派生（单一事实源），永不漂移。
+            "timeoutMs": PROBE_TIMEOUT.as_millis() as u64,
         },
     });
     let body = serde_json::to_string_pretty(&v).unwrap_or_default();
