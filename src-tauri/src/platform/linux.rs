@@ -140,8 +140,23 @@ impl ServiceControl for Impl {
         }
         // 模板内嵌（不再依赖外部 systemd/*.service 文件 —— npm 发行包不含该目录，
         // 旧实现因此静默跳过服务部署，是本次死锁的直接成因）。
-        let body = "[Unit]\nDescription=dsh-supervisor - DSH lifecycle guard\nAfter=network.target\nStartLimitIntervalSec=600\nStartLimitBurst=3\n\n[Service]\nType=simple\nExecStart=@BIN@ daemon\nRestart=always\nRestartSec=5\nKillMode=process\n\n[Install]\nWantedBy=default.target\n"
-            .replace("@BIN@", &guard.display().to_string());
+        //
+        // ⚠ `ExecStart` 的可执行路径**必须自带引号**（P3 修复，2026-09-12）。
+        //   systemd 对 ExecStart 的第一参数按 shell-like 规则解析：
+        //   **未加引号的空格会被当作参数分隔符** → 路径被拆成两段 →
+        //   systemd 报 `Command /home/user is not executable`（实测 systemd-analyze verify 确认）。
+        //   而用户家目录**可以含空格**（Linux 亦如此，/home/john smith/...），
+        //   且 `~/.local/bin/dsh-supervisor` 也可能落在含空格的路径下。
+        //
+        //   对照：Windows 侧同类问题（cmd 引号、schtasks /TR）已修并有测试；
+        //   内核侧 launchd plist 用数组形式 <string>@BIN@</string>（天然无此问题）——
+        //   唯独 systemd 这处漏网。
+        //
+        //   注意：引号写在**值内部**（systemd 需要它来界定第一个参数），
+        //   这与给 Rust args 加引号不同 —— 后者只会被原样作为路径的一部分。
+        let exec_start = format!("\"{}\" daemon", guard.display());
+        let body = "[Unit]\nDescription=dsh-supervisor - DSH lifecycle guard\nAfter=network.target\nStartLimitIntervalSec=600\nStartLimitBurst=3\n\n[Service]\nType=simple\nExecStart=@EXEC@\nRestart=always\nRestartSec=5\nKillMode=process\n\n[Install]\nWantedBy=default.target\n"
+            .replace("@EXEC@", &exec_start);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("创建 systemd 目录失败: {}", e))?;
         }

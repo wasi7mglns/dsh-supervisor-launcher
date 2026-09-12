@@ -1711,3 +1711,46 @@ fn g5_frontend_scripts_syntax_and_error_handling() {
 
     eprintln!("G5 PASS {} inline script blocks checked, F2/F3 present", checked);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// B58：systemd `ExecStart` 的可执行路径必须**自带引号**（P3 回归，2026-09-12）。
+//
+// systemd 对 `ExecStart` 的第一参数按 shell-like 规则解析：
+// **未加引号的空格会被当作参数分隔符** → 路径被拆成两段。
+//
+// 实测（`systemd-analyze verify`）：
+// ```text
+// ExecStart=/home/user name/bin/dsh-supervisor daemon
+//   → Command /home/user is not executable: 没有那个文件或目录
+// ExecStart="/home/user name/bin/dsh-supervisor" daemon
+//   → 正确识别为完整路径
+// ```
+//
+// 家目录**可以含空格**（Linux 亦然），故这是真实可达的路径。
+//
+// 为什么其它平台没这个问题：
+//   · macOS 用 plist `ProgramArguments` 数组（`<string>@BIN@</string>`）→ 天然无引号问题；
+//   · Windows 的 cmd 引号与 schtasks `/TR` 已分别修（B43 / B56）。
+//   唯独 systemd 这处漏网 —— 又是一次「同类缺陷只修了一处」。
+#[test]
+fn b58_systemd_exec_start_quotes_the_binary_path() {
+    let s = fs::read_to_string(manifest_dir().join("src").join("platform").join("linux.rs"))
+        .expect("platform/linux.rs");
+
+    // 必须存在「把路径包进引号」的构造（format! 里带 \"{}\" daemon）
+    assert!(
+        s.contains("\\\"{}\\\" daemon") && s.contains("guard.display()"),
+        "B58 FAIL ExecStart 路径未自带引号 —— 家目录含空格时 systemd 会把命令拆断"
+    );
+    // 模板里不得再有未加引号的 @BIN@ 直接进 ExecStart
+    assert!(
+        !s.contains("ExecStart=@BIN@ daemon"),
+        "B58 FAIL 模板仍用裸 @BIN@ 作 ExecStart 首参数"
+    );
+    // 且必须真的把解析结果写进 unit（防「构造了但没用」）
+    assert!(
+        s.contains("@EXEC@"),
+        "B58 FAIL 未把带引号的路径写入 unit 模板"
+    );
+    eprintln!("B58 PASS systemd ExecStart quotes the binary path");
+}
