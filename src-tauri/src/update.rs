@@ -190,6 +190,20 @@ pub fn init_identity(version: &str) -> serde_json::Value {
     if confirmed {
         g.pending_version = None;
         g.attempt = 0;
+        // ⚠ P0 修复（2026-09-12）：**更新成功后必须把该版本移出 pinned**。
+        //
+        //   缺陷：pinned 只在「尝试失败达阈值」时写入**目标版本**（见下方情况 B），
+        //     而清空点**只有** `reset_guard()`（手动恢复）——
+        //     `confirmed` 分支只清 pending_version / attempt，**不清 pinned**。
+        //
+        //   于是「失败 → 冷却 → 重试**成功**」之后，该版本仍留在 pinned 里；
+        //     此后 `should_check(version)` 命中 pinned 分支（**该分支不查冷却**）
+        //     → **永久拒绝所有后续更新**（含安全修复）。
+        //
+        //   这正是 P1-A 要消除的「永久自锁」以**另一条路径**复现：
+        //     原注释称「拉黑的是目标版本、比对的是当前版本、两者永不相等故形同虚设」，
+        //     但**更新一旦成功，current == target**，该分支立刻生效且**没有期限**。
+        //
         g.save();
         log(&format!("更新确认：已运行 {} （清零尝试计数）", version));
     } else if g.pending_version.is_some() {
@@ -221,6 +235,27 @@ pub fn init_identity(version: &str) -> serde_json::Value {
         ));
         g.attempt = 0;
         g.save();
+    }
+
+    // ⚠ P0 修复（2026-09-12）：**只要当前运行的版本曾被拉黑，就解除拉黑**。
+    //
+    //   缺陷：`pinned` 只在「尝试失败达阈值」时写入**目标版本**（情况 B），
+    //     清空点**只有** `reset_guard()`（手动恢复）。
+    //     而 `should_check()` 的 pinned 分支**不查冷却** —— 于是
+    //     「失败 → 冷却 → 重试成功」之后该版本仍留在黑名单里，
+    //     此后 `should_check(version)` 恒 false → **永久收不到任何更新（含安全修复）**。
+    //     这正是 P1-A 要消除的「永久自锁」以另一条路径复现：
+    //     原注释称「两者永不相等故形同虚设」，但更新一旦成功 current==target，
+    //     该分支立刻生效且**没有期限**。
+    //
+    //   此处放在 if/else 链**之后**（而非只在 confirmed 分支内），因为「当前版本曾被拉黑」
+    //     有两种到达方式：① 经本护栏更新成功（confirmed）；
+    //     ② 用户**手动**装了那个版本（它已被证明可用）。两者都该解除。
+    //   抑制语义保留：将来该版本若再失败，情况 B 会重新 pin。
+    if !version.is_empty() && g.pinned.iter().any(|p| p == version) {
+        g.pinned.retain(|p| p != version);
+        g.save();
+        log(&format!("当前运行版本 {} 曾被抑制，现已解除（更新成功后不应再拉黑）", version));
     }
 
     let kind = install_kind();

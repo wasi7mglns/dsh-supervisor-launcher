@@ -154,3 +154,70 @@ fn g6e_suppression_is_visible_to_user() {
     );
     eprintln!("G6-e PASS 抑制对用户可见且有恢复按钮");
 }
+
+/// G6-f：**pinned 抑制不得在「更新成功后」变成永久自锁**（P0 回归，2026-09-12）。
+///
+/// ## 修复的缺陷
+///
+/// `pinned` 只在「尝试失败达阈值」时写入**目标版本**（情况 B），
+/// 而清空点**只有** `reset_guard()`（手动恢复）——
+/// `confirmed` 分支只清 `pending_version`/`attempt`，**不清 pinned**。
+///
+/// 而 `should_check()` 的 pinned 分支**不查冷却**：
+///
+/// ```text
+///   ① 更新 v2 失败 → pin("v2")
+///   ② 6h 冷却后重试 → **成功**跑到 v2（confirmed 清 attempt 但 pinned 仍 = ["v2"]）
+///   ③ 此后 should_check("v2") 命中 pinned 分支 → 永久 false
+/// ```
+///
+/// 即：P1-A 要消除的「永久自锁」以**另一条路径**复现。
+/// 原注释称「拉黑的是目标版本、比对的是当前版本、两者永不相等故形同虚设」，
+/// 但**更新一旦成功 current == target**，该分支立刻生效且**没有期限**。
+///
+/// ## 锁定不变量
+///   G6-f  `init_identity` 必须在「当前运行版本曾被拉黑」时**解除拉黑**
+///   G6-g  解除必须发生在 if/else 链**之后**（覆盖「手动装了该版本」的情形），
+///          而非只在 confirmed 分支内
+///   G6-h  抑制语义保留：情况 B 仍会在失败达阈值时重新 pin
+#[test]
+fn g6f_pinned_is_cleared_once_running() {
+    let u = read("src/update.rs");
+
+    // G6-f：存在「运行版本被拉黑 → 解除」的处理
+    assert!(
+        u.contains("曾被抑制，现已解除"),
+        "G6-f FAIL init_identity 未在运行版本曾被拉黑时解除 —— 更新成功后变为永久自锁"
+    );
+    assert!(
+        u.contains("g.pinned.retain(|p| p != version)"),
+        "G6-f FAIL 缺少 pinned 的移除逻辑"
+    );
+
+    // G6-g：该解除必须在 else-if 链**结束之后**（不在 confirmed 分支内）
+    let i_chain_end = u.find("g.attempt = 0;\n        g.save();\n    }\n").unwrap_or(usize::MAX);
+    let i_unpin = u.find("曾被抑制，现已解除").unwrap_or(usize::MAX);
+    assert!(
+        i_unpin != usize::MAX && i_chain_end != usize::MAX && i_unpin > i_chain_end,
+        "G6-g FAIL 解除逻辑应在 if/else 链之后（覆盖手动安装该版本的情形）"
+    );
+
+    // G6-h（反向）：失败达阈值时仍会 pin —— 抑制语义未被删掉
+    assert!(
+        u.contains("g.pinned.push(target.clone())"),
+        "G6-h FAIL 失败达阈值时不再 pin —— 抑制语义被误删"
+    );
+
+    // G6-f（反向）：confirmed 分支内**不得**再有一份专用的 retain（避免两处实现分叉）
+    let confirmed_block = u
+        .split("// 情况 B")
+        .next()
+        .unwrap_or("");
+    let head = confirmed_block.rsplit("if confirmed {").next().unwrap_or("");
+    assert!(
+        !head.contains("pinned.retain"),
+        "G6-f FAIL confirmed 分支内不应有第二份 retain（同一事实一处实现）"
+    );
+
+    eprintln!("G6-f/g/h PASS pinned 在更新成功后被解除，且抑制语义保留");
+}
