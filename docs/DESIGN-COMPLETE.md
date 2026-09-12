@@ -1288,4 +1288,81 @@ tar 解包只写硬编码文件名（无遍历风险）、下载带 60s 超时�
 前端  verify     tsc 0 错 / eslint 0 错 / vitest 15 通过 / build 成功
 
 新增回归测试 14 个文件；每条修复均做「注入 → 失败 → 还原 → 通过」验证。
+
+---
+
+### 第十二轮：D-3 第一步 —— identity.json 写入收敛到单一 helper（2026-09-13）
+
+（第十轮 update/mirror/node/platform/main 六项与第十一轮插件市场回归的明细见
+ git 提交历史与 `AUDIT-HANDOFF.md`，本文件当时未逐轮追加。）
+
+#### 缺陷（第二状态源）
+
+`update.rs::init_identity()` 把 `attempt` / `pinned` / `pendingVersion` **抄进**
+`identity.json`；而 `reset_guard()` / `mark_pending()` **只写** `update-guard.json`，
+**不回写** `identity.json`。同一事实两份存储，且只在壳启动时刷新一次 → **必然分叉**。
+
+两个消费方读的都是那份陈旧副本：
+
+```
+壳   commands/mod.rs:416-424  shell_identity 快照（引导页展示 attempt/pinned）
+内核 domains/shell/index.js:119-121  用 id.attempt 作「失败次数」权威来源（决定回滚）
+```
+
+后果：用户点【立即恢复】（`reset_guard`：attempt 归零、pinned 清空）之后，
+引导页与内核**仍读到旧 attempt/pinned** —— 恢复动作在 UI 与回滚判定上都不生效，
+直到下次壳重启；若壳因更新失败被反复抑制，可能很久都不纠正。
+`mark_pending` 同理：内核看不到「已装待确认」的版本，更新确认状态机停在旧态。
+
+#### 修法（第一步：单一写入路径）
+
+新增 `write_identity_for(&Guard, runtime_fields)` 为 identity.json 的**唯一写入点**；
+`init_identity` / `set_phase` / `reset_guard` / `mark_pending` **全部经它**。
+护栏字段一律由传入的 Guard 注入（**即便调用方在 runtime_fields 里写同名键也会被覆盖**），
+使 identity.json 永远是 Guard 的投影。运行时字段与未知字段从旧文件保留。
+
+**不动任何消费方** → 零跨仓风险。第二步（从 identity.json 移除这三个字段、
+消费方改读 update-guard.json）是跨仓契约变更，需两侧协调发版，另行定夺。
+
+⚠ 一处易犯的错：`set_phase` 原实现是「读回旧文件再改 phase」。改为统一入口时若图省事
+沿用内存里的旧 Guard，会把护栏投影**退回旧值**（新风险）。故 `set_phase` 内**必须重新
+`Guard::load()`**；D-3-c 正是为这一条设的门禁。
+
+#### 注入验证（每条门禁都证明了可失败）
+
+| 注入 | 命中 |
+|---|---|
+| A 删 `reset_guard` 的 `write_identity(&g)` | d3a FAIL（19/1）|
+| B 删 `mark_pending` 的 `write_identity(&g)` | d3b FAIL（19/1）|
+| C `set_phase` 的 `Guard::load()` → `Guard::default()` | d3c FAIL（19/1）|
+| D 删 helper 里 `attempt` 的 map.insert | d3a/d3c/d3d/d3f FAIL（16/4）|
+| E helper 不读旧文件（`read_json` → `json!({})`） | d3c/d3e FAIL（18/2）|
+
+五次注入**全部编译通过**（注入不破坏可编译性），还原后 sha256 与注入前**逐字一致**
+（`RESTORE-OK` 五次 + 备份 diff 为空）。
+
+#### 新门禁（行为级，非源码字符串断言）
+
+`update.rs` 内 `mod d3_tests`（6 个用例）：直接调用真实写入方并**读回 identity.json**，
+故任何一处「漏写 / 写回旧值 / 调用方可覆盖」都会失败。
+经 `state_dir()` 的测试注入点（`#[cfg(test)] static TEST_STATE_DIR`）把状态目录指向
+临时目录，绝不触碰开发者真实的 `~/.dsh/shell/identity.json`；
+模块内用静态串行锁（测试线程池默认并发，会互相踩同一注入点）。
+
+- D-3-a reset_guard 同步护栏投影（核心症状）
+- D-3-b mark_pending 同步 pendingVersion
+- D-3-c set_phase 不得写回陈旧投影
+- D-3-d 调用方无法覆盖 Guard 字段（投影保证的机制证明）
+- D-3-e 运行时字段与未知字段必须保留（收敛不得变成裁剪）
+- D-3-f init_identity 从零投影正确
+
+#### 计数变化
+
+```
+壳    cargo test 100 项 → 106 项（+6，全部在 src/update.rs 的 bin 单测）
+      bin 单测 14 → 20；其余 5 个 test target 不变
+壳    cargo check --all-targets  0 警告
+内核  npm test  77 文件 / 1444 断言 / 0 失败（本轮未动内核）
+前端  npm run verify  tsc 0 / eslint 0 / vitest 15 / build 成功（本轮未动前端）
+```
 ```

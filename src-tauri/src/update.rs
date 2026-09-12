@@ -23,10 +23,32 @@ use std::path::{Path, PathBuf};
 
 /// 壳状态目录（与内核状态目录物理隔离：内核用 ~/.dsh/supervisor）。
 pub fn state_dir() -> PathBuf {
+    if let Some(p) = test_state_dir_override() {
+        return p;
+    }
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".dsh").join("shell")
+}
+
+/// 状态目录的**测试注入点**（沿用 nodeprobe::set_hard_deadline_ms 的既有惯例）。
+///
+/// 为什么需要：护栏的四个写入方（init_identity / mark_pending / reset_guard /
+/// set_phase）都落在 state_dir() 下。行为级测试必须能把它改写到临时目录 ——
+/// 否则测试会**改写开发者真实的 ~/.dsh/shell/identity.json**，
+/// 那是「测试污染真实状态」，不可接受。
+#[cfg(test)]
+static TEST_STATE_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn test_state_dir_override() -> Option<PathBuf> {
+    TEST_STATE_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+#[cfg(not(test))]
+fn test_state_dir_override() -> Option<PathBuf> {
+    None
 }
 
 fn identity_path() -> PathBuf { state_dir().join("identity.json") }
@@ -181,6 +203,62 @@ fn now_secs() -> u64 {
 /// 最大连续失败次数（达到即放弃强制，并把该版本拉黑）。
 const MAX_ATTEMPTS: u32 = 2;
 
+/// 写 identity.json —— **身份文件的唯一写入点**。
+///
+/// ## 为什么要收敛（D-3 第一步，2026-09-13）
+///
+/// 缺陷（第二状态源）：init_identity 把 attempt / pinned / pendingVersion **抄进**
+/// identity.json，而 reset_guard() / mark_pending() **只写** update-guard.json、
+/// 不回写 identity.json。于是同一事实有两份存储，且**已被证明会分叉**：
+///
+///   · 护栏账本（update-guard.json）是真正的事实：Guard::save() 是唯一推进入口；
+///   · identity.json 的护栏字段是它的**手工副本**，只在壳启动时刷新一次。
+///
+/// 两个消费方都读 identity.json 里这份**陈旧副本**：
+///   · 壳 commands/mod.rs:416 shell_identity（引导页展示 attempt/pinned）；
+///   · 内核 domains/shell/index.js:119-121 把 id.attempt 当「失败次数」权威来源（决定回滚）。
+///
+/// 后果示例：用户点【立即恢复】（reset_guard：attempt=0、pinned 清空）后，
+/// 引导页与内核**仍看到旧 attempt/pinned** —— 恢复动作在 UI 与回滚判定上都不生效，
+/// 直到下次壳重启才纠正（若壳因更新失败反复被抑制，可能很久）。
+///
+/// 修法：把 identity.json 的**所有**写入收敛到本函数，四个写入方
+/// （init_identity / set_phase / reset_guard / mark_pending）全部经它；
+/// 护栏字段一律取自传入的 Guard，**调用方无法自行传入** ——
+/// 使 identity.json 永远是 Guard 的投影，不可能分叉。
+///
+/// 注意：这是**第一步**（单一写入路径，不动任何消费方，零跨仓风险）。
+/// 第二步（从 identity.json 移除这三个字段、消费方改读 update-guard.json）
+/// 是跨仓契约变更，必须两侧协调发版，另行定夺。
+///
+/// runtime_fields 描述**本次调用的运行时上下文**（version / phase / pid /
+/// startedAt / exe 等）；其余字段从现有文件保留。
+fn write_identity_for(g: &Guard, runtime_fields: &serde_json::Value) -> serde_json::Value {
+    let mut v = read_json(&identity_path());
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    let map = v.as_object_mut().expect("identity.json 必须是对象");
+    if let Some(rf) = runtime_fields.as_object() {
+        for (k, val) in rf {
+            map.insert(k.clone(), val.clone());
+        }
+    }
+    // 护栏字段：**只**来自 Guard，调用方无法覆盖（即便 runtime_fields 里写了同名键，
+    // 也会被下面这三行盖掉）—— 这正是「不可能分叉」的实现保证。
+    map.insert("attempt".into(), serde_json::json!(g.attempt));
+    map.insert("pinned".into(), serde_json::json!(g.pinned));
+    map.insert("pendingVersion".into(), serde_json::json!(g.pending_version));
+    let out = serde_json::Value::Object(map.clone());
+    write_json(&identity_path(), &out);
+    out
+}
+
+/// 写 identity.json，仅同步护栏投影（reset_guard / mark_pending 用）。
+fn write_identity(g: &Guard) -> serde_json::Value {
+    write_identity_for(g, &serde_json::json!({}))
+}
+
 /// 启动时调用：写身份文件 + 推进护栏状态。
 pub fn init_identity(version: &str) -> serde_json::Value {
     let mut g = Guard::load();
@@ -264,15 +342,15 @@ pub fn init_identity(version: &str) -> serde_json::Value {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let id = serde_json::json!({
+    // ⚠ D-3 第一步：护栏字段（attempt/pinned/pendingVersion）**不在此处手抄** ——
+    //   本 json! 只描述**运行时上下文**，护栏投影由 write_identity_for 从传入的 Guard 注入，
+    //   杜绝「这里写一份、reset_guard/mark_pending 忘记回写」的分叉。
+    let runtime = serde_json::json!({
         "version": version,
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "installKind": kind,
         "selfUpdateCapable": capable,
-        "attempt": g.attempt,
-        "pinned": g.pinned,
-        "pendingVersion": g.pending_version,
         "phase": "boot",
         "pid": std::process::id(),
         "startedAt": now,
@@ -284,16 +362,18 @@ pub fn init_identity(version: &str) -> serde_json::Value {
         //   刷新时机：每次壳启动（含自更新后重启），故升级换路径后会自动跟随。
         "exe": std::env::current_exe().ok().map(|p| p.display().to_string()),
     });
-    write_json(&identity_path(), &id);
+    let id = write_identity_for(&g, &runtime);
     log(&format!("壳启动 v{} kind={} 可自更新={} attempt={}", version, kind, capable, g.attempt));
     id
 }
 
 /// 更新阶段上报（引导页各步骤调用，保持 identity.json 与 shell.log 同步）。
 pub fn set_phase(phase: &str) {
-    let mut v = read_json(&identity_path());
-    v["phase"] = serde_json::json!(phase);
-    write_json(&identity_path(), &v);
+    // ⚠ D-3 第一步：经统一写入点。**必须重新 load Guard**（而非沿用内存中的旧值）——
+    //   mark_pending / init_identity 可能在本命令之前刚刚改过账本，
+    //   用旧值会把护栏投影**写回陈旧状态**。
+    let g = Guard::load();
+    write_identity_for(&g, &serde_json::json!({ "phase": phase }));
     log(&format!("阶段 → {}", phase));
 }
 
@@ -302,6 +382,10 @@ pub fn mark_pending(version: &str) {
     let mut g = Guard::load();
     g.pending_version = Some(version.to_string());
     g.save();
+    // ⚠ D-3 第一步：账本变更后**同步** identity.json 的护栏投影。
+    //   旧实现只写 update-guard.json，故 identity.json 的 pendingVersion 一直是旧值 ——
+    //   而壳的 shell_identity 快照与内核 domains/shell/index.js 都读它。
+    write_identity(&g);
     log(&format!("已安装 {}，待重启生效", version));
 }
 
@@ -353,8 +437,289 @@ pub fn reset_guard() -> serde_json::Value {
         last_attempt_at: 0,
     };
     g.save();
+    // ⚠ D-3 第一步（本缺陷的核心症状）：复位后**必须**同步 identity.json。
+    //   旧实现只写 update-guard.json —— 于是用户点【立即恢复】之后，
+    //   shell_identity 快照与内核回滚判定读到的仍是**复位前的旧 attempt/pinned**，
+    //   「恢复」在 UI 与回滚判定上都不生效，直到下次壳重启。
+    write_identity(&g);
     log(&format!("更新护栏已手动复位（此前 attempt={}，pinned={:?}）", before.attempt, before.pinned));
     snapshot
 }
 
 pub fn identity_snapshot() -> serde_json::Value { read_json(&identity_path()) }
+
+#[cfg(test)]
+mod d3_tests {
+    //! D-3 第一步门禁：identity.json 的护栏字段必须是 Guard 的**投影**（单一写入路径）。
+    //!
+    //! ## 修复的缺陷
+    //!
+    //! init_identity 把 attempt / pinned / pendingVersion 抄进 identity.json，
+    //! 而 reset_guard() / mark_pending() **只写** update-guard.json、不回写 identity.json。
+    //! 于是同一事实有两个真源，且**必然分叉**（后者只在壳启动时刷新）。
+    //!
+    //! 两个消费方读的都是 identity.json 那份陈旧副本：
+    //!   · 壳 commands/mod.rs shell_identity（引导页展示 attempt/pinned）；
+    //!   · 内核 domains/shell/index.js id.attempt（回滚判定的权威失败计数）。
+    //!
+    //! ## 为什么这是**行为级**测试（不是源码字符串断言）
+    //!
+    //! 「所有写入都经同一个 helper」用 grep 断言很容易被自己写的注释骗过
+    //! （本仓已发生过两次：断言命中说明文字里的字符串）。此处直接**调用真实写入方**
+    //! 并读回 identity.json —— 注入任何一处「漏写 / 写回旧值」都会让它失败。
+    //!
+    //! ## 目录隔离
+    //!
+    //! 经 state_dir() 的注入点把状态目录指向临时目录，绝不触碰开发者真实的
+    //! ~/.dsh/shell/identity.json（测试污染真实状态是不可接受的）。
+    //!
+    //! ## 串行
+    //!
+    //! 默认测试线程池会让多个用例并发改写**同一个** TEST_STATE_DIR，
+    //! 故统一用一把静态锁把本模块的用例串行化。
+    use super::*;
+    use std::sync::MutexGuard;
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct Env {
+        dir: PathBuf,
+        _g: MutexGuard<'static, ()>,
+    }
+
+    impl Env {
+        fn new(tag: &str) -> Self {
+            let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = std::env::temp_dir().join(format!("dsh-d3-{}-{}", tag, std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("建临时状态目录");
+            *TEST_STATE_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
+            Env { dir, _g: g }
+        }
+        fn guard(&self) -> serde_json::Value {
+            read_json(&self.dir.join("update-guard.json"))
+        }
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            *TEST_STATE_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 造一份账本，模拟「更新失败达阈值」后的护栏状态（attempt=2、pinned 有项）。
+    fn seed_guard(dir: &Path, attempt: u32, pinned: &[&str], pending: Option<&str>) {
+        write_json(
+            &dir.join("update-guard.json"),
+            &serde_json::json!({
+                "attempt": attempt,
+                "pendingVersion": pending,
+                "pinned": pinned,
+                "lastAttemptAt": now_secs(),
+            }),
+        );
+    }
+
+    /// D-3-a（核心症状）：reset_guard 必须让 identity.json 的护栏字段同步归零。
+    ///
+    /// 注入：删掉 reset_guard 里的 write_identity(&g) →
+    /// identity.json 仍显示复位前的 attempt=2 / pinned=["9.9.9"] → FAIL。
+    #[test]
+    fn d3a_reset_guard_syncs_identity_projection() {
+        let env = Env::new("reset");
+        // 先让 identity.json 存在且带着「复位前」的护栏值（旧实现正是停在这里）。
+        seed_guard(&env.dir, 2, &["9.9.9"], Some("9.9.9"));
+        write_json(
+            &env.dir.join("identity.json"),
+            &serde_json::json!({
+                "version": "1.0.8",
+                "attempt": 2,
+                "pinned": ["9.9.9"],
+                "pendingVersion": "9.9.9",
+            }),
+        );
+        let before = identity_snapshot();
+        assert_eq!(before["attempt"], serde_json::json!(2), "前置：identity 应带着旧 attempt");
+
+        reset_guard();
+
+        // 账本已清零
+        let g = env.guard();
+        assert_eq!(g["attempt"], serde_json::json!(0), "update-guard attempt 应归零");
+        assert_eq!(g["pinned"], serde_json::json!([]), "update-guard pinned 应清空");
+        // identity.json 必须**同步**投影（这正是缺陷所在）
+        let id = identity_snapshot();
+        assert_eq!(
+            id["attempt"],
+            serde_json::json!(0),
+            "D-3-a FAIL reset_guard 未回写 identity.json —— 引导页与内核仍看到旧 attempt"
+        );
+        assert_eq!(
+            id["pinned"],
+            serde_json::json!([]),
+            "D-3-a FAIL reset_guard 未回写 identity.json 的 pinned"
+        );
+        assert_eq!(
+            id["pendingVersion"],
+            serde_json::Value::Null,
+            "D-3-a FAIL reset_guard 未回写 identity.json 的 pendingVersion"
+        );
+    }
+
+    /// D-3-b：mark_pending 必须把新的 pendingVersion 同步进 identity.json。
+    ///
+    /// 注入：删掉 mark_pending 里的 write_identity(&g) → identity.json 仍是旧值 → FAIL。
+    #[test]
+    fn d3b_mark_pending_syncs_identity_projection() {
+        let env = Env::new("pending");
+        seed_guard(&env.dir, 1, &[], None);
+        init_identity("1.0.8");
+        assert_eq!(
+            identity_snapshot()["pendingVersion"],
+            serde_json::Value::Null,
+            "前置：尚无待生效版本"
+        );
+
+        mark_pending("1.0.9");
+
+        assert_eq!(
+            identity_snapshot()["pendingVersion"],
+            serde_json::json!("1.0.9"),
+            "D-3-b FAIL mark_pending 未回写 identity.json —— 内核看不到待确认的更新"
+        );
+        // 反向：账本本身也必须已更新（两处一致，不是只有一处对）
+        assert_eq!(env.guard()["pendingVersion"], serde_json::json!("1.0.9"));
+    }
+
+    /// D-3-c：set_phase 不得把**陈旧**的护栏投影写回 identity.json。
+    ///
+    /// 这是统一写入路径**引入的新风险**：set_phase 原实现「读回旧文件再改 phase」，
+    /// 若改成「用内存里的旧 Guard」，就会把护栏字段退回旧值。
+    /// 注入：把 set_phase 里的 Guard::load() 换成空 Guard::default() → FAIL。
+    #[test]
+    fn d3c_set_phase_keeps_guard_projection_fresh() {
+        let env = Env::new("phase");
+        seed_guard(&env.dir, 2, &["9.9.9"], Some("9.9.9"));
+        // 让 identity.json 处于「陈旧」状态（旧 attempt=0），复现真实分叉场景。
+        write_json(
+            &env.dir.join("identity.json"),
+            &serde_json::json!({
+                "version": "1.0.8",
+                "attempt": 0,
+                "pinned": [],
+                "pendingVersion": serde_json::Value::Null,
+            }),
+        );
+
+        set_phase("shell-update-check");
+
+        let id = identity_snapshot();
+        assert_eq!(id["phase"], serde_json::json!("shell-update-check"), "phase 必须被写入");
+        assert_eq!(
+            id["attempt"],
+            serde_json::json!(2),
+            "D-3-c FAIL set_phase 把陈旧护栏投影写回（应用 Guard::load 的最新值）"
+        );
+        assert_eq!(
+            id["pinned"],
+            serde_json::json!(["9.9.9"]),
+            "D-3-c FAIL set_phase 未从账本投影 pinned"
+        );
+        // 运行时字段不得被 set_phase 破坏
+        assert_eq!(id["version"], serde_json::json!("1.0.8"), "运行时字段应保留");
+    }
+
+    /// D-3-d：守卫字段只能来自 Guard —— 调用方**无法**通过 runtime_fields 覆盖。
+    ///
+    /// 这是「不可能分叉」的机制保证：若哪天有人图省事在 runtime_fields 里塞了
+    /// 一个 attempt，也不该生效。
+    ///
+    /// 注入：删掉 write_identity_for 里三行 map.insert 护栏字段的**最后一行**（attempt）
+    /// → 调用方传入的 999 会留下 → FAIL。
+    #[test]
+    fn d3d_guard_fields_cannot_be_overridden_by_caller() {
+        let env = Env::new("override");
+        seed_guard(&env.dir, 1, &["1.1.1"], Some("1.1.1"));
+        let g = Guard {
+            attempt: 7,
+            pending_version: None,
+            pinned: vec!["2.2.2".into()],
+            last_attempt_at: 0,
+        };
+        let out = write_identity_for(
+            &g,
+            &serde_json::json!({
+                "version": "1.0.8",
+                // 恶意/图省事：调用方试图直接指定护栏字段
+                "attempt": 999,
+                "pinned": ["999.0.0"],
+                "pendingVersion": "999.0.0",
+            }),
+        );
+        assert_eq!(
+            out["attempt"],
+            serde_json::json!(7),
+            "D-3-d FAIL 调用方传的 attempt 覆盖了 Guard —— 投影保证被破坏"
+        );
+        assert_eq!(out["pinned"], serde_json::json!(["2.2.2"]));
+        assert_eq!(out["pendingVersion"], serde_json::Value::Null);
+        // 落盘文件同样必须是 Guard 的值
+        assert_eq!(identity_snapshot()["attempt"], serde_json::json!(7));
+    }
+
+    /// D-3-e（反向）：运行时字段与**未知**字段必须被保留 —— 收敛写入不能变成丢字段。
+    ///
+    /// 旧实现是「read → 改几个键 → write」，preserve 其它键是既有契约
+    /// （例如 shell.html 依赖的 installKind / selfUpdateCapable / exe）。
+    ///
+    /// 注入：把 write_identity_for 里的 read_json 换成 json!({})（不读旧文件）→ FAIL。
+    #[test]
+    fn d3e_helper_preserves_runtime_and_unknown_fields() {
+        let env = Env::new("preserve");
+        write_json(
+            &env.dir.join("identity.json"),
+            &serde_json::json!({
+                "version": "1.0.8",
+                "installKind": "deb",
+                "selfUpdateCapable": true,
+                "exe": "/opt/dsh/gui",
+                "phase": "boot",
+                "futureFieldFromNewerShell": "keep-me",
+            }),
+        );
+        let g = Guard::default();
+        // 只更新 phase，其余全部保留
+        write_identity_for(&g, &serde_json::json!({ "phase": "ready" }));
+
+        let id = identity_snapshot();
+        assert_eq!(id["phase"], serde_json::json!("ready"), "phase 应被更新");
+        assert_eq!(id["version"], serde_json::json!("1.0.8"), "version 应保留");
+        assert_eq!(id["installKind"], serde_json::json!("deb"), "installKind 应保留");
+        assert_eq!(id["selfUpdateCapable"], serde_json::json!(true), "selfUpdateCapable 应保留");
+        assert_eq!(id["exe"], serde_json::json!("/opt/dsh/gui"), "exe 应保留");
+        assert_eq!(
+            id["futureFieldFromNewerShell"],
+            serde_json::json!("keep-me"),
+            "D-3-e FAIL 未知字段被丢弃（收敛不得变成裁剪）"
+        );
+    }
+
+    /// D-3-f：init_identity 启动即把护栏投影写正确（正向闭环）。
+    #[test]
+    fn d3f_init_identity_projects_guard_from_scratch() {
+        let env = Env::new("init");
+        seed_guard(&env.dir, 2, &["9.9.9"], Some("9.9.9"));
+        // 以别的版本启动 → 情况 B：attempt+1、达到阈值 → pin 目标、清 pending
+        init_identity("1.0.8");
+        let id = identity_snapshot();
+        assert_eq!(id["version"], serde_json::json!("1.0.8"));
+        assert_eq!(id["attempt"], serde_json::json!(3), "attempt 应 +1");
+        assert!(
+            id["pinned"].as_array().map(|a| a.iter().any(|x| x == "9.9.9")).unwrap_or(false),
+            "D-3-f FAIL identity.json 的 pinned 未反映账本"
+        );
+        assert_eq!(id["pendingVersion"], serde_json::Value::Null);
+    }
+}
+
