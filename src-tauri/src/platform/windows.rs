@@ -237,13 +237,26 @@ impl ServiceControl for Impl {
         //   而壳默认以普通用户权限运行 —— 若首次尝试失败，退化为普通权限任务，
         //   保证「服务定义一定能建立」（守卫本身不需要管理员权限，它只管理当前用户的 DSH）。
         //   原则：**权限不足时应降级而非彻底失败**，否则用户会卡在「守卫就绪」。
+        // ⚠ `/TR` 的值**必须自带引号**（P1-D 修复，2026-09-12）：
+        //   schtasks 对 `/TR` 接收的都是**纯字符串**（此处经 args 传参，不经过 cmd），
+        //   它内部按命令行规则解析 —— 路径含空格时，若不自带引号，
+        //   任务动作会被**截断到第一个空格**。
+        //   而 `%USERPROFILE%\.dsh\supervisor\guard-task.cmd` 里含 Windows 用户名，
+        //   用户名**可以含空格**（如 "John Smith"）。
+        //   症状：任务创建**成功**（schtasks 不报错）但执行时找不到目标 → 登录自启静默失效。
+        //
+        //   对照证据：内核侧同类调用**已经**自带引号
+        //   （plus/src/platform/os/autostart.js 的 `'/TR', '"' + guiCommand() + '"'`）；
+        //   壳侧 spawn_daemon 的 cmd 引号也已修（本文件下方 + B43 测试）—— 唯独此处漏网。
+        //   注意引号写在**值内部**，而不是给 Rust args 加引号（后者会被原样传递）。
+        let tr_action = format!("\"{}\"", wrapper.display());
         let base = |rl: Option<&str>| {
             let mut c = Command::new("schtasks");
             c.args(["/Create", "/TN", GUARD_TASK, "/SC", "ONLOGON"]);
             if let Some(level) = rl {
                 c.args(["/RL", level]);
             }
-            c.args(["/F", "/TR", &wrapper.display().to_string()]);
+            c.args(["/F", "/TR", &tr_action]);
             c
         };
 

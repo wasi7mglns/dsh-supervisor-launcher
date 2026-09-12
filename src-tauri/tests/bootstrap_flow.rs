@@ -1010,6 +1010,39 @@ fn b43_windows_cmd_quoting_handles_spaces() {
     eprintln!("B43 PASS windows cmd quoting handles spaces");
 }
 
+/// B56：Windows 计划任务的 `/TR` 值必须**自带引号**（P1-D 回归，2026-09-12）。
+///
+/// ## 缺陷
+///
+/// `schtasks /Create ... /TR <wrapper>` 的 `/TR` 值是**纯字符串**，schtasks 内部按
+/// 命令行规则解析 —— 路径含空格时若不自带引号，动作会被**截断到第一个空格**。
+/// 而 wrapper = `%USERPROFILE%\.dsh\supervisor\guard-task.cmd`，含用户名；
+/// Windows 用户名**可以含空格**（如 "John Smith"）。
+///
+/// 症状：任务创建**成功**（schtasks 不报错）但执行时找不到目标 → **登录自启静默失效**。
+///
+/// ## 为什么 B43 没拦住
+///
+/// B43 只断言了 `spawn_daemon` 的 `cmd /C` 引号（那条路径已修）。
+/// `/TR` 是**同一类缺陷的另一处**，而 B43 的断言范围没覆盖它 ——
+/// 「修了一处就以为同类都修了」正是本仓反复出现的失效模式。
+#[test]
+fn b56_windows_schtasks_tr_value_is_quoted() {
+    let s = fs::read_to_string(manifest_dir().join("src").join("platform").join("windows.rs"))
+        .expect("platform/windows.rs");
+    // 必须存在「把路径包进引号」的构造
+    assert!(
+        s.contains("format!(\"\\\"{}\\\"\", wrapper.display())"),
+        "B56 FAIL /TR 值未自带引号 —— 用户名含空格时任务动作会被截断"
+    );
+    // 且不得再用未加引号的裸 display() 直接当 /TR 值
+    assert!(
+        !s.contains("\"/TR\", &wrapper.display().to_string()"),
+        "B56 FAIL 仍在用未加引号的 wrapper 作 /TR 值"
+    );
+    eprintln!("B56 PASS schtasks /TR value is quoted");
+}
+
 /// B44：本地 TCP 连接必须有**连接**超时，且守卫探针不得占用主线程。
 ///
 /// `TcpStream::connect` **没有超时**：端口被防火墙 DROP（而非 REJECT）时会等到 OS
