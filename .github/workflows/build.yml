@@ -104,6 +104,31 @@ jobs:
             libsoup-3.0-dev libjavascriptcoregtk-4.1-dev pkg-config \
             rpm           # rpm 打包需要 rpmbuild
 
+      # ── 门禁测试（P1-B 接线，2026-09-12）──
+      #
+      # ⚠ 为什么必须单独一步：本仓 60+ 个门禁（G1/G1'/G2/G3/G5、B1–B56）与
+      #   平台矩阵自检**此前从未在 CI 执行** —— 只有 `updater_artifacts` 被跑过。
+      #   而 README 声称「壳的跨平台与引导行为由测试保障（cargo test…B1–B55）」，
+      #   DESIGN 更写着「没有门禁的规范等于没有规范」。
+      #   于是跨平台约束在产线上退化为注释：改坏 platform/ 也不会被拦住。
+      #
+      # 覆盖（均为**无外部依赖**目标，可安全在 CI 跑）：
+      #   · bootstrap_flow    —— G1/G1'/G2/G3/G5 + B1–B56（分层 + 引导流程 + 前端语法）
+      #   · update_guard_test —— G6（自更新护栏不得永久自锁，P1-A）
+      #   · 单元测试          —— error/bounded/core/node/nodeprobe 内嵌 #[cfg(test)]
+      # 注：`updater_artifacts` 需要 SHELL_REHEARSAL_DIR（打包产物），
+      #     故仍在下方「产物验收」步骤单独跑，不并入本步。
+      - name: 门禁测试（G1–G6 + B1–B56 + 单元）
+        shell: bash
+        run: |
+          # 不截断：门禁失败时断言文案就是排障依据（与上一步同理）。
+          set -o pipefail
+          # ⚠ 不用 `--lib`：本包是 **bin crate**（无 library target），
+          #   `--lib` 会直接 `error: no library targets found` 并退出 101。
+          #   `--bins` 覆盖 src 内嵌的 #[cfg(test)] 单元测试。
+          cargo test --bins --test bootstrap_flow --test update_guard_test 2>&1 | tail -80
+        working-directory: src-tauri
+
       - name: 壳无头冒烟（--node-plan：环境探针 + 官方最新 LTS）
         shell: bash
         run: |
