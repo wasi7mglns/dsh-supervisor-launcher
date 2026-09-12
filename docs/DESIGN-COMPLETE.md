@@ -1269,3 +1269,23 @@ tar 解包只写硬编码文件名（无遍历风险）、下载带 60s 超时�
 壳    cargo test  92 项 / 0 失败（起点 77，+15）
 前端  verify     tsc 0 错 / eslint 0 错 / vitest 15 通过 / build 成功
 ```
+### 第九轮续：实例域安全（2026-09-12）
+
+| 级别 | 位置 | 缺陷 |
+|---|---|---|
+| **P1** | 内核 instance/index.js | 升级失败**两条路径都无回滚**（npm 失败 / 重启失败）→ 实例停机 + 版本不确定，guardian 不自愈 |
+| **P1** | 内核 instance/index.js | removeInstance **未确认单元已停**就 rm -rf 实例根目录 → 对运行中实例**不可逆数据丢失**（service.js:41 已提示可经 isUnitActive 复核，实例域从未调用）|
+| **P1** | 内核 instance/index.js | ports.release(port) **不带 ownerId** → 可误删他人端口登记（上一轮刚加归属校验）|
+| **P1** | 内核 instance/index.js | _updCache 只写不删（内存单调增长）+ 60s 定时器未 unref |
+| **P2** | 内核 instance/index.js | systemd 模板**无条件删除**（可能删掉用户同名文件）→ 改**改名让位**（不丢数据）|
+| **P2** | 内核 instance/index.js | 我上一轮留下的**自相矛盾**：`set sandboxSupported` 与「用方法而非 setter」的注释并存 |
+
+### 最终累计（九轮）
+
+```
+内核  npm test   74 文件 / 1401 断言 / 0 失败（起点 1098，+303）
+壳    cargo test  92 项 / 0 失败（起点 77，+15）
+前端  verify     tsc 0 错 / eslint 0 错 / vitest 15 通过 / build 成功
+
+新增回归测试 14 个文件；每条修复均做「注入 → 失败 → 还原 → 通过」验证。
+```
