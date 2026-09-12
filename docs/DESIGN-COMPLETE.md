@@ -1156,3 +1156,31 @@ BEFORE                                    AFTER
 
 **关键点**：本清单的 6 项中，**5 项集中在批 D（契约层）**，1 项在批 F。
 即：**「把东西移到壳里」实际上就是「建立契约层 + 删除内核副本」这一件事**。
+
+### 第四轮：转发链路 + 前端门禁（2026-09-12 续）
+
+覆盖此前未审计的转发三文件（proxy 893 / forward-core 448 / relay 488 行）与
+router 其余（switch/evidence/router-ops/index/quota-strategies）、guard/ports、relay/manager，
+以及 `ui/src` 前端源码。修 7 P1 + 7 P2/P3。
+
+| 级别 | 位置 | 缺陷 |
+|---|---|---|
+| **P1 安全** | 内核 relay | `config.js` 声称「LAN 受 RFC1918 白名单约束」，**全仓从未实现**；relay 监听 0.0.0.0 且把 Origin 改写成回环 → 未设 token 时同网段零认证触达 DSH 特权面 |
+| **P1** | 内核 forward-core | 请求级熔断**完全失效**：`markUsed` 在请求**发出前**无条件清零失败计数 → 阈值 2 数学上不可达 |
+| **P1** | 内核 forward-core | `prov.markNetFail` —— **方法全仓不存在**，guard 恒 false；注释声称的「2026-09 二次修正」从未生效 |
+| **P1** | 内核 proxy.js | `_restartPending` 只写不读（延后=丢弃）且 2min 退避在延迟**之前**置位 |
+| **P1** | 内核 proxy.js | 裸 `npx` 未走平台解析（Windows ENOENT），且门禁正则只覆盖 npm、对 npx 盲区 |
+| **P1** | 内核 base.js | `applyDetection` 失败分支不设 nextResetAt → 探测闸门**恒真**，每 5min 起停实例（启停风暴）|
+| **P1 门禁** | 内核 CI | 前端门禁**从未执行**：CI 注释指向的「release-core.sh 的 [3/7]」**不存在**（只有 [1/5]），而 build-ui 只构建不测试 |
+| **P2** | relay / ports / router-ops | 注释谎称 HOLD_MS 上限 · `readUpstreamBody` 无时间上限 · `acc.instance` 与 instanceOf 双源（12 处）· `release` 忽略 owner · `setProviderKeys` 删反代账号不释放实例/端口 · 更新进度双状态源 · OAuth 跨轮误杀 |
+
+⚠ 前端门禁修复前**实测**：`tsc --noEmit` 0 错、`vitest run` 3 文件 15 用例全绿、`eslint` 0 错 ——
+即这些测试一直是对的，只是从未被调用。已补进 `ci-core.sh`（verify 在 build **之前**）。
+
+### 四轮累计
+
+```
+内核  npm test   68 文件 / 1255 断言 / 0 失败（起点 1098，+157）
+壳    cargo test  92 项 / 0 失败（起点 77，+15）
+前端  verify     tsc 0 错 / eslint 0 错 / vitest 15 通过（此前从未运行）
+```
