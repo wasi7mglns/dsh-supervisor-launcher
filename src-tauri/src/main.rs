@@ -450,11 +450,14 @@ fn main() {
                 // 关闭窗口行为（读守卫 config.closeAction，系统级开关 2026-09）：
                 // 'exit' = 退出管家（通知守卫停止全部服务链 + 壳退出）；默认 'hide' = 隐藏至托盘常驻。
                 if env::close_action() == "exit" {
-                    let app = window.app_handle();
+                    // ⚠ 2026-09-12（P2 修复）：必须离开 UI 线程（与托盘 quit 同一纪律）。
+                    let h = window.app_handle().clone();
                     let port = env::api_port();
-                    // 契约 §4.1：停被管对象（等回执）→ 由所有者停止守卫 → 壳退出
-                    domain::guardctl::shutdown_all(port);
-                    app.exit(0);
+                    api.prevent_close();
+                    std::thread::spawn(move || {
+                        domain::guardctl::shutdown_all(port);
+                        h.exit(0);
+                    });
                     return;
                 }
                 let _ = window.hide();

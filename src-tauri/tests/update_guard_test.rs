@@ -273,3 +273,35 @@ fn g6j_shasums_failure_does_not_abort_fallback() {
     );
     eprintln!("G6-j PASS SHASUMS 失败不中断镜像回退");
 }
+
+/// G6-k：**退出握手不得在 UI 线程执行**（两条路径都必须 offload）。
+///
+/// `guardctl::shutdown_all` 最坏约 70 秒（`/session/stop` 60s + 轮询）。
+/// 在 UI 线程做会让窗口假死，用户强杀 → 跳过握手 → 留下未停的 DSH。
+///
+/// 原实现：托盘 quit 路径正确地 spawn 到线程，而 `closeAction=exit`
+/// 的关窗路径**直接在回调里同步执行** —— 同一纪律只覆盖两条路径中的一条。
+#[test]
+fn g6k_exit_handshake_is_off_ui_thread() {
+    let m = read("src/main.rs");
+    // 关窗 exit 路径必须 prevent_close + spawn
+    assert!(
+        m.contains("api.prevent_close();"),
+        "G6-k FAIL 关窗 exit 路径缺 prevent_close（最后一个窗口关闭可能让进程先退出、握手被截断）"
+    );
+    assert!(
+        m.contains("let h = window.app_handle().clone();"),
+        "G6-k FAIL 关窗 exit 路径未把退出握手 offload 到线程（UI 会假死 ~70s）"
+    );
+    // 反向：不得再有「在 on_window_event 里同步调 shutdown_all 后 exit」的形态
+    assert!(
+        !m.contains("domain::guardctl::shutdown_all(port);\n                    app.exit(0);"),
+        "G6-k FAIL 仍存在 UI 线程同步退出握手"
+    );
+    // 托盘路径的既有纪律仍在
+    assert!(
+        m.contains("let h = app.clone();"),
+        "G6-k FAIL 托盘 quit 路径的 offload 丢失"
+    );
+    eprintln!("G6-k PASS 两条退出路径都把握手 offload 到后台线程");
+}
