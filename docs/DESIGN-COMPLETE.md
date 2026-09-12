@@ -1204,3 +1204,26 @@ tar 解包只写硬编码文件名（无遍历风险）、下载带 60s 超时�
 壳    cargo test  92 项 / 0 失败（起点 77，+15）
 前端  verify     tsc 0 错 / eslint 0 错 / vitest 15 通过 / build 成功
 ```
+### 第六/七轮：lifecycle 剩余 + platform 层（2026-09-12 续）
+
+| 级别 | 位置 | 缺陷 |
+|---|---|---|
+| **P1** | 内核 lifecycle/supervisor | **优雅停机被 process.exit 截断**：`shutdown()` 内部 `stopAll` 是 async 却不 await，三个调用方都紧接着 `process.exit` → 子进程/端口成孤儿（同类第二处：relay-daemon 的 frpc）|
+| **P1** | 内核 `platform/loghub.js` | 4 处 `this._log` **方法从未定义** → 写盘失败分支抛 TypeError 被同条 catch 再抛 → 事件与告警**双双丢失** |
+| **P1** | 内核 `platform/os/pidlookup.js` | Windows PowerShell 回退**不可达**（wmic 存在但解析不中即 return null）→ cmdline 防线整条静默失效 |
+| **P2** | 内核 platform | `writePrivate` 丢弃保护失败仍报 ok · `hasTool` 负结果永久缓存 + 沙箱能力构造期冻结 · .desktop `Exec` 未转义 `%` |
+| **P2** | 内核 relay/manager | reconcile 无单飞去重（2s 节拍叠加串行 TCP 探测）|
+| **P2** | 内核 router-ops | `added++` 不 await 检测 → 计数虚高；daemon 模式下守卫可能双写 providers.json（三条路径只在一处设防）|
+| **P3** | 内核 platform | 死声明 `guiSupported`/`_logFileFor` · **一条恒真断言**（`undefined` 也通过）|
+
+⚠ **本轮又拦下 1 处子代理误判**（累计 4 次）：
+称 `extractTarGz` 是「全仓零调用的死导出」—— 实际被 `dist/self-update.js:87` 调用，
+正是「纯 Node 解包取代 execFileSync(tar)」那次修复的落点；**照删会破坏守卫自更新**。
+
+### 七轮累计
+
+```
+内核  npm test   71 文件 / 1316 断言 / 0 失败（起点 1098，+218）
+壳    cargo test  92 项 / 0 失败（起点 77，+15）
+前端  verify     tsc 0 错 / eslint 0 错 / vitest 15 通过 / build 成功
+```
