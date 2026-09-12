@@ -1250,3 +1250,22 @@ tar 解包只写硬编码文件名（无遍历风险）、下载带 60s 超时�
 壳    cargo test  92 项 / 0 失败（起点 77，+15）
 前端  verify     tsc 0 错 / eslint 0 错 / vitest 15 通过 / build 成功
 ```
+### 第九轮：native 管理器 + 实例域 + 壳看护（2026-09-12 续）
+
+| 级别 | 位置 | 缺陷 |
+|---|---|---|
+| **P1** | 内核 native/manager.js | 安装/升级/卸载三入口锁**不对称** —— upgrade 从不设 installing、install/uninstall 不查 busy() → **升级中可卸载**（装了一半 + manifest 被清 = 不可恢复）|
+| **P1** | 内核 instance/index.js | 升级失败**两条路径都无回滚**（安装失败 / 重启失败）→ 实例停机 + 版本不确定，guardian 不自愈 |
+| **P1** | 内核 instance/index.js | removeInstance 未确认单元已停就 rm -rf 实例根目录 → 对运行中实例**不可逆数据丢失** |
+| **P1** | 内核 instance/index.js | ports.release(port) **不带 ownerId** → 误删他人端口登记（上一轮刚加归属校验，此处置之不理）|
+| **P1** | 内核 instance/index.js | _updCache 只写不删（内存单调增长）+ 两处 60s 定时器未 unref |
+| **P2** | 内核 shell | 「谁是壳主程序」两份实现已分叉（watchdog 排 6 flag / restartShell 只排 3）→ **运维自检进程被误杀** |
+| **P2** | 内核 instance/index.js | 我上一轮留下的**自相矛盾**：setter 与「用方法而非 setter」的注释并存 |
+
+### 九轮累计
+
+```
+内核  npm test   73 文件 / 1381 断言 / 0 失败（起点 1098，+283）
+壳    cargo test  92 项 / 0 失败（起点 77，+15）
+前端  verify     tsc 0 错 / eslint 0 错 / vitest 15 通过 / build 成功
+```
