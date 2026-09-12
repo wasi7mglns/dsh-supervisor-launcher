@@ -21,15 +21,50 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// 前端全部源码 = HTML 内联脚本 + 它 src 引用的每个 js/*.js。
+///
+/// ⚠ 为什么不是只读 bootstrap.html：2026-09-11 起引导脚本已按职责拆成 9 个外部模块
+///   （原 802 行单块，一处语法错即全页不执行）。断言若只读 HTML，会**静默看不到**
+///   任何前端逻辑 —— 门禁变成空转。此函数保证「测的是真正会执行的代码」。
 fn bootstrap_html() -> String {
-    fs::read_to_string(manifest_dir().join("bootstrap").join("bootstrap.html"))
-        .expect("read bootstrap.html")
+    let root = manifest_dir().join("bootstrap");
+    let html = fs::read_to_string(root.join("bootstrap.html")).expect("read bootstrap.html");
+    let mut all = html.clone();
+    // 按 HTML 中的出现顺序拼接外部模块，便于「先加载」类的断言仍然成立
+    let mut rest = html.as_str();
+    while let Some(i) = rest.find("<script") {
+        let after = &rest[i..];
+        let open_end = match after.find('>') { Some(v) => v, None => break };
+        let tag = &after[..open_end];
+        if let Some(s) = tag.find("src=") {
+            let tail = &tag[s + 4..];
+            let tail = tail.trim_start_matches(|c| c == ' ' || c == '\t' || c == '"' || c == '\'');
+            let end = tail.find(|c| c == '"' || c == '\'').unwrap_or(tail.len());
+            let rel = &tail[..end];
+            if let Ok(js) = fs::read_to_string(root.join(rel)) {
+                all.push('\n');
+                all.push_str(&js);
+            }
+        }
+        let body_start = i + open_end + 1;
+        let close_rel = match rest[body_start..].find("</script>") { Some(v) => v, None => break };
+        rest = &rest[body_start + close_rel + "</script>".len()..];
+    }
+    all
 }
 
 /// 取某个函数的**函数体**（从 sig 到下一个顶层 function 或文件末尾）。
 ///
 /// ⚠ 为什么不按固定字节长度截取：本仓含大量中文注释，1 汉字 = **3 字节**，
 ///   故 `&h[i..i+900]` 实际只覆盖约 300 字符 —— 断言会因此误判（曾真实发生）。
+/// 把源码里的 `NS.` 前缀去掉，便于断言与「是否命名空间化」解耦。
+///
+/// 背景：2026-09-11 前端拆分为 9 个外部模块，共享符号统一走 `window.__BOOT_NS`，
+/// 于是 `withTimeout(...)` 变成 `NS.withTimeout(...)`。断言若写死带前缀的文本，
+/// 就会在「纯重命名」时误报 —— 而重命名并不改变行为。
+fn ns_stripped(src: &str) -> String {
+    src.replace("NS.", "")
+}
 fn function_body(src: &str, sig: &str) -> String {
     let start = match src.find(sig) { Some(v) => v, None => return String::new() };
     let rest = &src[start..];
@@ -73,11 +108,11 @@ fn b2_js_stepnames_matches_html_order() {
     let order = html_step_order(&html);
     // 源码用单引号；两种引号都接受，避免因风格调整误报。
     let single = format!(
-        "var stepNames = [{}];",
+        "stepNames = [{}];",
         EXPECTED.iter().map(|s| format!("\x27{}\x27", s)).collect::<Vec<_>>().join(", ")
     );
     let double = format!(
-        "var stepNames = [{}];",
+        "stepNames = [{}];",
         EXPECTED.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ")
     );
     assert!(
@@ -100,7 +135,7 @@ fn b3_boot_starts_from_env_not_shell_update() {
     );
     // 环境就绪后才进入桌面更新
     assert!(
-        html.contains("then(stepShellUpdate)"),
+        ns_stripped(&html).contains("then(stepShellUpdate)"),
         "B3 FAIL 未看到「环境 → 桌面更新」的衔接"
     );
     eprintln!("B3 PASS boot starts from env, shell update after env");
@@ -154,11 +189,11 @@ fn b8_core_steps_are_bounded() {
     assert!(html.contains("CORE_PLAN_BUDGET_MS"), "B8 FAIL 内核版本检查缺前端超时预算");
     assert!(html.contains("CORE_APPLY_BUDGET_MS"), "B8 FAIL 内核安装缺前端超时预算");
     assert!(
-        html.contains("withTimeout(core.invoke('core_plan')"),
+        ns_stripped(&html).contains("withTimeout(core.invoke('core_plan')"),
         "B8 FAIL core_plan 未用 withTimeout 包裹"
     );
     assert!(
-        html.contains("withTimeout(core.invoke('core_apply'"),
+        ns_stripped(&html).contains("withTimeout(core.invoke('core_apply'"),
         "B8 FAIL core_apply 未用 withTimeout 包裹"
     );
     // Rust 侧：npm install 不得无限阻塞
@@ -762,7 +797,7 @@ fn b33_guard_start_has_timeout() {
     let h = bootstrap_html();
     assert!(h.contains("GUARD_START_BUDGET_MS"), "B33 FAIL 前端缺守卫启动预算");
     assert!(
-        h.contains("withTimeout(core.invoke('guard_start')"),
+        ns_stripped(&h).contains("withTimeout(core.invoke('guard_start')"),
         "B33 FAIL 前端 guard_start 未包超时（裸 invoke）"
     );
     eprintln!("B33 PASS guard_start bounded on both sides");
@@ -932,10 +967,10 @@ fn b48_path_scan_comes_last() {
 fn b41_polling_loops_have_independent_heartbeat() {
     let h = bootstrap_html();
     // 环境探测轮询：每次查询都必须包超时
-    assert!(h.contains("withTimeout(core.invoke('node_status'), 15000"), "B41 FAIL 环境轮询未包超时");
+    assert!(ns_stripped(&h).contains("withTimeout(core.invoke('node_status'), 15000"), "B41 FAIL 环境轮询未包超时");
     assert!(h.contains("查询无响应，重试中"), "B41 FAIL 环境轮询无超时分支（无法自愈）");
     // 守卫就绪轮询
-    assert!(h.contains("withTimeout(core.invoke('guard_ready'), 10000"), "B41 FAIL 守卫就绪轮询未包超时");
+    assert!(ns_stripped(&h).contains("withTimeout(core.invoke('guard_ready'), 10000"), "B41 FAIL 守卫就绪轮询未包超时");
     eprintln!("B41 PASS polling loops have heartbeat");
 }
 
@@ -1152,9 +1187,45 @@ fn check_js_syntax(label: &str, js: &str) -> Result<(), String> {
 fn b53_frontend_js_must_be_syntactically_valid() {
     let root = manifest_dir().join("bootstrap");
     let mut checked = 0;
+    // ① 外部模块：js/ 下每个 .js 都必须独立语法正确
+    let js_dir = root.join("js");
+    if js_dir.is_dir() {
+        let mut mods: Vec<_> = fs::read_dir(&js_dir)
+            .expect("read js dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "js").unwrap_or(false))
+            .collect();
+        mods.sort();
+        assert!(!mods.is_empty(), "B53 FAIL js/ 目录存在但没有任何 .js 模块");
+        let boot = fs::read_to_string(root.join("bootstrap.html")).expect("read bootstrap.html");
+        for p in &mods {
+            let label = p.file_name().unwrap().to_string_lossy().to_string();
+            let js = fs::read_to_string(p).unwrap_or_else(|e| panic!("B53 FAIL 读取 {} 失败: {}", label, e));
+            match check_js_syntax(&format!("mod-{}", label), &js) {
+                Ok(()) => checked += 1,
+                Err(e) => {
+                    if e.contains("无法运行 node") {
+                        eprintln!("B53 SKIP（本机无 node，无法校验 JS 语法）: {}", e.trim());
+                        return;
+                    }
+                    panic!("B53 FAIL 模块 {} 语法错误:\n{}", label, e);
+                }
+            }
+            // ② 反向：每个模块都必须被 HTML 引用 —— 否则是「写了不加载」的死文件
+            assert!(boot.contains(&format!("js/{}", label)),
+                "B53 FAIL 模块 {} 存在但 bootstrap.html 未引用（死文件）", label);
+        }
+        eprintln!("B53 外部模块 {} 个，全部被引用且语法正确", mods.len());
+    }
     for name in ["bootstrap.html", "shell.html"] {
         let html = fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("B53 FAIL 读取 {} 失败: {}", name, e));
         let scripts = inline_scripts(&html);
+        if scripts.is_empty() && name == "bootstrap.html" {
+            // 已拆为外部模块（上面已逐文件校验，更强）——但不允许「既无内联也无外部引用」
+            assert!(html.contains("js/00-runtime.js"), "B53 FAIL bootstrap.html 既无内联脚本也无外部模块引用");
+            continue;
+        }
         assert!(!scripts.is_empty(), "B53 FAIL {} 中未找到内联 <script>", name);
         for (i, js) in scripts.iter().enumerate() {
             match check_js_syntax(&format!("{}-{}", name, i), js) {
@@ -1478,6 +1549,15 @@ fn g5_frontend_scripts_syntax_and_error_handling() {
             let body = &rest[body_start..body_start + close];
             if !attrs.contains("src") {
                 blocks.push(body.to_string());
+            } else if let Some(sq) = attrs.find("src=") {
+                let tail = &attrs[sq + 4..];
+                let tail = tail.trim_start_matches(|c: char| c == ' ' || c == '\t' || c == '"' || c == '\'');
+                let end = tail.find(|c: char| c == '"' || c == '\'').unwrap_or(tail.len());
+                let rel = &tail[..end];
+                // 拆分后的外部模块同样是「会执行的 JS」，必须一并检查（否则 G5 空转）
+                if let Ok(js) = fs::read_to_string(manifest_dir().join("bootstrap").join(rel)) {
+                    blocks.push(js);
+                }
             }
             rest = &rest[body_start + close + "</script>".len()..];
         }
