@@ -1067,6 +1067,13 @@ fn b56_windows_schtasks_tr_value_is_quoted() {
 fn b57_async_commands_do_not_block_on_tokio_worker() {
     let c = fs::read_to_string(manifest_dir().join("src").join("commands").join("mod.rs"))
         .expect("commands/mod.rs");
+    // ⚠ 2026-09-13：**归一化换行**。下方用 find("\n}\n") 取函数体，而 Windows 检出
+    //   可能是 CRLF（core.autocrlf + 本仓原先无 .gitattributes）→ 该针脚永不匹配 →
+    //   走 unwrap_or(rest.len())，body 变成「从 core_plan 到**文件结尾**」：
+    //     · contains("spawn_blocking") 会被**别的函数**满足 → 假绿；
+    //     · i_sb < i_lc 的先后比较落到别的函数上 → 断言失去意义。
+    //   即：这不是「Windows 上多红一条」，而是**门禁在 Windows 上不再检查它声称的事**。
+    let c = if c.contains('\r') { c.replace("\r\n", "\n") } else { c };
 
     // 取出 core_plan 函数体
     let start = c.find("pub async fn core_plan").expect("B57 FAIL 未找到 core_plan");

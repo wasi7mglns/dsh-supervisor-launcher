@@ -35,8 +35,19 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// 读取待检查文件，并**归一化换行为 LF**。
+///
+/// ⚠ 2026-09-13：这些门禁大量做**多行源码片段**的文本断言，而 Windows 检出
+///   可能是 CRLF（core.autocrlf + 本仓原先无 .gitattributes）→ 内嵌换行的针脚永不匹配：
+///     · 正向 find → 退化为 usize::MAX（失败）；
+///     · 反向 !contains → 退化为恒真（假绿、门禁空转，比失败更糟）。
+///   实测：把工作树整体转成 CRLF 后跑全套，update_guard_test 的 G6-g 立刻失败 ——
+///   这正是 Windows leg 在 CI 上红掉的原因（macOS/Linux 是 LF 故全绿）。
+///   修法：**在读取处归一化**，使断言在任何平台检查的是同一件事。
 fn read(rel: &str) -> String {
-    fs::read_to_string(manifest_dir().join(rel)).unwrap_or_else(|e| panic!("读取 {} 失败: {}", rel, e))
+    let s = fs::read_to_string(manifest_dir().join(rel))
+        .unwrap_or_else(|e| panic!("读取 {} 失败: {}", rel, e));
+    if s.contains('\r') { s.replace("\r\n", "\n") } else { s }
 }
 
 #[test]
