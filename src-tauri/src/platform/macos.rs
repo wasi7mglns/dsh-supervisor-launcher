@@ -104,8 +104,23 @@ impl Platform for Impl {
     fn install_node(&self, file: &Path) -> Result<PathBuf, String> {
         let abs = file.canonicalize().map_err(|e| e.to_string())?;
         let esc = abs.display().to_string().replace('"', "");
+        // ⚠ P1 修复（2026-09-13）：**嵌套双引号未转义 → 语法错误，macOS target 无法编译**。
+        //
+        //   缺陷：AppleScript 的 do shell script 需要用引号包住 shell 命令，
+        //     但这里写成了未转义的嵌套双引号：
+        //         "do shell script "installer -pkg '{}' -target /" with administrator privileges"
+        //     → error: character literal may only contain one codepoint / expected `,`, found `-`
+        //     （macos.rs:108）。
+        //
+        //   为什么长期不可见：本文件被 platform/mod.rs 的 #[cfg(target_os = "macos")]
+        //     整体条件编译，**Linux 上的 cargo check/test 根本不解析它** ——
+        //     与同文件先前那处 SVC_QUICK 未导入（E0425）是同一盲区的两个独立缺陷。
+        //     实证：新增的 CI platform-check（macos-latest 上 cargo check --all-targets）
+        //     第一次运行就报了 failure，本机用「临时把 macos 实现切到 Linux 上编译」
+        //     的方法复现出了与 CI 相同的语法错误。
+        //   修法：按 AppleScript 语义转义内部引号（外壳命令整体加 \"...\"）。
         let script = format!(
-            "do shell script "installer -pkg '{}' -target /" with administrator privileges",
+            "do shell script \"installer -pkg '{}' -target /\" with administrator privileges",
             esc
         );
         let out = crate::bounded::run(
