@@ -3,11 +3,22 @@ name: launcher-build
 # 公开壳仓产线（2026-09 双仓拆分定案）：本仓=壳（src-tauri 引导器形态，MIT 可独立构建）。
 # 矩阵 → 逐平台 Tauri bundle → 安装包挂 GitHub Release + 发布 npm 包（自更新产物）。
 #
-# ── 触发策略（2026-09 修复 F5：原 push main 会每次全平台构建，浪费额度）──
-#   仅 tag / 手动；日常 push main 不再触发（壳为低频发布组件）。
+# ── 触发策略（2026-09-13 修订）──
+#   历史（F5）：仅 tag / 手动，理由是「原 push main 会每次全平台**打包**」。
+#   现修订为：
+#     · push main → 只跑**轻量跨平台编译检查**（platform-check：cargo check，
+#       不打包、不发布）。公开仓 Actions 免费，且这是**唯一**能编译
+#       macos.rs / windows.rs 的途径 —— 二者被 #[cfg(target_os)] 排除，
+#       Linux（含本仓 CI 的 ubuntu 步骤）**从不编译它们**。
+#       实证：本轮 P1 就是 macos.rs 用了 SVC_QUICK 却没导入 → macOS E0425，
+#       而 Linux 上 100+ 项测试全绿也看不见。
+#     · tag / 手动 → 仍跑完整 bundle 矩阵 + 发布（原行为不变）。
+#   保留 F5 的省时意图：**打包矩阵仍不在日常 push 上跑**（见 build job 的 if 守卫）。
 on:
   push:
     tags: ['v*']
+    # 日常 push main 跑轻量编译检查（见 platform-check）。
+    branches: [main]
   workflow_dispatch: {}
 
 # ── 平台矩阵（2026-09 跨平台审计定案）──
@@ -35,8 +46,36 @@ jobs:
           ver=$(node -p "require('./src-tauri/tauri.conf.json').version")
           echo "ver=$ver" >> "$GITHUB_OUTPUT"
 
+  # ── 轻量跨平台编译检查（2026-09-13）──
+  #
+  # 为什么必须单独有它：macos.rs / windows.rs 被 #[cfg(target_os)] 条件编译，
+  #   在 Linux 上**永远不参与编译** —— 因此「用了父模块的项却没导入」这类错误
+  #   （本轮 P1：macos.rs 用 SVC_QUICK 未导入 → E0425）只能由对应平台 runner 拦住。
+  # 定位：只做 cargo check（编译校验），**不打包、不发布**；
+  #   完整 bundle 矩阵仍只在 tag / 手动时跑（保留 F5 意图）。
+  platform-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: cargo check --all-targets（编译 macos.rs / windows.rs）
+        run: cargo check --all-targets
+        working-directory: src-tauri
+
   build:
     needs: version
+    # ⚠ 2026-09-13：**打包矩阵只在 tag / 手动时跑**（保留 F5 的省时意图）——
+    #   日常 push 由上面的 platform-check 做轻量编译检查，不产 bundle。
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write   # action-gh-release 挂 Release + 资产上传
     strategy:
@@ -130,8 +169,18 @@ jobs:
           # 与「未知平台实现的 trait 方法归属」——后者尤其重要：该模块被
           # #[cfg(not(any(linux,macos,windows)))] 排除，三大平台构建根本不编译它，
           # 故**只有静态结构门禁**能拦住「方法放错 impl 块」这类缺陷。
-          cargo test --bins --test bootstrap_flow --test update_guard_test \
-            --test platform_unsupported_structure_test 2>&1 | tail -80
+          #
+          # ⚠ 2026-09-13：**改为自动枚举全部 test target**，不再硬编码名字。
+          #   缺陷：上面这段注释自己写着「门禁此前从未在 CI 执行」，却又复发了 ——
+          #     原先硬编码三个 --test 名，于是**新增的门禁文件被静默排除在 CI 之外**。
+          #   实测漏了 4 个：platform_shared_items_test（正是为「平台文件用了父模块项
+          #     却没导入 → macOS E0425」建的那道）、mirror_env_wiring_test、
+          #     round13_p3_batch_test，以及**既有的** service_self_heal_test。
+          #   改为自动枚举后，新增 tests/*.rs 会自动纳入 CI，这类漏网不会再发生。
+          #   排除 updater_artifacts（需打包产物 SHELL_REHEARSAL_DIR，下方单独跑）。
+          TARGETS=$(ls tests/*.rs | sed 's#tests/##; s#\.rs$##' | grep -v '^updater_artifacts$' | sed 's/^/--test /' | tr '\n' ' ')
+          echo "CI 将执行的 test target: ${TARGETS}"
+          cargo test --bins ${TARGETS} 2>&1 | tail -80
         working-directory: src-tauri
 
       - name: 壳无头冒烟（--node-plan：环境探针 + 官方最新 LTS）
