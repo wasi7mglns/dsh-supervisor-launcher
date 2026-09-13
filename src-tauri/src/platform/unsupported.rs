@@ -76,6 +76,12 @@ impl ServiceControl for Impl {
             .map_err(|e| format!("直接拉起守卫失败: {}", e))?;
         Ok(child.id())
     }
+
+    /// 未知平台：没有服务定义 → 明确 false（默认实现即 definition_path().is_file()，
+    /// 但这里显式写出，使「未知平台绝不静默成功」的纪律在方法级也可见）。
+    fn is_defined(&self) -> bool {
+        false
+    }
 }
 
 // ⚠ 2026-09-12（P1 修复）：**这里必须收束 ServiceControl，另起 Platform 的 impl**。

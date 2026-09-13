@@ -56,7 +56,13 @@ impl Platform for Impl {
         Capabilities {
             platform: NAME,
             native_service: true, // systemd --user
-            privilege_channel: true, // pkexec / sudo
+            // ⚠ P3 修复（2026-09-13，失效模式 b）：**声明与实测必须同源**。
+            //   原先硬编码 true，而 has_privilege_channel() 会真的探测 pkexec/sudo。
+            //   在两者都没有的机器上，--platform-matrix 报 privilege_channel=true，
+            //   而同一机器 --shell-update-plan 的 self_update_capable=false、
+            //   Node 安装会失败 —— 同一事实两个相反答案，排障时误导。
+            //   现改为调用同一个探测函数（单一事实源）。
+            privilege_channel: self.has_privilege_channel(),
             node_artifact: "tar.xz",
         }
     }

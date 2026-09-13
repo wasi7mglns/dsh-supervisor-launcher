@@ -1444,3 +1444,42 @@ mod parent { pub const SVC_NORMAL: u8 = 1; pub const SVC_QUICK: u8 = 2;
 还原后 sha256 逐字一致，全绿。
 
 **计数变化**：壳 cargo test 114 → **117 项**（新增 3）；cargo check --all-targets 0 警告。
+
+### 第十三轮续二：壳仓 P2/P3 五组（2026-09-13）
+
+| 级别 | 位置 | 缺陷 | 修法 |
+|---|---|---|---|
+| **P2** | `mirror.rs::warmup_async` | 算出 npm 最快源却**从不写入** `selected_npm` → registry.json 的 `selected` **永远是 null** → 内核「优先采用壳投放的 selected……两侧必然同源」分支永不执行（跨仓同源承诺失效）| 把选中源**与其延迟一起落盘**；export 用同源延迟 |
+| **P2** | `node.rs` | 唯一带延迟的导出传的是 **Node 源**延迟，却与 **npm 语义**的 selected 配对（潜伏错配）| 改调无延迟导出，由落盘的同源延迟填充 |
+| **P2** | `bootstrap/js/80-init.js` | `env_progress` 监听以 `if (p.busy)` 为闸，而该条件**永远为假**（带 busy 的 emit 在前一行刚把 busy 置 false；进度事件来自 `push_status`，payload 根本没有 busy）→ 装 Node（数分钟）期间**零进度零状态**| 改为「只要 status 就展示」+ progress 驱动进度条；`push_status` payload 补 `busy:true` |
+| **P2** | `nodeprobe.rs` | 硬上限时置回 Idle，而**卡死的 worker 线程无法回收** → 用户每点一次「重试」就多一条永不退出的线程（与注释所称「不会堆积线程」相反）；旧 worker 还可能污染新一轮诊断 | 代际作废防污染；孤儿计数；**孤儿未退出前拒绝新建**并给出明确结论 |
+| **P3** | `main.rs` `--service-plan` | 用 `definition_path().is_file()`，而 Windows 是标识串 `schtasks://…` → **恒报「现存 = 否」** | 新增 `ServiceControl::is_defined()`（默认文件存在性；Windows 覆写为 `schtasks /Query`）|
+| **P3** | `platform/linux.rs` | `capabilities().privilege_channel` 硬编码 true，与 `has_privilege_channel()` 的实探分叉 → 同一机器两个相反答案 | 改为调用同一探测函数 |
+| **P3** | `bootstrap/js/50-kernel.js` | 远端版本查询失败时 `core_plan` 已带回 `error`，前端**不看**它 → 离线时谎报「内核已是最新」| 消费 `p.error`，如实显示失败原因 |
+| **P3** | `main.rs` / `80-init.js` | `env_status` 全仓**零监听**（死广播），且其 latest 与 node_status 构成第二真源；`env_done`（安装完成信号）同样零接收方 | 删 `env_status`；给 `env_done` 补监听（明确「已就绪」文案）|
+
+**注入验证**（9 次注入，全部使对应门禁 FAIL；还原后 sha256 逐字一致）：
+
+| 注入 | 命中 |
+|---|---|
+| warmup 不落盘 selected_npm | M-a FAIL |
+| export 延迟回到调用方参数 | M-b FAIL |
+| node.rs 传回 Node 延迟 | M-c FAIL |
+| 前端回到 if (p.busy) 闸 | E-a FAIL |
+| push_status 去掉 busy | E-c FAIL |
+| 去掉 nodeprobe 孤儿守卫 | orphan 门禁 FAIL |
+| --service-plan 回到 is_file | P-a FAIL |
+| Linux capability 回到硬编码 true | P-b + P-e FAIL |
+| 前端不消费 core_plan.error | P-c FAIL |
+| env_status 加回 + 删 env_done 监听 | P-d FAIL |
+
+**新增门禁**：`tests/mirror_env_wiring_test.rs`(6) / `tests/round13_p3_batch_test.rs`(5) /
+`nodeprobe` 单测新增 1（孤儿不累积）。
+
+⚠ 两处门禁自身的第一版是**假红/空转**，已修正：
+  · M-a 用全文件 find 命中了 `load()` 里的读取赋值（位置在 warmup 之前）→ 改为**限定在
+    warmup_async 函数体内**搜索；
+  · `defined_locally` 写成「以 fn/const 开头且 contains(item)」→ 把 `fn f() { SVC_QUICK }`
+    （**使用**）误判为「本地定义」→ 改为要求「该项是**被声明的名字**」。
+
+**计数变化**：壳 cargo test 117 → **129 项**（+12）；cargo check --all-targets 0 警告。

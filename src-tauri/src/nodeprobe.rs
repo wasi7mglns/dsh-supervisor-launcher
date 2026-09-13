@@ -156,6 +156,11 @@ fn state() -> &'static Mutex<State> {
 /// 使缓存失效（Node 安装完成后调用）。
 pub fn invalidate() {
     if let Ok(mut g) = state().lock() {
+        // 显式复位：作废旧代际（防旧 worker 回写诊断）、清孤儿计数（允许重新探测）。
+        // 注：旧 worker 若仍在运行，线程本身依然存在（Rust 无法强制回收），
+        //     但此处是「用户/安装流程显式要求重来」的语义，故接受重新开始。
+        GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ORPHANS.store(0, std::sync::atomic::Ordering::SeqCst);
         *g = State::Idle;
     }
 }
@@ -209,6 +214,7 @@ pub fn status(budget: Duration) -> Outcome {
             State::Running(rx, started) => {
                 if started.elapsed() >= STALE_AFTER {
                     let (tx, rx2) = channel();
+                    abandon_current_worker(); // 旧 worker 仍在跑 → 记孤儿、作废其代际
                     live_reset();
                     spawn_worker(tx);
                     *rx = Some(rx2);
@@ -217,6 +223,16 @@ pub fn status(budget: Duration) -> Outcome {
                 started_at = *started;
             }
             State::Idle => {
+                // ⚠ P2：若上一次的 worker 仍未退出（卡在无界系统调用），**不再新建** ——
+                //   否则用户每点一次「重试」就多一条永不退出的线程。此时给出明确结论，
+                //   等旧 worker 退出（或 invalidate() 显式复位）后即可重新探测。
+                if ORPHANS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    return failed(
+                        "上一次环境探测仍未退出（线程卡在系统调用中，无法回收）；已跳过重复启动，避免线程堆积"
+                            .to_string(),
+                        0,
+                    );
+                }
                 let (tx, rx) = channel();
                 live_reset();
                 // 规则一：在启动探测前先标记阶段 —— 线程调度本身也可能延迟，
@@ -265,12 +281,16 @@ pub fn status(budget: Duration) -> Outcome {
                 let where_ = current_stuck()
                     .map(|(d, ms)| format!("卡在「{}」已 {} ms", d, ms))
                     .unwrap_or_else(|| "探测线程未报告任何阶段".to_string());
+                // 作废该 worker 并记孤儿（它仍在卡死中，无法回收）；
+                // 之后 status() 在孤儿未退出前不会再新建线程（见 Idle 分支）。
+                abandon_current_worker();
                 *g = State::Idle;
                 failed(
                     format!(
-                        "环境探测超过 {} ms 未完成（{}）",
+                        "环境探测超过 {} ms 未完成（{}）；该探测线程已作废且无法回收，当前未退出孤儿线程数={}",
                         hard_deadline().as_millis(),
-                        where_
+                        where_,
+                        orphan_count()
                     ),
                     el,
                 )
@@ -304,7 +324,35 @@ pub fn resolve(budget: Duration) -> Option<(PathBuf, String)> {
     }
 }
 
+/// 探测**代际**：每次新建 worker 自增。worker 回写诊断前比对代际，
+/// 保证「已作废的旧 worker」不会把 trace 写进新一轮探测（防诊断串被污染）。
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 已被**作废但尚未退出**的 worker 数量（不可回收的线程）。
+///
+/// ⚠ 2026-09-13（P2 修复）：本文件的设计目标是「即使某个系统调用永久挂起也一定给出结论」，
+///   而 worker 一旦卡在无界阻塞系统调用，**线程本身无法回收**。
+///   原实现在硬上限时把状态置回 Idle —— 于是用户**每点一次「重试」就多一条永不退出的线程**
+///   （每条约 2MB 栈），与 `commands/mod.rs` 声称的「不会堆积线程」相反；
+///   且旧 worker 若稍后解除阻塞，还会经全局 live() 把 trace 写进**新一轮**探测（污染诊断串）。
+///   修法：① 代际作废（见上）防污染；② 计数孤儿并**在孤儿未退出前不再新建 worker**
+///     （重试会得到明确的「上次探测仍未退出」结论，而不是默默再开一条线程）；
+///     ③ invalidate() 是显式复位口（安装成功后 / 测试复位）。
+static ORPHANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 作废当前 worker 并记为孤儿（它仍在运行、无法回收）。
+fn abandon_current_worker() {
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst); // 使旧 worker 退出时不回写诊断
+    ORPHANS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 当前未退出的孤儿 worker 数（诊断用；不改变行为）。
+pub fn orphan_count() -> u64 {
+    ORPHANS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn spawn_worker(tx: Sender<Outcome>) {
+    let gen = GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let _ = std::thread::Builder::new()
         .name("node-probe".to_string())
         .spawn(move || {
@@ -312,6 +360,17 @@ fn spawn_worker(tx: Sender<Outcome>) {
             // 规则一/二之外的最后一道保险：worker 内 panic 也必须产出结论。
             // 否则线程静默死亡 → 命令只能一直报 probing（这正是前几轮的现象之一）。
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(detect));
+            // 代际校验：若本轮已被作废（GENERATION 前进），则**不回写诊断**，
+            // 仅统计孤儿退出，避免污染新一轮的 trace/summary。
+            if GENERATION.load(std::sync::atomic::Ordering::SeqCst) != gen {
+                // 饱和减（invalidate() 可能已把计数清零；绝不能下溢成天文数字）
+                let _ = ORPHANS.fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |v| Some(v.saturating_sub(1)),
+                );
+                return;
+            }
             let outcome = match r {
                 Ok((path, version, err)) => Outcome {
                     path,
@@ -538,6 +597,56 @@ mod tests {
         set_hang_in_enumerate(false);
         set_hard_deadline_ms(25_000);
         invalidate();
+    }
+
+    /// ⚠ P2 门禁（2026-09-13）：孤儿 worker 未退出前**不得再新建**（防线程堆积）。
+    ///
+    /// 缺陷：硬上限到达时原实现把状态置回 Idle —— 用户每点一次「重试」
+    ///   就 spawn 一条**永不退出**的新 worker（卡在无界系统调用），与
+    ///   commands/mod.rs 声称的「不会堆积线程」相反。
+    /// 修法：作废时记孤儿，孤儿未退出前 Idle 分支拒绝新建并给出明确结论。
+    ///
+    /// 断言：越过硬上限后**连续多次** status() 不得让孤儿计数继续增长。
+    #[test]
+    fn orphan_workers_do_not_accumulate_on_repeated_retry() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        set_hard_deadline_ms(400);
+        invalidate();
+        assert_eq!(orphan_count(), 0, "invalidate 应清零孤儿计数");
+        set_hang_in_enumerate(true);
+
+        let t0 = Instant::now();
+        let mut last = status(Duration::from_millis(30));
+        while !last.finished && t0.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(40));
+            last = status(Duration::from_millis(30));
+        }
+        assert!(last.finished, "越过硬上限必须给出结论");
+        let after_first = orphan_count();
+        assert_eq!(after_first, 1, "首次超限应恰好产生 1 个孤儿，实得 {}", after_first);
+
+        // 反复重试：孤儿仍未退出 → 必须拒绝新建（计数不得增长）
+        for i in 0..6 {
+            let o = status(Duration::from_millis(30));
+            assert!(o.finished, "第 {} 次重试应立刻给出结论（不再新建线程）", i + 1);
+            let err = o.error.clone().unwrap_or_default();
+            assert!(
+                err.contains("跳过重复启动") || err.contains("仍未退出"),
+                "第 {} 次重试的结论应说明为何不新建：{}",
+                i + 1,
+                err
+            );
+        }
+        assert_eq!(
+            orphan_count(),
+            after_first,
+            "反复重试后孤儿数不得增长（旧实现每次 +1）"
+        );
+
+        set_hang_in_enumerate(false);
+        set_hard_deadline_ms(25_000);
+        invalidate();
+        assert_eq!(orphan_count(), 0, "invalidate 后应可重新探测");
     }
 
     /// 注入未开启时，正常探测必须完成（确认测试钩子未污染正常路径）。

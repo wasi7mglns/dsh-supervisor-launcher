@@ -26,6 +26,20 @@ pub trait ServiceControl: Send + Sync {
     /// Windows 的计划任务没有文件，返回标识串（`schtasks://DSH-Supervisor`）供日志。
     fn definition_path(&self) -> PathBuf;
 
+    /// 服务定义**当前是否已存在**（跨平台的事实判定）。
+    ///
+    /// ⚠ 2026-09-13（P3 修复，失效模式 a+e）：**不能一律用 `definition_path().is_file()`**。
+    ///   Windows 的 "路径" 是标识串 `schtasks://DSH-Supervisor`（没有文件），
+    ///   `is_file()` **恒为 false** —— 于是 `--service-plan` 自检无论计划任务
+    ///   是否真的存在/刚被建立，都报「现存 = 否」，把排障者的方向带偏
+    ///   （而这个自检正是本仓「服务定义」能力的官方验证入口）。
+    ///
+    ///   默认实现 = 文件存在性（Linux systemd unit / macOS LaunchAgent plist 都适用）；
+    ///   Windows 覆写为 `schtasks /Query` 的真实判定。
+    fn is_defined(&self) -> bool {
+        self.definition_path().is_file()
+    }
+
     /// 建立服务定义（幂等）。
     ///
     /// 返回人类可读的状态描述。**注意**：`enable` 失败不应返回 Err ——

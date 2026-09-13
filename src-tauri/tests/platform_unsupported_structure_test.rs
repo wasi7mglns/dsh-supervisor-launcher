@@ -133,6 +133,11 @@ const PLATFORM_METHODS: &[&str] = &[
 ];
 const SERVICE_METHODS: &[&str] = &[
     "kind", "definition_path", "ensure_defined", "start", "stop", "spawn_daemon",
+    // 2026-09-13 新增：服务定义**存在性**的平台事实判定。
+    //   背景（P3）：--service-plan 原用 definition_path().is_file()，而 Windows 的
+    //   「路径」是标识串 schtasks://DSH-Supervisor（没有文件）→ 恒 false →
+    //   自检无论计划任务是否存在都报「现存 = 否」。故把判定收进 trait，由各平台实现。
+    "is_defined",
 ];
 
 #[test]

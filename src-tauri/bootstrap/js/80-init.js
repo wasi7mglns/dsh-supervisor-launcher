@@ -105,6 +105,16 @@
       var p = (e && e.payload) || {};
       NS.fail('运行环境安装失败：' + (p.error || '未知'));
     });
+    // ⚠ 2026-09-13：补上 env_done 的监听（失效模式 c：声明了但零消费）。
+    //   该事件由 commands/mod.rs 在 Node 安装**成功后**发射（带 {version}），
+    //   此前全仓无任何接收方，是纯粹的无效广播 —— 而 Rust 侧注释称其为
+    //   「安装完成」的信号。现消费它：给出明确的完成文案（进度条收尾），
+    //   让「装完了」与「还在装」在引导页上可区分。
+    NS.evt.listen('env_done', function (e) {
+      var p = (e && e.payload) || {};
+      if (NS.showProgress) { try { NS.showProgress(null); } catch (err) {} }
+      NS.status('运行环境已就绪' + (p.version ? '（Node.js ' + p.version + '）' : '') + ' · 正在启动管家…');
+    });
   }
   NS.boot();
 })(window.__BOOT_NS);

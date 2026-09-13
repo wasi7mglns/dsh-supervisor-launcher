@@ -18,6 +18,18 @@
         NS.status('发现新内核 v' + p.latest + '（当前 v' + p.installed + '）· 正在强制更新…');
         return NS.coreApply(p.latest);
       }
+      // ⚠ 2026-09-13 修复（失效模式 f）：**远端版本查询失败时必须如实告知**。
+      //   缺陷：core.rs 的 build_plan 在 latest 查询失败时输出 action=unknown 且**带 error 原因**，
+      //     而前端在 installed 非空时**不看 p.error**，直接走下面的「内核已是最新」分支。
+      //   后果：离线 / 全部镜像不可达时，用户被告知「内核已是最新」，掩盖了
+      //     「这次根本没查成」——与仓库「如实回传成败、绝不吞错」的纪律相悖，
+      //     也让用户失去唯一的网络诊断线索。
+      if (p.error) {
+        var mt2 = p.registry ? String(p.registry).replace(/^https?:\/\//, '') : NS.mirrorText();
+        NS.status('内核版本检查失败（沿用当前 v' + p.installed + '）：' + p.error + (mt2 ? ' · 源 ' + mt2 : ''));
+        NS.coreTo = p.installed;
+        return NS.wait(300).then(NS.stepCoreDone);
+      }
       // ⚠ 显示**实际命中的镜像**（2026-09-11 修复）：
       //   core_plan 早就回传了 registry 字段，但前端从未使用 —— 数据链路断了。
       var mt = p.registry ? String(p.registry).replace(/^https?:\/\//, '') : NS.mirrorText();

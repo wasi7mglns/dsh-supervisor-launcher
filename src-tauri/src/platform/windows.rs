@@ -217,8 +217,24 @@ impl ServiceControl for Impl {
     }
 
     fn definition_path(&self) -> PathBuf {
-        // 计划任务不是文件；返回标识串供日志/诊断（`is_file()` 恒 false 是有意为之）。
+        // 计划任务不是文件；返回标识串供日志/诊断。
+        // ⚠ 正因如此，**不能**用 `definition_path().is_file()` 判断「定义是否存在」
+        //   （恒 false，会让 --service-plan 自检误报）—— 见下面的 is_defined 覆写。
         PathBuf::from(format!("schtasks://{}", GUARD_TASK))
+    }
+
+    /// Windows 的真实判定：`schtasks /Query` 成功即计划任务存在。
+    ///
+    /// ⚠ 2026-09-13（P3 修复）：覆写默认的 `definition_path().is_file()` ——
+    ///   后者对标识串恒为 false，使 `--service-plan` 无论任务是否存在都报「现存 = 否」。
+    fn is_defined(&self) -> bool {
+        matches!(
+            crate::bounded::run(
+                Command::new("schtasks").args(["/Query", "/TN", GUARD_TASK]),
+                SVC_QUICK,
+            ),
+            Ok(o) if o.success
+        )
     }
 
     /// 建立计划任务（幂等，且**包装脚本过时时自愈**）。

@@ -213,7 +213,11 @@ fn cli_service_plan() -> i32 {
         println!("== 守卫服务定义自检 ==");
     println!("平台          = {}", std::env::consts::OS);
     println!("服务定义路径  = {}", platform::service().definition_path().display());
-    println!("现存          = {}", if platform::service().definition_path().is_file() { "是" } else { "否" });
+    // ⚠ 2026-09-13（P3 修复）：经 ServiceControl::is_defined()（平台**事实**判定）——
+    //   原先用 definition_path().is_file()，而 Windows 的路径是标识串
+    //   schtasks://DSH-Supervisor，is_file() **恒 false** → 自检无论计划任务是否
+    //   存在/刚建立都报「否」，把排障方向带偏（本自检正是「服务定义」能力的官方入口）。
+    println!("现存          = {}", if platform::service().is_defined() { "是" } else { "否" });
     println!("HOME          = {}", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| "(未设置)".into()));
 
     // 守卫可执行文件定位（与实际 ensure_guard 同一路径推导，避免「自检通过但运行时找不到」）。
@@ -245,7 +249,7 @@ fn cli_service_plan() -> i32 {
         Ok(desc) => {
             println!();
             println!("建立结果      = {}", desc);
-            println!("建立后现存    = {}", if platform::service().definition_path().is_file() { "是" } else { "否" });
+            println!("建立后现存    = {}", if platform::service().is_defined() { "是" } else { "否" });
             0
         }
         Err(e) => {
@@ -380,7 +384,13 @@ fn main() {
                     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                     s.latest = Some(v.clone());
                     drop(s);
-                    let _ = handle.emit("env_status", serde_json::json!({ "latest": v }));
+                    // ⚠ 2026-09-13（失效模式 c/f）：**删除这个死广播**。
+                    //   env_status 全仓**零监听**（bootstrap 只监听 shell:goto-panel /
+                    //   shell:goto-bootstrap / guard_progress / shell_update_progress /
+                    //   env_progress / env_error / env_done）。
+                    //   而它携带的 latest 已由 node_status 轮询（单一事实源）提供 ——
+                    //   再加监听反而制造第二真源（本仓明确反对）。故按「要么接线、要么删除」
+                    //   的纪律选择删除；s.latest 仍保留（node_status 从状态读取）。
                 }
             });
 
