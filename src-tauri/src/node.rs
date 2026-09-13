@@ -142,8 +142,16 @@ pub fn latest_lts() -> Result<LtsChoice, String> {
             }
             // 同步导出契约给内核（若内核已存在则继承同一偏好；不存在时也无害，
             // 内核首次安装后会读到这份文件）。
-            // 携带本次实测延迟：契约的 selected.latencyMs 供内核直接采用，免重复测速。
-            if let Err(e) = crate::mirror::export_to_kernel_with(&m, Some(latency_ms)) {
+            //
+            // ⚠ P2 修复（2026-09-13）：**不再把 Node 侧延迟当 npm 侧的延迟传**。
+            //   此处选中的是 **Node 发行源**（source/latency_ms 都属 node_p 探测）；
+            //   而契约里的 selected 描述的是 **npm registry** 选择
+            //   （origin 取自 m.selected_npm，由 warmup_async 落盘）。
+            //   原实现传 Some(latency_ms)（Node 延迟）与该 origin 配对 ——
+            //   「拿 Node 的延迟去描述 npm 的选择」，只因 selected_npm 恒为 None 才未显形。
+            //   现传 None：让 export 用随 selected_npm 一起落盘的**同源**延迟；
+            //   npm 尚无选择时 selected 本就是 null，行为不变。
+            if let Err(e) = crate::mirror::export_to_kernel(&m) {
                 crate::update::log(&format!("导出内核镜像偏好失败（不影响本次安装）: {}", e));
             }
             Ok(LtsChoice { version, file, source, latency_ms, probes: diag })

@@ -88,7 +88,18 @@
   if (NS.evt) {
     NS.evt.listen('env_progress', function (e) {
       var p = e.payload || {};
-      if (p.busy) { NS.setStep(1); NS.status(p.status || '正在安装 Node.js…'); }
+      // ⚠ 2026-09-13 修复（失效模式 e：闸门恒不可达）：
+      //   原条件 if (p.busy) **永远为假**：唯一带 busy 的 emit 是 commands/mod.rs:185
+      //   的 crate::log(&s)，而那里在前一行（:165）刚把 busy 置回 false；
+      //   安装过程的进度事件来自 main.rs:82 的 push_status，其 payload **根本不含 busy**。
+      //   后果：装 Node（30~90MB、慢网数分钟）期间引导页停在 afterEnv 的静态文案，
+      //     Rust 侧 0.1/0.2/0.3/0.8 进度与「选用镜像…/官方最新 LTS…」状态**全被丢弃**
+      //     —— 恰是本仓反复强调的「静默等待与卡死无法区分」。
+      //   修法：只要有 status 就展示；progress 为数字时驱动进度条。
+      if (p.status) { NS.setStep(1); NS.status(p.status); }
+      if (typeof p.progress === 'number' && NS.showProgress) {
+        try { NS.showProgress(p.progress >= 1 ? null : Math.round(p.progress * 100)); } catch (err) {}
+      }
     });
     NS.evt.listen('env_error', function (e) {
       var p = (e && e.payload) || {};

@@ -79,7 +79,11 @@ pub(crate) fn push_status(app: &tauri::AppHandle, status: String, progress: f32)
         s.progress = progress;
         s.logs.push(status.clone());
     }
-    let _ = app.emit("env_progress", serde_json::json!({ "status": status, "progress": progress }));
+    // ⚠ 2026-09-13：**必须带 busy:true** —— 本函数只在安装过程中被调用
+    //   （push_status 的唯一调用方是 run_install）。原 payload 不含 busy，
+    //   而前端监听器当时以 if (p.busy) 为闸 → 所有进度事件被丢弃（分支恒不可达）。
+    //   现补上 busy 使「安装中」可辨识；前端已改为只要 status 就展示（不再依赖该字段）。
+    let _ = app.emit("env_progress", serde_json::json!({ "status": status, "progress": progress, "busy": true }));
 }
 
 fn run_install(app: &tauri::AppHandle) -> Result<(String, String), String> {

@@ -98,6 +98,9 @@ pub struct Mirrors {
     pub shell: Vec<String>,
     pub selected_node: Option<String>,
     pub selected_npm: Option<String>,
+    /// 选中 npm 源在**实测时**的延迟（ms）。随 selected_npm 一起落盘 ——
+    /// 使「选择」与「延迟」同源，避免导出时被调用方传入别的延迟（如 Node 侧）。
+    pub selected_npm_latency_ms: Option<u64>,
     pub checked_at: Option<u64>,
 }
 
@@ -109,6 +112,7 @@ impl Default for Mirrors {
             shell: SHELL_PRESETS.iter().map(|s| s.to_string()).collect(),
             selected_node: None,
             selected_npm: None,
+            selected_npm_latency_ms: None,
             checked_at: None,
         }
     }
@@ -153,6 +157,7 @@ pub fn load() -> Mirrors {
             if let Some(s2) = v.get("selectedNpm").and_then(|x| x.as_str()) {
                 m.selected_npm = Some(s2.to_string());
             }
+            m.selected_npm_latency_ms = v.get("selectedNpmLatencyMs").and_then(|x| x.as_u64());
             m.checked_at = v.get("checkedAt").and_then(|x| x.as_u64());
         }
     }
@@ -171,6 +176,7 @@ pub fn save(m: &Mirrors) -> Result<(), String> {
         "shell": m.shell,
         "selectedNode": m.selected_node,
         "selectedNpm": m.selected_npm,
+        "selectedNpmLatencyMs": m.selected_npm_latency_ms,
         "checkedAt": m.checked_at,
     });
     let body = serde_json::to_string_pretty(&v).unwrap_or_default();
@@ -230,10 +236,22 @@ pub fn export_to_kernel_with(m: &Mirrors, latency_ms: Option<u128>) -> Result<()
             }
         }
     }
+    // ⚠ P2 修复（2026-09-13）：延迟必须与**所选的 npm 源同源**。
+    //
+    //   缺陷：原用调用方传入的 latency_ms。而唯一带延迟的调用点是 node.rs:146，
+    //     它传的是 **Node 源**的延迟，却与 npm 语义的 selected 配对 ——
+    //     「拿 Node 的延迟去描述 npm 的选择」。只因 selected_npm 恒为 None（见 warmup 修复）
+    //     才未显形，属潜伏的第二处缺陷。
+    //   现优先用随 selected_npm 一起落盘的实测延迟（同一事实同一来源）；
+    //     调用方显式传入仅在「同一次探测刚得到」时作为兜底。
+    let eff_latency_ms: Option<u128> = m
+        .selected_npm_latency_ms
+        .map(|v| v as u128)
+        .or(latency_ms);
     let selected = m.selected_npm.as_ref().map(|origin| {
         serde_json::json!({
             "origin": origin,
-            "latencyMs": latency_ms,
+            "latencyMs": eff_latency_ms,
             "checkedAt": m.checked_at,
         })
     });
@@ -450,6 +468,27 @@ pub fn warmup_async() {
                 npm_probes: mp,
                 at: now_secs(),
             };
+            // ⚠ P2 修复（2026-09-13，失效模式 f + i）：**必须把选中的 npm 源落盘**。
+            //
+            //   缺陷：本函数算出了 npm 最快源与延迟，却只放进内存 ProbeSnapshot，
+            //     **从不写入 m.selected_npm** —— 全仓没有任何地方把它设成一个被选中的源
+            //     （只在 load 时从磁盘读、在 mirror_set 时置 None）。
+            //   后果：export_to_kernel 里 `m.selected_npm.as_ref().map(...)` 恒为 None →
+            //     写进 registry.json 的 `selected` **永远是 null** →
+            //     内核 domains/dist/index.js「优先采用壳投放的 selected……两侧必然同源」
+            //     那条分支**永不执行**（内核每次仍自测选源），
+            //     跨仓「同源」承诺与 selected.checkedAt 的 TTL 路径全部失效。
+            //   修法：把本次实测的最快 npm 源与其延迟落盘（同时刷新 checked_at）。
+            //     只在探测确实得到结果时写，避免把「全不可达」写成一次有效选择。
+            let mut m = m;
+            if let (Some(best), Some(ms)) = (snap.npm_best.clone(), snap.npm_latency_ms) {
+                m.selected_npm = Some(best);
+                m.selected_npm_latency_ms = Some(ms as u64);
+                m.checked_at = Some(now_secs());
+                if let Err(e) = save(&m) {
+                    crate::update::log(&format!("预热结果落盘失败（不影响本次引导）: {}", e));
+                }
+            }
             if let Ok(mut g) = warm().lock() {
                 *g = Some(snap);
             }
