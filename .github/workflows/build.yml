@@ -4,20 +4,20 @@ name: launcher-build
 # 矩阵 → 逐平台 Tauri bundle → 安装包挂 GitHub Release + 发布 npm 包（自更新产物）。
 #
 # ── 触发策略（2026-09-13 修订）──
-#   历史（F5）：仅 tag / 手动，理由是「原 push main 会每次全平台**打包**」。
-#   现修订为：
-#     · push main → 只跑**轻量跨平台编译检查**（platform-check：cargo check，
-#       不打包、不发布）。公开仓 Actions 免费，且这是**唯一**能编译
-#       macos.rs / windows.rs 的途径 —— 二者被 #[cfg(target_os)] 排除，
-#       Linux（含本仓 CI 的 ubuntu 步骤）**从不编译它们**。
-#       实证：本轮 P1 就是 macos.rs 用了 SVC_QUICK 却没导入 → macOS E0425，
-#       而 Linux 上 100+ 项测试全绿也看不见。
-#     · tag / 手动 → 仍跑完整 bundle 矩阵 + 发布（原行为不变）。
-#   保留 F5 的省时意图：**打包矩阵仍不在日常 push 上跑**（见 build job 的 if 守卫）。
+#   历史（F5）：仅 tag / 手动，理由是「原 push main 会每次全平台打包」。
+#   现修订为：**push main 也跑完整构建矩阵**（不设轻量替代、不设 tag 守卫）。
+#
+#   依据（本轮实证）：macos.rs / windows.rs 被 #[cfg(target_os)] 条件编译，
+#     Linux 上**连解析都不做** —— 该文件里两个独立缺陷（SVC_QUICK 未导入 E0425、
+#     AppleScript 字符串嵌套未转义引号的语法错误）在本地 130+ 项测试全绿的情况下
+#     完全隐形，而它们让 **macOS 根本无法出包**。
+#     **只有完整构建（在真实 mac/win runner 上）才能发现这类问题。**
+#   取舍说明：完整构建耗时更长（macOS 按平台计费口径最贵），但公开仓 Actions 免费；
+#     以「跑得久」换「问题暴露得早、暴露得全」是明确的选择。
 on:
   push:
     tags: ['v*']
-    # 日常 push main 跑轻量编译检查（见 platform-check）。
+    # 日常 push main 跑**完整构建**（含 mac/win bundle 与全部门禁测试）。
     branches: [main]
   workflow_dispatch: {}
 
@@ -46,36 +46,14 @@ jobs:
           ver=$(node -p "require('./src-tauri/tauri.conf.json').version")
           echo "ver=$ver" >> "$GITHUB_OUTPUT"
 
-  # ── 轻量跨平台编译检查（2026-09-13）──
-  #
-  # 为什么必须单独有它：macos.rs / windows.rs 被 #[cfg(target_os)] 条件编译，
-  #   在 Linux 上**永远不参与编译** —— 因此「用了父模块的项却没导入」这类错误
-  #   （本轮 P1：macos.rs 用 SVC_QUICK 未导入 → E0425）只能由对应平台 runner 拦住。
-  # 定位：只做 cargo check（编译校验），**不打包、不发布**；
-  #   完整 bundle 矩阵仍只在 tag / 手动时跑（保留 F5 意图）。
-  platform-check:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-      - name: cargo check --all-targets（编译 macos.rs / windows.rs）
-        run: cargo check --all-targets
-        working-directory: src-tauri
-
   build:
     needs: version
-    # ⚠ 2026-09-13：**打包矩阵只在 tag / 手动时跑**（保留 F5 的省时意图）——
-    #   日常 push 由上面的 platform-check 做轻量编译检查，不产 bundle。
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    # ⚠ 2026-09-13（按用户明确要求修订）：**push 直接跑完整构建矩阵**。
+    #
+    #   为什么不做「轻量 cargo check」：仅编译校验发现不了打包/签名/产物装配阶段的问题，
+    #   而本仓恰恰在那些阶段踩过坑（glibc 基座、bundle 装配、验签清单、UPDATE 资产）。
+    #   轻量检查会给出「绿了」的假象，反而掩盖问题 —— 故一律跑完整构建。
+    #   公开仓 Actions 免费，不存在额度顾虑。
     permissions:
       contents: write   # action-gh-release 挂 Release + 资产上传
     strategy:

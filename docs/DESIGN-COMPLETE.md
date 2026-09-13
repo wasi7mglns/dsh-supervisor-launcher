@@ -1503,9 +1503,18 @@ mod parent { pub const SVC_NORMAL: u8 = 1; pub const SVC_QUICK: u8 = 2;
 
 二者被 `#[cfg(target_os)]` 条件编译，Linux 上**连解析都不做**；而 CI 原先只在 tag 时触发。
 
-**修法**：新增 **platform-check** job（macos-latest + windows-latest）跑
-`cargo check --all-targets`，并把 `on.push` 补上 `branches: [main]`。
-保留 F5 的省时意图：打包矩阵加 `if` 守卫，仍只在 tag / 手动时跑。
+**修法（经一次政策修订，以下是最终形态）**：
+
+初版我加了一个只做 `cargo check` 的轻量 **platform-check** job，并给 `build` 加 tag 守卫，
+让日常 push 走轻量路径。**这被明确否决，且否决是对的**：
+仅编译校验发现不了**打包 / 签名 / 产物装配**阶段的问题（glibc 基座、bundle 装配、
+验签清单、UPDATE 资产），而本仓恰在那些阶段踩过坑；轻量检查会给出「绿了」的假象，
+**反而掩盖问题**。
+
+最终形态：**push main 直接跑完整构建矩阵**
+（`ubuntu-22.04` / `windows-latest` / `macos-latest` / `macos-15-intel` 四平台 bundle），
+**删除 platform-check、去掉 build 的 `if` 守卫**。公开仓 Actions 免费，
+以「跑得久」换「问题暴露得早、暴露得全」。
 
 #### ③ 该 CI 第一次运行就抓到 P1：macOS **第二个**编译错误
 
@@ -1523,28 +1532,32 @@ macos.rs:108  "do shell script "installer -pkg '{}' -target /" with administrato
 （该本地手法只对 macos.rs 有效 —— 它仅用 std + 本仓模块；windows.rs 用了
 `std::os::windows::…`，切到 Linux 只会得到 `raw_arg` 找不到的假错误。）
 
-#### ④ 新增门禁：Linux 侧平台文件**可解析性**
+#### ④ 「Linux 侧轻量语法门禁」**已删除**（政策否决）
 
-`tests/platform_files_parse_test.rs`（2 断言）：用 `rustfmt` 作**独立文件解析器**
-（不受 `#[cfg]` 影响）解析**每一个** `src/platform/*.rs` ——
-**在 Linux 上、在任何 CI runner 之前**就能拦住「cfg 屏蔽文件里的语法错误」这一整类。
-**诚实边界**：只覆盖**语法**；**名字解析**（E0425 等）仍需 platform-check 在真机编译。
+曾加入 `tests/platform_files_parse_test.rs`：用 `rustfmt` 作独立解析器，
+在 Linux 上解析每个 `src/platform/*.rs`，以拦住 cfg 屏蔽文件里的语法错误。
+**已按「不要轻量替代」的要求删除** —— 它是「用一个便宜检查代替完整构建」的思路，
+正是被否决的那一类。语法错误由**完整构建**在真实平台上暴露（本轮 CI 已实证：
+platform-check 第一次运行就抓到了 macos.rs 的语法错误）。
 
 #### ⑤ 门禁的门禁
 
-`tests/ci_gate_coverage_test.rs`（4 断言）：C-a CI 必须**自动枚举**（不得硬编码）；
-C-b 唯一允许排除的是 `updater_artifacts`；C-c CI 必须有 mac/win 的 `cargo check`；
-C-d 反向判据非空转。该文件本身由自动枚举纳入 CI（自覆盖）。
+`tests/ci_gate_coverage_test.rs`（5 断言）：C-a CI 必须**自动枚举**（不得硬编码）；
+C-b 唯一允许排除的是 `updater_artifacts`；
+**C-c push 必须跑完整构建矩阵**（build job 不得有 job 级 `if:` 守卫、矩阵必须含
+macOS/Windows、且 build 内要跑 `cargo test`）；
+**C-d 反悔防护：不得存在只做 `cargo check` 的轻量 job 替代完整构建**；
+C-e 反向判据非空转（含 `job_block` 定位有效性）。该文件本身由自动枚举纳入 CI（自覆盖）。
 
 #### 注入验证（5 次，全部 FAIL；还原后 sha256 逐字一致）
 
 | 注入 | 命中 |
 |---|---|
 | 改回硬编码 --test 三连 | C-a + C-b FAIL |
-| 删掉 platform-check job | C-c FAIL |
+| **给 build 加回 tag 守卫**（=退回轻量替代的形态）| C-c FAIL |
+| **把轻量 platform-check job 加回来** | C-d FAIL |
+| **矩阵里删掉 windows** | C-c FAIL |
 | 多加一个 grep -v 排除项 | C-b FAIL |
-| 把 macos.rs 嵌套双引号语法错误放回（真缺陷复现）| PF-a FAIL |
-| 在 windows.rs 注入括号不配对 | PF-a FAIL |
 
 ⚠ 注入 1 第一次**没生效**：python 匹配串里把 `${TARGETS}` 误写成带反斜杠形态，
   assert 报错进了 **stderr 而我只看了 stdout**，误以为成功。改用锚点定位后复现成功。
