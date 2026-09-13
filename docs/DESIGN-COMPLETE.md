@@ -1483,3 +1483,81 @@ mod parent { pub const SVC_NORMAL: u8 = 1; pub const SVC_QUICK: u8 = 2;
     （**使用**）误判为「本地定义」→ 改为要求「该项是**被声明的名字**」。
 
 **计数变化**：壳 cargo test 117 → **129 项**（+12）；cargo check --all-targets 0 警告。
+
+---
+
+### 第十三轮续三：CI 接线（门禁漏跑 / 平台盲区）+ macOS 第二个编译错误（2026-09-13）
+
+#### ① CI 硬编码 --test 名单 → 4 个门禁被静默排除
+
+「门禁测试」步骤原先硬编码 `--test bootstrap_flow --test update_guard_test
+--test platform_unsupported_structure_test`。于是**新增的 tests/*.rs 不在 CI 执行**，
+实测漏了 4 个：`platform_shared_items_test`（**正是为 macOS E0425 建的那道，建了却不在 CI 跑**）、
+`mirror_env_wiring_test`、`round13_p3_batch_test`、以及**既有的** `service_self_heal_test`。
+该步骤自己的注释就写着「60+ 个门禁此前从未在 CI 执行」——同类问题以「新增文件被硬编码漏掉」复发。
+
+**修法**：自动枚举 `tests/*.rs`（只排除 `updater_artifacts`，它需打包产物）。
+新增测试文件从此自动纳入 CI。
+
+#### ② 平台盲区：macos.rs / windows.rs 从不被任何门禁编译
+
+二者被 `#[cfg(target_os)]` 条件编译，Linux 上**连解析都不做**；而 CI 原先只在 tag 时触发。
+
+**修法**：新增 **platform-check** job（macos-latest + windows-latest）跑
+`cargo check --all-targets`，并把 `on.push` 补上 `branches: [main]`。
+保留 F5 的省时意图：打包矩阵加 `if` 守卫，仍只在 tag / 手动时跑。
+
+#### ③ 该 CI 第一次运行就抓到 P1：macOS **第二个**编译错误
+
+platform-check 首次运行：**windows success / macos failure**。
+无法下载 job 日志（未认证 403），本机改用**「临时把 macos 实现切到 Linux 上编译」**
+复现出与 CI 相同的错误：
+
+```text
+macos.rs:108  "do shell script "installer -pkg '{}' -target /" with administrator privileges"
+→ error: character literal may only contain one codepoint
+```
+
+**嵌套双引号未转义 = 纯语法错误 → macOS target 根本无法编译**。
+与先前那处 `SVC_QUICK` 未导入（E0425）是**同一盲区下的两个独立缺陷**。
+（该本地手法只对 macos.rs 有效 —— 它仅用 std + 本仓模块；windows.rs 用了
+`std::os::windows::…`，切到 Linux 只会得到 `raw_arg` 找不到的假错误。）
+
+#### ④ 新增门禁：Linux 侧平台文件**可解析性**
+
+`tests/platform_files_parse_test.rs`（2 断言）：用 `rustfmt` 作**独立文件解析器**
+（不受 `#[cfg]` 影响）解析**每一个** `src/platform/*.rs` ——
+**在 Linux 上、在任何 CI runner 之前**就能拦住「cfg 屏蔽文件里的语法错误」这一整类。
+**诚实边界**：只覆盖**语法**；**名字解析**（E0425 等）仍需 platform-check 在真机编译。
+
+#### ⑤ 门禁的门禁
+
+`tests/ci_gate_coverage_test.rs`（4 断言）：C-a CI 必须**自动枚举**（不得硬编码）；
+C-b 唯一允许排除的是 `updater_artifacts`；C-c CI 必须有 mac/win 的 `cargo check`；
+C-d 反向判据非空转。该文件本身由自动枚举纳入 CI（自覆盖）。
+
+#### 注入验证（5 次，全部 FAIL；还原后 sha256 逐字一致）
+
+| 注入 | 命中 |
+|---|---|
+| 改回硬编码 --test 三连 | C-a + C-b FAIL |
+| 删掉 platform-check job | C-c FAIL |
+| 多加一个 grep -v 排除项 | C-b FAIL |
+| 把 macos.rs 嵌套双引号语法错误放回（真缺陷复现）| PF-a FAIL |
+| 在 windows.rs 注入括号不配对 | PF-a FAIL |
+
+⚠ 注入 1 第一次**没生效**：python 匹配串里把 `${TARGETS}` 误写成带反斜杠形态，
+  assert 报错进了 **stderr 而我只看了 stdout**，误以为成功。改用锚点定位后复现成功。
+
+#### CI 实证
+
+| run | sha | 结论 |
+|---|---|---|
+| 34737146315 | `06a1700`（加 platform-check）| **failure**（macOS leg 抓到上述 P1）|
+| 34737470174 | `0225df9`（修 macos.rs）| **success**（macos + windows 双绿）|
+
+两次 run 的 `build` / `publish` 均 **skipped**（不打包、不发布）—— 门控按设计生效。
+（GitHub job 日志下载需认证，403；结论取自公开 API 的 runs/jobs 接口。）
+
+**计数变化**：壳 cargo test 129 → **135 项**（+6）；cargo check --all-targets 0 警告。
+CI 实际执行：3 → **8 个 test target** + mac/win 编译检查。
