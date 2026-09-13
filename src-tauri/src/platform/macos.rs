@@ -15,7 +15,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use super::service::ServiceControl;
-use super::{home_dir, Capabilities, Platform, SVC_NORMAL};
+// ⚠ P1 修复（2026-09-13，失效模式 g + 平台对称性）：**必须导入 SVC_QUICK**。
+//   缺陷：本文件 :202 使用了 SVC_QUICK（launchctl bootout 的有界超时），
+//     而本 use 列表**漏了它** —— 子模块不继承父模块作用域，故 target_os=macos
+//     构建时是未绑定标识符 **E0425 → macOS（arm64/x64）构建直接失败，无法出包**。
+//   为什么长期未被发现：platform/mod.rs 以 #[cfg(target_os = "macos")] 条件编译，
+//     Linux 上的 cargo test/check **根本不编译本文件** → 100+ 项测试全绿也掩盖它。
+//   对照：linux.rs 与 windows.rs 的 use 列表都含 SVC_QUICK。
+//   （已用 rustc 最小复现确证该作用域规则：E0425 cannot find value SVC_QUICK in this scope。）
+use super::{home_dir, Capabilities, Platform, SVC_NORMAL, SVC_QUICK};
 
 pub const NAME: &str = "macos";
 /// 守卫的 LaunchAgent 标签（**定义由本文件建立**；内核只做 enable/disable）。

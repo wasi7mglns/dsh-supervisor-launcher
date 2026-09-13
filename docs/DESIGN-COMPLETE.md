@@ -1411,3 +1411,36 @@ A-2/A-3 的断言用 `include_str!` 读自身源码，而**针脚字符串本身
       update_guard 9 / updater_artifacts 6 —— 五项不变
 壳    cargo check --all-targets  0 警告
 ```
+
+---
+
+### 第十三轮续：macOS 构建断裂（P1）+ 跨平台导入门禁（2026-09-13）
+
+| 级别 | 位置 | 缺陷 | 修法 |
+|---|---|---|---|
+| **P1** | `platform/macos.rs:18` | 使用 `SVC_QUICK`（:202）却**未导入** → `target_os=macos` 构建 **E0425**，macOS（arm64/x64）无法出包；因 `#[cfg(target_os)]` 条件编译，Linux 上的 cargo test/check 根本不编译该文件，117 项测试全绿也掩盖它 | use 列表补 `SVC_QUICK`（与 linux.rs / windows.rs 对齐）|
+
+**为什么长期不可见**：`platform/mod.rs` 按平台条件编译；CI 在 Linux 上不编译 macos.rs。
+已用 rustc 最小复现确证作用域规则（子模块不继承父模块作用域）：
+
+```text
+mod parent { pub const SVC_NORMAL: u8 = 1; pub const SVC_QUICK: u8 = 2;
+  pub mod macos_like { use super::{SVC_NORMAL}; pub fn f() -> u8 { SVC_NORMAL + SVC_QUICK } } }
+→ error[E0425]: cannot find value SVC_QUICK in this scope
+```
+
+**新增门禁** `tests/platform_shared_items_test.rs`（3 断言；静态结构 —— 与既有
+`platform_unsupported_structure_test.rs` 同一理由：CI 无法编译非本平台的 cfg 分支）：
+
+- S-a 每个平台文件用到的**父模块共享项**，须经 `use super::` 导入或以限定路径访问
+- S-b `SVC_*` 常量在三平台文件均已导入（从 mod.rs **动态解析**常量名，防硬编码过时）
+- S-c 反向：判据能识别「使用但未导入」形态，且不误报已导入形态（门禁非空转）
+
+⚠ S-c 第一版**门禁空转**：`defined_locally` 写成「以 fn/const 开头且 contains(item)」，
+  于是 `fn f() { SVC_QUICK }`（**使用**）被误判为「本地定义」→ 反向断言不成立。
+  已改为要求「该项是**被声明的名字**」，重跑确认 S-c 通过、且注入确实使 S-a/S-b FAIL。
+
+**注入验证**：把 `SVC_QUICK` 从 macos.rs 导入移除（还原修复前）→ S-a / S-b 两条 FAIL；
+还原后 sha256 逐字一致，全绿。
+
+**计数变化**：壳 cargo test 114 → **117 项**（新增 3）；cargo check --all-targets 0 警告。
