@@ -56,8 +56,8 @@ impl Platform for Impl {
             platform: NAME,
             native_service: true, // systemd --user
 // 声明与实测必须同源：改为调用同一个探测函数。
-            privilege_channel: self.has_privilege_channel(),
-            node_artifact: "tar.xz",
+            privilege_channel: self.has_privilege_channel(), // 仅壳自更新用；Node 安装已改为用户级、零权限
+            node_artifact: "tar.gz",
         }
     }
 
@@ -82,12 +82,15 @@ impl Platform for Impl {
         let tag = if arch == "arm64" { "linux-arm64" } else { "linux-x64" };
         Some(super::NodeArtifact {
             tag,
-            file: format!("node-v{}-linux-{}.tar.xz", version, arch),
+            // 用 .tar.gz：gzip 普遍可用，不再依赖 xz（原 .tar.xz 在无 xz 的机器上必失败）。
+            file: format!("node-v{}-linux-{}.tar.gz", version, arch),
         })
     }
 
     fn node_candidate_paths(&self) -> Vec<PathBuf> {
         let mut v = vec![
+            // 用户级安装（<状态根>/node）最先：壳自己装的，优先于系统其它 Node。
+            self.node_bin_after_install(),
             PathBuf::from("/usr/local/bin/node"),
             PathBuf::from("/usr/bin/node"),
             PathBuf::from("/bin/node"),
@@ -104,7 +107,8 @@ impl Platform for Impl {
     }
 
     fn node_bin_after_install(&self) -> PathBuf {
-        PathBuf::from("/usr/local/bin/node")
+        // 用户级安装落点（零权限）；不再指向 /usr/local（那需要 pkexec/sudo）。
+        crate::env::node_install_root().join("bin").join("node")
     }
 
     fn is_usable_executable(&self, cand: &Path) -> bool {
@@ -112,43 +116,27 @@ impl Platform for Impl {
     }
 
     fn install_node(&self, file: &Path) -> Result<PathBuf, String> {
-        let abs = file.canonicalize().map_err(|e| e.to_string())?;
-        let cmd = format!("tar -xJf '{}' -C /usr/local --strip-components=1", abs.display());
-        // P3 修复（2026-09-13）：**经与 has_privilege_channel 同一个 helper** 选提权命令。
-        //
-        //   缺陷：has_privilege_channel 探测「pkexec **或** sudo」，而这里**硬编码 pkexec**。
-        //     一台**有 sudo、无 pkexec** 的机器（常见于精简发行版/容器/自建环境）上：
-        //       · self_update_capable() / 引导页诊断显示「可自更新」；
-        //       · 但真正安装 Node 时立刻失败于「无法启动 pkexec」。
-        //     用户看到的是「已经说可以，却装不上」，且错误指向 pkexec —— 与实际环境不符。
-        //     （桌面壳自更新走 tauri-plugin-updater，它内部是 pkexec → GUI sudo → sudo 回退，
-        //       故只有本壳自己的 Node 安装这一条路径漏了回退。）
-        //
-        //   修法：两者共用 find_privilege_command()（单一事实源）—— 见 PRIVILEGE_COMMANDS。
-        let priv_cmd = find_privilege_command().ok_or_else(|| {
-            format!(
-                "未找到可用提权通道（需要 {} 之一）。请安装 policykit（提供 pkexec）或 sudo。",
-                PRIVILEGE_COMMANDS.join(" 或 ")
-            )
-        })?;
-        let out = crate::bounded::run(
-            Command::new(priv_cmd).args(["sh", "-c", &cmd]),
-            INSTALL_CMD_TIMEOUT,
-        )
-        .map_err(|e| format!("无法启动 {}（{}）。", priv_cmd, e))?;
+        // 用户级解包（tar.gz），**不需要 pkexec/sudo**（2026-09-18 权限模型重写）。
+        //   原实现把 tar 解到 /usr/local，必须提权 —— 在「有 pkexec 无 polkit agent」
+        //   （容器/WSL/SSH）或「无 pkexec 无 sudo」的机器上必然装不上。改为解到
+        //   <状态根>/node，零权限且三平台一致；用 .tar.gz 也不再依赖 xz。
+        let root = crate::env::node_install_root();
+        let staging = root.with_file_name("node.extract");
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+        let mut cmd = Command::new("tar");
+        cmd.args(["-xzf"]).arg(file).arg("-C").arg(&staging).arg("--strip-components=1");
+        let out = crate::bounded::run(&mut cmd, INSTALL_CMD_TIMEOUT)
+            .map_err(|e| format!("无法启动 tar: {}", e))?;
         if !out.success {
-            return Err(format!(
-                "{} 退出码 {}（用户取消或安装失败）：{}",
-                priv_cmd,
-                out.code.unwrap_or_else(|| "killed".into()),
-                out.stderr.trim()
-            ));
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(format!("解包 Node 归档失败: {}", out.stderr.trim()));
         }
-        let node = self.node_bin_after_install();
-        if !node.is_file() {
-            return Err(format!("安装完成但 {} 未就位", node.display()));
+        let r = super::commit_user_node(&staging, &root, &["bin", "node"]);
+        if r.is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
         }
-        Ok(node)
+        r
     }
 
     fn core_extra_candidates(&self, _names: &[&str], _pkg: Option<&str>) -> Vec<PathBuf> {
@@ -164,7 +152,7 @@ impl Platform for Impl {
 
     fn has_privilege_channel(&self) -> bool {
         // **不主动执行提权**，只探测命令存在性（用于「不可自更新」的提前判定）。
-        // 与 install_node **共用** find_privilege_command —— 同一事实一处实现。
+        // 提权探测（供壳自更新判定）；Node 安装已改为用户级、零权限，不再依赖它。
         find_privilege_command().is_some()
     }
 
@@ -298,11 +286,9 @@ impl ServiceControl for Impl {
 mod tests {
     //! A-2 门禁：提权通道的「探测」与「使用」必须**同源**（2026-09-13）。
     //!
-    //! 缺陷：has_privilege_channel 探测「pkexec **或** sudo」，而 install_node 硬编码
-    //! pkexec。有 sudo 无 pkexec 的机器被误判「可自更新」，却在安装 Node 时失败。
-    //! 该缺陷在二进制里无法用普通单测覆盖（要真提权），故按本仓既有惯例做**结构断言**；
-    //! 但断言的是**特征调用**（install_node 里必须出现 find_privilege_command，
-    //! 且不得再出现字面量 pkexec），而不是易撞名的局部变量。
+    //! 2026-09-18 权限模型重写后：Node 安装为**用户级解包、零权限**，install_node 不得
+    //! 再调提权通道；has_privilege_channel 仍保留共享 helper（供壳自更新判定）。
+    //! 结构断言：install_node 不含 pkexec/sudo 且用 tar，以及提权清单单一定义。
     use super::*;
 
     /// 去掉注释后再断言 —— 本仓两次被自己写的说明文字骗过（见 AUDIT-HANDOFF 9.2）。
@@ -317,28 +303,28 @@ mod tests {
     }
 
     #[test]
-    fn a2_probe_and_use_share_one_privilege_source() {
+    fn a2_user_scope_install_needs_no_privilege() {
         let raw = include_str!("linux.rs");
         let code = strip_comments(raw);
 
-        // 正向：探测与实际执行都必须经同一 helper
-        assert!(
-            code.contains("find_privilege_command()"),
-            "A-2 FAIL 未使用共享的 find_privilege_command"
-        );
+        // 2026-09-18 权限模型重写：Node 安装改为**用户级解包，零权限**。
+        //   install_node 不得再调用任何提权通道（原 pkexec/sudo 在容器/WSL/SSH 常不可用）。
         let install = code
             .split("fn install_node")
             .nth(1)
             .expect("A-2 FAIL 未找到 install_node");
         let install_body = install.split("fn core_extra_candidates").next().unwrap_or(install);
         assert!(
-            install_body.contains("find_privilege_command()"),
-            "A-2 FAIL install_node 未用共享 helper 选提权命令"
+            !install_body.contains("find_privilege_command()"),
+            "A-2 FAIL install_node 仍在提权 —— 用户级安装应零权限"
         );
-        // 反向：install_node 内不得再**硬编码** pkexec 作为执行命令
         assert!(
-            !install_body.contains("Command::new(\"pkexec\")"),
-            "A-2 FAIL install_node 仍硬编码 pkexec —— 有 sudo 无 pkexec 的机器会被误判可自更新"
+            !install_body.contains("pkexec") && !install_body.contains("sudo"),
+            "A-2 FAIL install_node 仍出现提权命令字面量"
+        );
+        assert!(
+            install_body.contains("tar"),
+            "A-2 FAIL install_node 未用 tar 解包用户级归档"
         );
         let probe = code
             .split("fn has_privilege_channel")

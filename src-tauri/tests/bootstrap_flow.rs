@@ -388,20 +388,22 @@ fn b13_shell_owns_service_definition() {
     eprintln!("B13 PASS shell owns 3-platform service definition + spawn fallback");
 }
 
-/// B14：macOS Node 安装格式必须与安装命令匹配（.pkg）。
-/// 旧实现下载 .tar.gz 却交给 `installer -pkg` —— 格式不匹配，必然失败。
+/// B14：Node 归档格式必须与**实际解包方式**匹配（2026-09-18 权限模型重写）。
+/// 历史：曾下载 .tar.gz 却交给 `installer -pkg`（格式不匹配必失败）；后改 .pkg；
+/// 现改为**用户级 tar.gz 解包（零权限）**，故断言 tarball + tar 而非 pkg/installer。
 #[test]
 fn b14_macos_node_installer_format_matches() {
-    // 2026-09-11：macOS 安装逻辑已下沉到 platform/macos.rs（门禁 G1）——
-    //   断言随产权迁移，否则测试盯着一个已不含该逻辑的文件而误报。
     let n = platform_sources();
-    assert!(n.contains("node-v{}.pkg"), "B14 FAIL macOS 未改用官方 .pkg（安装命令要求 .pkg）");
     assert!(
-        !n.contains("node-v{}-darwin-{}.tar.gz"),
-        "B14 FAIL 仍下载 .tar.gz 却交给 installer -pkg（格式不匹配）"
+        n.contains("node-v{}-darwin-{}.tar.gz"),
+        "B14 FAIL macOS 未用官方 tarball（用户级解包要求 tar.gz）"
     );
-    assert!(n.contains("installer -pkg"), "B14 FAIL 未找到 installer -pkg 调用");
-    eprintln!("B14 PASS macOS uses .pkg consistent with installer -pkg");
+    assert!(
+        !n.contains("node-v{}.pkg"),
+        "B14 FAIL 仍选 .pkg（需要管理员，且与 tar 解包不匹配）"
+    );
+    assert!(n.contains("-xzf"), "B14 FAIL 未找到 tar.gz 解包调用");
+    eprintln!("B14 PASS macOS uses tar.gz consistent with tar extraction");
 }
 
 /// B15：Node 安装包下载超时必须足够大（产物 30-90MB；ureq 的 timeout 覆盖整次调用）。
@@ -991,15 +993,14 @@ fn b41_polling_loops_have_independent_heartbeat() {
 /// 而 `osx-arm64-pkg` 从不存在；通用 pkg 的标签就是 `osx-x64-pkg`。
 #[test]
 fn b42_macos_tag_matches_pkg_artifact() {
-    // 2026-09-11：制品映射已下沉到 platform/macos.rs；标签与文件名现在同源
-    //   （同一个 NodeArtifact 结构一次给出），不再有判定用 tar、下载用 pkg 的错位。
+    // 2026-09-18：制品改为用户级 tarball；标签与文件名仍同源（NodeArtifact 一次给出）。
     let n = platform_sources();
-    assert!(n.contains("node-v{}.pkg"), "B42 FAIL macOS 未选 .pkg");
-    assert!(n.contains("osx-x64-pkg"), "B42 FAIL macOS 标签未与 .pkg 对齐");
+    assert!(n.contains("node-v{}-darwin-{}.tar.gz"), "B42 FAIL macOS 未选 tarball");
     assert!(
-        !n.contains("osx-arm64-tar"),
-        "B42 FAIL macOS 仍在用 tar 标签判定 pkg 产物"
+        n.contains("osx-x64-tar") && n.contains("osx-arm64-tar"),
+        "B42 FAIL macOS tarball 标签缺失（双架构）"
     );
+    assert!(!n.contains("osx-x64-pkg"), "B42 FAIL macOS 仍在用 pkg 标签");
     eprintln!("B42 PASS macOS tag matches artifact");
 }
 
@@ -1149,10 +1150,10 @@ fn b45_platform_tag_is_arch_aware() {
         !n.contains("#[cfg(target_os = \"linux\")]\n    { return \"linux-x64\"; }"),
         "B45 FAIL Linux 标签仍硬编码 x64"
     );
-    // Windows arm64 限制必须被如实记录（诚实性断言）
+    // Windows arm64 现使用**原生 zip**（用户级解包；不再退 x64 msi 靠模拟）。
     assert!(
-        n.contains("win-arm64-msi"),
-        "B45 FAIL 未记录 Windows arm64 的 msi 缺失限制"
+        n.contains("win-arm64-zip"),
+        "B45 FAIL Windows arm64 未使用原生 zip 产物"
     );
     // 反向自检：确保找的是**实现文件**而非又一处注释 ——
     //   若 platform_sources() 未来不再含这些串，上面会失败（不会静默通过）。

@@ -44,8 +44,8 @@ impl Platform for Impl {
         Capabilities {
             platform: NAME,
             native_service: true, // launchd
-            privilege_channel: true, // osascript（管理员授权）
-            node_artifact: "pkg",
+            privilege_channel: true, // 仅壳自更新用；Node 安装已改为用户级、零权限
+            node_artifact: "tar.gz",
         }
     }
 
@@ -58,23 +58,25 @@ impl Platform for Impl {
     }
 
     fn node_artifact(&self, version: &str) -> Option<super::NodeArtifact> {
-        // macOS 必须用官方 **.pkg**（2026-09-11 修复）：
-        //   原实现下载 `node-v<ver>-darwin-<arch>.tar.gz`（tarball），却交给
-        //   `installer -pkg` 执行 —— 格式不匹配，**必然安装失败**。
-        //   官方提供的是通用 .pkg（`node-v<ver>.pkg`，arm64/x64 通用）。
-        //   选 .pkg 而非 tarball 的原因：它带**签名与安装位置语义**，
-        //   可用一次系统授权装到 /usr/local，与其它平台行为一致。
-        //
-        //   标签 `osx-x64-pkg` 是官方 index.json 的实际标签（实测确认；
-        //   没有 osx-arm64-pkg 条目）。
+        // 用户级安装：官方 tarball 双架构齐全（osx-x64-tar / osx-arm64-tar），
+        //   解包到 <状态根>/node，**不需要管理员**（2026-09-18 权限模型重写）。
+        //   官方**没有** osx-arm64-pkg，且 .pkg 需要系统授权 —— 故弃用 pkg。
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            _ => return None,
+        };
+        let tag = if arch == "arm64" { "osx-arm64-tar" } else { "osx-x64-tar" };
         Some(super::NodeArtifact {
-            tag: "osx-x64-pkg",
-            file: format!("node-v{}.pkg", version),
+            tag,
+            file: format!("node-v{}-darwin-{}.tar.gz", version, arch),
         })
     }
 
     fn node_candidate_paths(&self) -> Vec<PathBuf> {
         let mut v = vec![
+            // 用户级安装（<状态根>/node）最先：壳自己装的，优先于系统其它 Node。
+            self.node_bin_after_install(),
             PathBuf::from("/usr/local/bin/node"),
             // Apple Silicon 上的 Homebrew 落点（原生 arm64 安装常见于此）
             PathBuf::from("/opt/homebrew/bin/node"),
@@ -92,7 +94,8 @@ impl Platform for Impl {
     }
 
     fn node_bin_after_install(&self) -> PathBuf {
-        PathBuf::from("/usr/local/bin/node")
+        // 用户级安装落点（零权限）；不再指向 /usr/local（那需要管理员）。
+        crate::env::node_install_root().join("bin").join("node")
     }
 
     fn is_usable_executable(&self, cand: &Path) -> bool {
@@ -100,44 +103,26 @@ impl Platform for Impl {
     }
 
     fn install_node(&self, file: &Path) -> Result<PathBuf, String> {
-        let abs = file.canonicalize().map_err(|e| e.to_string())?;
-        let esc = abs.display().to_string().replace('"', "");
-        // P1 修复（2026-09-13）：**嵌套双引号未转义 → 语法错误，macOS target 无法编译**。
-        //
-        //   缺陷：AppleScript 的 do shell script 需要用引号包住 shell 命令，
-        //     但这里写成了未转义的嵌套双引号：
-        //         "do shell script "installer -pkg '{}' -target /" with administrator privileges"
-        //     → error: character literal may only contain one codepoint / expected `,`, found `-`
-        //     （macos.rs:108）。
-        //
-        //   为什么长期不可见：本文件被 platform/mod.rs 的 #[cfg(target_os = "macos")]
-        //     整体条件编译，**Linux 上的 cargo check/test 根本不解析它** ——
-        //     与同文件先前那处 SVC_QUICK 未导入（E0425）是同一盲区的两个独立缺陷。
-        //     实证：新增的 CI platform-check（macos-latest 上 cargo check --all-targets）
-        //     第一次运行就报了 failure，本机用「临时把 macos 实现切到 Linux 上编译」
-        //     的方法复现出了与 CI 相同的语法错误。
-        //   修法：按 AppleScript 语义转义内部引号（外壳命令整体加 \"...\"）。
-        let script = format!(
-            "do shell script \"installer -pkg '{}' -target /\" with administrator privileges",
-            esc
-        );
-        let out = crate::bounded::run(
-            Command::new("osascript").arg("-e").arg(&script),
-            INSTALL_CMD_TIMEOUT,
-        )
-        .map_err(|e| format!("无法启动 osascript: {}", e))?;
+        // 用户级解包（tar.gz），**不需要管理员**（2026-09-18 权限模型重写）。
+        //   原 .pkg + osascript「with administrator privileges」需要系统授权；用户级
+        //   tarball 三平台一致、零权限，且 macOS 官方无 arm64 pkg（tarball 双架构齐全）。
+        let root = crate::env::node_install_root();
+        let staging = root.with_file_name("node.extract");
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+        let mut cmd = Command::new("tar");
+        cmd.args(["-xzf"]).arg(file).arg("-C").arg(&staging).arg("--strip-components=1");
+        let out = crate::bounded::run(&mut cmd, INSTALL_CMD_TIMEOUT)
+            .map_err(|e| format!("无法启动 tar: {}", e))?;
         if !out.success {
-            return Err(format!(
-                "macOS 安装失败（用户取消或 installer 报错）: {}",
-                out.stderr.trim()
-            ));
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(format!("解包 Node 归档失败: {}", out.stderr.trim()));
         }
-        // 2026-09-18：退出码 0 不等于文件就位：必须核对，否则后续以「未检测到 Node」误报。
-        let node = self.node_bin_after_install();
-        if !node.is_file() {
-            return Err(format!("installer 退出码 0 但 {} 未就位（安装未生效）", node.display()));
+        let r = super::commit_user_node(&staging, &root, &["bin", "node"]);
+        if r.is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
         }
-        Ok(node)
+        r
     }
 
     fn core_extra_candidates(&self, names: &[&str], _pkg: Option<&str>) -> Vec<PathBuf> {

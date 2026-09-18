@@ -66,7 +66,7 @@
 阶段                 执行者   调用                              产物
 ─────────────────────────────────────────────────────────────────────────────
 1 检测环境           壳       nodeprobe::status                候选枚举 + 版本
-2 运行环境           壳       node::install（pkexec/msiexec）  官方 Node LTS
+2 运行环境           壳       node::install（用户级解包）      官方 Node LTS
                                                         → 壳写 runtime.json
 3 桌面版本           壳       Tauri updater + minisign         壳自更新
 4 内核版本           壳       core::latest_version → install   npm 装内核
@@ -365,8 +365,8 @@ pub trait Platform: Send + Sync {
     fn name(&self) -> &'static str;
 
     // ── Node 制品与安装（F1：这是壳的独有职责）──
-    fn node_artifact(&self, version: &str) -> Option<NodeArtifact>;  // tar.xz / pkg / msi
-    fn install_node(&self, a: &Path) -> Result<InstallReport, ShellError>;  // 含提权
+    fn node_artifact(&self, version: &str) -> Option<NodeArtifact>;  // tar.gz / zip
+    fn install_node(&self, a: &Path) -> Result<InstallReport, ShellError>;  // 用户级、零权限
     fn core_platform_tag(&self) -> &'static str;   // linux-x64 / darwin-arm64 / win-x64
 
     // ── 探测 ──
@@ -417,8 +417,8 @@ pub enum ShellError {
 | 能力 | Linux | macOS | Windows | 实现位 |
 |---|---|---|---|---|
 | 环境探针（候选/版本/PATH）| | | | `domain/probe` |
-| Node 制品解析 | `tar.xz` | `pkg` | `msi` | `platform/*::node_artifact` |
-| Node 安装（提权）| `pkexec` | `osascript` | `msiexec` | `platform/*::install_node` |
+| Node 制品解析 | `tar.gz` | `tar.gz` | `zip` | `platform/*::node_artifact` |
+| Node 安装（**用户级/零权限**）| `tar` | `tar` | `Expand-Archive` | `platform/*::install_node` |
 | 镜像测速与选择 | | | | `domain/mirror` |
 | 内核安装/升级 | | | | `domain/provision` |
 | 服务定义（守卫）| systemd | LaunchAgent | schtasks | `platform/*::ServiceControl` |

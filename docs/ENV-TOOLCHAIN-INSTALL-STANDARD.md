@@ -56,7 +56,7 @@
 
 ### 2.3 npm 修复策略（按优先级，跨平台）
 
-1. 官方分发包自带 npm：node 的 MSI/pkg/tar.xz 安装后，npm 通常已就位（先探测，命中即止）；
+1. 官方分发包自带 npm：node 的用户级归档（zip/tar.gz）解包后，npm 通常已就位（先探测，命中即止）；
 2. 未命中且存在 `<nodeBinDir>/node_modules/npm/bin/npm-cli.js` → 以 `node <npm-cli.js>` 形态可用（契约已支持 `npmArgs`）；
 3. 包内 CLI 也不存在（裁剪分发/解包不完整）→ **重新执行官方安装**（幂等）后复探；
 4. 仍失败 → 如实失败，文案给出「手动安装 Node 官方分发包」的指引。
@@ -129,9 +129,39 @@ NS.install.fail(kind, text)    // 失败文字（走既有 fail 面板）
 |---|---|---|---|
 | node 可执行名 | `node` | `node` | `node.exe` |
 | npm 可执行名 | `npm` | `npm` | `npm.cmd` |
-| 官方分发包 | `tar.xz` → `/usr/local` | `.pkg` → `/usr/local` | `.msi` |
+| 官方分发包 | `tar.gz` | `tar.gz` | `zip` |
+| 安装位置 | `<状态根>/node`（用户级） | `<状态根>/node` | `<状态根>/node` |
+| 是否需要提权 | **否** | **否** | **否** |
 | npm 兜底 | `node_modules/npm/bin/npm-cli.js` | 同左 | 同左 |
 | 事件形态 | 统一 `install_*` | 同左 | 同左 |
+
+---
+
+## 4bis. 权限模型（2026-09-18 重写，跨平台）
+
+**结论：Node 安装不再需要任何提权。** 三平台统一把官方归档解到用户可写的
+`<状态根>/node`，不做系统级安装。
+
+**为什么**（原系统级安装的失败模式）：
+
+- Windows `.msi` + `Start-Process -Verb RunAs`：UAC 提升到**管理员账户**后，常读不到
+  当前用户 profile 下的 `.msi` → **msiexec 退出码 1619（安装包无法打开）**；
+  且 `canonicalize()` 在 Windows 返回 `\\?\` 前缀路径，msiexec 不认。
+- macOS `.pkg` + `osascript ... with administrator privileges`：需要系统授权弹窗，
+  且官方**没有** osx-arm64 pkg。
+- Linux `tar -C /usr/local` + pkexec/sudo：容器 / WSL / SSH / 精简发行版常无可用
+  polkit agent 或 sudo；且 `tar -xJf` 依赖 xz。
+
+**模型**：
+
+1. **默认（唯一）路径 = 用户级、零权限**：下载官方归档（Windows `win-{arch}.zip` /
+   macOS `darwin-{arch}.tar.gz` / Linux `linux-{arch}.tar.gz`）→ 解到
+   `<状态根>/node.extract` → 校验 node 可执行 → **原子替换** `<状态根>/node`。
+2. 运行期契约（`runtime.json`）记录该绝对路径；守卫由 `<壳> --run-guard` 经契约定位 node，
+   故 **systemd/launchd/schtasks 不需要 PATH 里有 node**。
+3. **提权只与壳自更新（替换安装包）有关**，且由各平台自身通道完成
+   （Windows 安装程序 / macOS updater / Linux pkexec→sudo），与 Node 安装解耦。
+4. 无权限、跨账户、跨文件系统都不再影响 Node 安装。
 
 ---
 

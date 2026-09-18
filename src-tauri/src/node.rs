@@ -23,9 +23,9 @@ fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
 
 /// 本平台在官方 index.json 中的平台标签（必须与 `platform_artifact()` 的产物语义一致）。
 ///
-/// 不变量：判定依据与下载对象必须是同一种制品。macOS 用通用 `.pkg`
-/// （标签 `osx-x64-pkg`，官方无 `osx-arm64-pkg`）；Linux 按架构 `linux-x64`/`linux-arm64`；
-/// Windows 只有 `win-x64-msi`（无 arm64 msi，arm64 上装 x64 msi 依赖系统模拟）。
+/// 不变量：判定依据与下载对象必须是同一种制品（2026-09-18 起统一为**用户级归档**）：
+///   macOS `osx-{arch}-tar` → `darwin-{arch}.tar.gz`；Linux `linux-{arch}` → `linux-{arch}.tar.gz`；
+///   Windows `win-{arch}-zip` → `win-{arch}.zip`。三平台均零权限解包到 <状态根>/node。
 /// 当前平台的 Node 官方制品（**标签 + 文件名同源**）。
 ///
 /// 实现已下沉到 platform 层（2026-09-11）：这是纯「平台 → 官方制品」映射
@@ -224,7 +224,7 @@ pub fn download_verified(
 /// 平台安装：官方产物 + 一次性系统授权弹窗。
 ///
 /// 实现已下沉到 platform 层（2026-09-11）：三平台的提权通道与安装器各不相同
-/// （pkexec+tar / osascript+installer / powershell+msiexec），这是平台知识。
+/// 实现已迁至 platform 层：三平台统一为**用户级归档解包（零权限）**，见 ENV-TOOLCHAIN-INSTALL-STANDARD §4bis。
 ///
 /// 这是**壳独有**的能力：装内核之前必须先把运行环境装好（引导顺序 R1），
 ///   而提权需要人在场 —— 内核（无头系统服务）永远做不到这件事。
@@ -337,10 +337,15 @@ pub fn finalize_install(
     if !meets_minimum(Some(&v)) {
         return Err((false, format!("安装到的 Node.js {} 低于最低要求 {}", v, MIN_NODE)));
     }
-    if !npm_usable_at(node_bin) {
-        crate::update::log("官方分发包未提供可用 npm，正在重新执行官方安装（幂等）…");
-        reinstall_for_npm(local).map_err(|e| (true, e))?;
+    if npm_usable_at(node_bin) {
+        // 成功即写运行期契约（单一写入方）：内核/守卫据此绑定该绝对 node/npm 路径。
+        if let Some(rt) = crate::runtime_contract::derive_usable(node_bin, &v) {
+            crate::runtime_contract::write(&rt);
+        }
+        return Ok((node_bin.display().to_string(), v));
     }
+    crate::update::log("官方分发包未提供可用 npm，正在重新执行官方安装（幂等）…");
+    reinstall_for_npm(local).map_err(|e| (true, e))?;
     Ok((node_bin.display().to_string(), v))
 }
 

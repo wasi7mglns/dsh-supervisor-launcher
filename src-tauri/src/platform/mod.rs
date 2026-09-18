@@ -126,6 +126,52 @@ fn macos_system_proxy() -> Option<String> {
     None
 }
 
+/// 用户级 Node 安装的**原子落定**（三平台共用）。
+///
+/// 约定：调用方先把官方归档解到 `staging`。两种布局都由本函数统一处理：
+///   · Unix：`tar --strip-components=1` → staging 下直接是 bin/lib/...；
+///   · Windows：`Expand-Archive` → staging 下多一层 `node-vX-win-.../`。
+/// 落定后返回 node 可执行路径。失败不留下半装状态（root 只在确认可执行后才替换）。
+pub fn commit_user_node(
+    staging: &std::path::Path,
+    root: &std::path::Path,
+    node_rel: &[&str],
+) -> Result<std::path::PathBuf, String> {
+    let probe = |b: &std::path::Path| -> std::path::PathBuf {
+        node_rel.iter().fold(b.to_path_buf(), |p, s| p.join(*s))
+    };
+    let mut base = staging.to_path_buf();
+    if !probe(&base).is_file() {
+        // Windows：压缩包内多一层版本目录 → 若 staging 下只有一个目录且其中含 node，以此为准。
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            let dirs: Vec<std::path::PathBuf> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir())
+                .collect();
+            if dirs.len() == 1 {
+                base = dirs[0].clone();
+            }
+        }
+    }
+    let found = probe(&base);
+    if !found.is_file() {
+        return Err(format!("解包后未找到 Node 可执行（{}）", found.display()));
+    }
+    if let Some(parent) = root.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let _ = std::fs::remove_dir_all(root);
+    if let Err(e) = std::fs::rename(&base, root) {
+        return Err(format!("落定 {} 失败: {}", root.display(), e));
+    }
+    let _ = std::fs::remove_dir_all(staging); // base != staging 时清掉剩余空壳
+    let installed = probe(root);
+    if !installed.is_file() {
+        return Err(format!("{} 未就位", installed.display()));
+    }
+    Ok(installed)
+}
+
 /// 以当前平台的**正确方式**执行版本探针（`<prog> [args...] --version`），有界返回首个非空行。
 ///
 /// 为什么必须在平台层：Windows 上的 .cmd / .bat（如官方 npm.cmd）**不能**被
@@ -202,18 +248,18 @@ pub struct Capabilities {
     pub platform: &'static str,
     /// 是否有**原生**服务管理器（systemd / launchd / 计划任务）。
     pub native_service: bool,
-    /// 是否有提权通道（Node 安装需要）。
+    /// 是否有提权通道（**仅壳自更新/可选系统安装**需要；Node 安装已用户级、零权限）。
     pub privilege_channel: bool,
-    /// Node 制品形态（`tar.xz` / `pkg` / `msi`）。
+    /// Node 制品形态（`zip` / `tar.gz`，均为用户级零权限归档）。
     pub node_artifact: &'static str,
 }
 
 /// Node 官方制品的描述（**平台层解析**，业务层只消费）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeArtifact {
-    /// `index.json` 的 `files[]` 标签（如 `linux-x64` / `osx-x64-pkg` / `win-x64-msi`）。
+    /// `index.json` 的 `files[]` 标签（如 `linux-x64` / `osx-arm64-tar` / `win-x64-zip`）。
     pub tag: &'static str,
-    /// 发布文件名（含版本号），如 `node-v22.12.0-linux-x64.tar.xz`。
+    /// 发布文件名（含版本号），如 `node-v22.12.0-linux-x64.tar.gz`。
     pub file: String,
 }
 
@@ -420,14 +466,16 @@ pub trait Platform: Send + Sync {
         home_dir().join(".local").join("state").join("dsh-supervisor")
     }
 
-    /// **安装 Node**（含平台提权通道）。
+    /// **安装 Node**（**用户级，零权限**；2026-09-18 权限模型重写）。
     ///
-    /// · Linux   `pkexec sh -c "tar -xJf … -C /usr/local"`
-    /// · macOS   `osascript` + `installer -pkg … -target /`（带管理员授权）
-    /// · Windows `powershell Start-Process msiexec … -Verb RunAs -Wait`
+    /// 三平台统一：把官方归档解到 `<状态根>/node`，再原子替换。
+    /// · Linux/macOS `tar -xzf <archive> -C <staging> --strip-components=1`
+    /// · Windows     `powershell Expand-Archive`
     ///
-    /// 这是**壳独有**的能力：装内核之前必须先把运行环境装好（引导顺序），
-    ///   而提权需要人在场 —— 内核（无头服务）永远做不到这件事。
+    /// 为什么不再提权：系统级安装（MSI/pkg//usr/local）需要 UAC/pkexec/sudo，
+    ///   而 UAC 提升到管理员账户后常读不到当前用户 profile 下的安装包（msiexec 1619）、
+    ///   容器/WSL/SSH 常无可用 polkit agent 或 sudo。用户级解包在**任何**权限下都能成功。
+    /// 提权只与**壳自更新**（替换安装程序）有关，由各平台自身通道完成。
     fn install_node(&self, file: &std::path::Path) -> Result<std::path::PathBuf, String>;
 
     /// 是否存在可用的**提权通道**（用于「不可自更新」的提前判定）。

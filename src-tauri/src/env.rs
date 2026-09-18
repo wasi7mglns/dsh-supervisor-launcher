@@ -151,6 +151,16 @@ pub fn probe_system_node() -> Option<(PathBuf, String)> {
 ///   真实路径随**系统盘符**与**系统语言**变化（中文系统是 `Program Files` 的本地化目录名），
 ///   也可能装在 `Program Files (x86)`。故一律经 `ProgramFiles` / `ProgramFiles(x86)`
 ///   环境变量推导 —— 这也是 `nodeprobe::known_locations()` 采用的口径，两处必须一致。
+/// 用户级 Node 安装根（**零权限**）：<状态根>/node。
+///
+/// 为什么是用户级（2026-09-18 权限模型重写）：系统级安装（Windows MSI / macOS pkg /
+///   Linux /usr/local）都需要提权；而 Windows 上 UAC 提升到管理员账户后，常读不到
+///   当前用户 profile 下的安装包（msiexec 退出码 1619 = 安装包无法打开）。用户级归档
+///   解包三平台一致、**完全不需要授权**，也永不产生跨账户路径不可读问题。
+pub fn node_install_root() -> PathBuf {
+    state_root().join("node")
+}
+
 /// **安装后** Node 可执行文件应出现的位置（平台判定；用于校验安装成功）。
 ///
 /// 实现已下沉到 platform 层（2026-09-11）。

@@ -78,7 +78,7 @@ pub trait Platform: Send + Sync {
     fn name(&self) -> &'static str;
 
     // ── Node 制品与安装 ──
-    /// 制品形态（Linux tar.xz / macOS pkg / Windows msi）与文件名。
+    /// 制品形态（Linux/macOS tar.gz / Windows zip，均为**用户级零权限**归档）与文件名。
     fn node_artifact(&self, version: &str) -> Option<NodeArtifact>;
     /// 安装（含提权）。**提权为本平台专有实现**。
     fn install_node(&self, artifact: &Path) -> Result<InstallReport, ShellError>;
@@ -146,8 +146,8 @@ pub enum ShellError {
 | 能力 | Linux | macOS | Windows | 实现位 |
 |---|---|---|---|---|
 | 环境探针（候选枚举/版本/PATH）| | | | `domain/probe` |
-| Node 制品解析 | `tar.xz` | `pkg` | `msi` | `platform/*::node_artifact` |
-| Node 安装（提权）| `pkexec` | `osascript` | `msiexec` | `platform/*::install_node` |
+| Node 制品解析 | `tar.gz` | `tar.gz` | `zip` | `platform/*::node_artifact` |
+| Node 安装（**用户级/零权限**）| `tar` → `<状态根>/node` | `tar` | `Expand-Archive` | `platform/*::install_node` |
 | 镜像测速与选择 | | | | `domain/mirror` |
 | 内核安装/升级 | | | | `domain/provision` |
 | 服务定义（守卫）| systemd | LaunchAgent | schtasks | `platform/*::ServiceControl` |
